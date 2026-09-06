@@ -2,7 +2,7 @@ project:
   schema_version: "0.1"
   study_species: mouse
   input_format: fif
-  data_status: real_data_not_found_in_workspace
+  data_status: real_sample_available_outside_workspace
 
 expected_data:
   # These are checks, not assertions about a file until that file is read.
@@ -10,6 +10,10 @@ expected_data:
   n_channels: 16
   n_times_per_epoch: 5000
   nominal_epoch_duration_s: 5.0
+  # Current sample metadata reported 1 Hz high-pass and 200 Hz low-pass.
+  # Keep these as checks/annotations until preprocessing history is confirmed per file.
+  preprocessed_highpass_hz: 1.0
+  preprocessed_lowpass_hz: 200.0
   preprocessing_history_confirmed: false
   reference_description: "采集时参考；颅骨参考、接地；四脑区共用参考电极（按当前研究说明）"
 
@@ -58,13 +62,32 @@ parameterization:
   min_r_squared: 0.90
 
 connectivity:
-  enabled: false
-  methods: [imcoh, wpli2_debiased, coh]
-  mode: fourier
-  fmin_hz: 1.0
-  fmax_hz: 150.0
+  enabled: true
+  methods: [mic, mim, wpli2_debiased]
+  mode: multitaper
+  fmin_hz: 2.0
+  fmax_hz: 100.0
+  fdecim: 1
+  mt_bandwidth_hz: 4.0
+  mt_adaptive: false
+  mt_low_bias: true
   min_epochs: 5
-  region_pair_summary: arithmetic_mean_over_valid_channel_pairs
+  rank_strategy: data_driven_energy_99pct
+  rank_relative_tolerance: 1.0e-6
+  rank_variance_threshold: 0.99
+  fixed_rank_by_region: {}
+  exclude_line_noise_hz: [50.0, 60.0]
+  line_noise_half_width_hz: 0.5
+  bands_from_global_config: true
+  rank_sensitivity_offsets: [-1, 0, 1]
+  rank_sensitivity_enabled: true
+  stability_enabled: true
+  stability_subsample_fraction: 0.75
+  stability_n_subsamples: 2
+  stability_seed: 20260906
+  granger:
+    enabled: false
+  region_pair_summary: median_over_valid_channel_pairs_for_wpli_only
 
 statistics:
   animal_unit: animal_id

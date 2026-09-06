@@ -20,6 +20,11 @@ from .metadata import load_metadata_tables, validate_metadata_tables
 from .parameterization import fit_channel_psd_table
 from .plotting import (
     plot_band_power,
+    plot_connectivity_band_matrices,
+    plot_connectivity_channel_pairs,
+    plot_connectivity_rank_sensitivity,
+    plot_connectivity_redundancy,
+    plot_connectivity_spectrum,
     plot_parameterization_components,
     plot_parameterization_fit,
     plot_psd,
@@ -32,6 +37,8 @@ from .spectral import compute_band_power, compute_psd, summarize_psd
 
 def _write_frame(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if frame.empty and len(frame.columns) == 0:
+        frame = pd.DataFrame(columns=["status"])
     frame.to_csv(path, index=False)
 
 
@@ -139,6 +146,48 @@ def run_single_file(
         connectivity = compute_connectivity(loaded.data, loaded.sfreq, channel_table, quality["epoch"], config)
         _write_frame(connectivity["spectrum"], output / "connectivity_spectrum.csv")
         _write_frame(connectivity["region_summary"], output / "connectivity_region_summary.csv")
+        _write_frame(connectivity["band_summary"], output / "connectivity_band_summary.csv")
+        _write_frame(connectivity["patterns"], output / "connectivity_patterns.csv")
+        _write_frame(connectivity["redundancy_correlation"], output / "connectivity_redundancy_correlation.csv")
+        _write_frame(connectivity["redundancy_singular_values"], output / "connectivity_redundancy_singular_values.csv")
+        _write_frame(connectivity["rank_summary"], output / "connectivity_rank_summary.csv")
+        _write_frame(connectivity["rank_sensitivity"], output / "connectivity_rank_sensitivity.csv")
+        _write_frame(connectivity["stability"], output / "connectivity_stability.csv")
+        _write_frame(connectivity["epoch_profile"], output / "connectivity_epoch_profile.csv")
+        _write_frame(connectivity["input_checks"], output / "connectivity_input_checks.csv")
+        _write_frame(connectivity["failures"], output / "connectivity_failures.csv")
+        write_json(connectivity["metadata"], output / "connectivity_metadata.json")
+        plot_connectivity_redundancy(
+            connectivity["redundancy_correlation"],
+            connectivity["redundancy_singular_values"],
+            connectivity["rank_summary"],
+            figures / "connectivity_redundancy",
+            dpi=int(config.get("plotting", {}).get("dpi", 150)),
+        )
+        for method in ("mic", "mim", "wpli2_debiased"):
+            if not connectivity["region_summary"].empty and method in set(connectivity["region_summary"].get("method", pd.Series(dtype=str))):
+                plot_connectivity_spectrum(
+                    connectivity["region_summary"],
+                    method,
+                    figures / f"connectivity_{method}_spectrum",
+                    dpi=int(config.get("plotting", {}).get("dpi", 150)),
+                )
+        plot_connectivity_band_matrices(
+            connectivity["band_summary"],
+            figures / "connectivity_band_matrices",
+            dpi=int(config.get("plotting", {}).get("dpi", 150)),
+        )
+        plot_connectivity_channel_pairs(
+            connectivity["spectrum"],
+            figures / "connectivity_wpli2_debiased_channel_pairs",
+            dpi=int(config.get("plotting", {}).get("dpi", 150)),
+        )
+        if not connectivity["rank_sensitivity"].empty and "region_a" in connectivity["rank_sensitivity"]:
+            plot_connectivity_rank_sensitivity(
+                connectivity["rank_sensitivity"],
+                figures / "connectivity_rank_sensitivity",
+                dpi=int(config.get("plotting", {}).get("dpi", 150)),
+            )
         connectivity_status = str(connectivity["status"])
     else:
         _write_frame(pd.DataFrame([{"status": connectivity_status, "reason": "requires confirmed mapping and cross-epoch review"}]), output / "connectivity_status.csv")
@@ -173,6 +222,11 @@ def run_single_file(
         "parameterization_status": parameterization_status,
         "parameterization_fit_range_hz": config.get("parameterization", {}).get("fit_range_hz"),
         "connectivity_status": connectivity_status,
+        "connectivity_frequency_range_hz": [
+            config.get("connectivity", {}).get("fmin_hz", None),
+            config.get("connectivity", {}).get("fmax_hz", None),
+        ],
+        "connectivity_effective_duration_s": connectivity.get("metadata", {}).get("effective_valid_duration_s") if "connectivity" in locals() else None,
         "animal_level_statistics_run": False,
         "limitations": [
             "Actual_record_start/end are not inferred from event values.",

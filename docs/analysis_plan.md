@@ -25,7 +25,7 @@
 - 实际数组：`21 × 16 × 5000`；1000 Hz；epoch 时间 0–4.999 s。
 - `drop_log` 候选条目 25 个，其中 4 个为 `USER` 删除，保留 21 个 epoch；有效时长 105 s。
 - 通道名：`TETFP01–08`、`TETFP17–24`；类型均为 `seeg`；MNE unit code 107（V）。
-- 物理编号/脑区映射仍未在登记表确认，输出中留空；没有按数组位置或名称自动推断。
+- 用户随后确认物理编号/脑区映射：1–4=M1、5–8=STR、17–20=PF、21–24=SNr；半球和电极几何仍留空。代码按实际通道名匹配，不按数组位置猜测。
 - 质量：0 个 fail epoch×channel 行；1 个 warn 行（TETFP21，saved epoch 14，异常幅度标记）。
 - 没有动物身份、session、给药登记或 AIMs，因此未运行动物层统计，也未生成行为结论。
 
@@ -46,19 +46,29 @@
 
 ## 阶段 3：specparam/FOOOF 与跨脑区连接
 
-状态：参数化已实现并在真实 T80 样例上完成单文件验证；连接接口已建立，但因缺少脑区映射仍未对真实样例运行。
+状态：specparam/FOOOF 和首版功能连接已在真实 T80 样例上完成单文件验证。Granger/时间反转校正仍关闭。
 
 - 默认使用 specparam fixed、无 knee 模型，拟合范围为配置中的 2–150 Hz；参数化只接受文件/给药时点内的汇总 PSD，失败记录保留。
 - T80 实际结果：16/16 通道拟合成功，95 个周期峰，2,384 行逐频率模型曲线；R²、MAE、offset、exponent 以及峰参数均写入结果表。FOOOF 兼容后端也已用真实 PSD 的两个通道独立验证成功。
 - 输出目录：`results/real_LID-T80_parameterized/`，包括 `parameterization_model.csv`、`parameterization_peaks.csv`、`parameterization_curves.csv`、`parameterization_failures.csv` 和 PNG/SVG 拟合图。
-- 连接需确认 `channel_map.csv` 后运行；连接估计只跨有效 epoch，不拼接不连续 epoch。
-- 真实样例当前没有脑区映射，因此不应运行六组脑区连接结果。
+- `metadata/channel_map.csv` 已按用户确认的物理编号填入：1–4=M1、5–8=STR、17–20=PF、21–24=SNr；代码按实际通道名匹配。
+- 连接估计只跨同一文件/记录节点/给药时点内的有效 epoch，不拼接不连续 epoch；当前 T80 使用 21 个有效 epoch和 105 s 有效时长。
+- 使用 MNE-Connectivity 0.9.0 的 multitaper `spectral_connectivity_epochs`：MIC/MIM 为真正的多变量脑区集合估计；wPLI 使用全部跨脑区通道对，脑区汇总首版为有效通道对中位数。
+- 当前真实 T80 结果：六组脑区对均生成 MIC、MIM 和 wPLI 频谱；M1/STR/PF 选择维度为3，SNr为2（数据驱动 99% 方差规则）；这些是该文件的质量/降维描述，不是跨动物统计结论。
+- MIC 保留有符号原值，同时用绝对值表示连接强度；MIM 保留未归一化原值；wPLI 保留负的有限样本估计，不开平方、不截断为零。
+- 已完成输入检查、频率/线噪声标记、epoch 稳定性、秩敏感性和合成信号基础验证；等量抽样在单文件上标记为不适用，因为没有多个条件节点可匹配。
+
+真实 T80 输出目录：
+
+`results/real_LID-T80_connectivity/`
+
+重点文件为 `connectivity_spectrum.csv`、`connectivity_region_summary.csv`、`connectivity_band_summary.csv`、`connectivity_rank_summary.csv`、`connectivity_rank_sensitivity.csv`、`connectivity_stability.csv`、`connectivity_input_checks.csv`、`connectivity_failures.csv` 及 `figures/connectivity_*.png|svg`。
 
 ## 阶段 4：批量和行为接口
 
 状态：批量入口和节点级行为合并接口已建立，尚未有真实登记数据。
 
-- 行为键为 animal × session × nominal dose time，不复制到 epoch 作为独立行为样本。
+- 行为键为 animal × session × nominal dose time，不复制到 epoch 作为独立行为样本。连接结果已经保留有效 epoch 数和有效时长，可在身份登记后接入同一节点级行为表。
 - 批量入口把无法解析、路径不存在和运行失败写入 `batch_manifest.csv`。
 
 ## 阶段 5：动物层比较
