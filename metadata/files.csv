@@ -1,0 +1,2 @@
+file_id,session_id,animal_id,file_path,dose_state,drug,nominal_dose_time_min,actual_record_start,actual_record_end,preprocessing_notes,include_file_level,is_example
+LID-T80_all_channels-epo,,,C:\Users\PC\Desktop\94\LID-94\T80\LID-T80_all_channels-epo.fif,post_dose,L-DOPA,80,,,预处理历史待核实；T80为名义给药后时间；动物身份和session未提供,true,known_sample_unresolved_identity

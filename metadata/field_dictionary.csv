@@ -1,0 +1,21 @@
+table_name,field_name,description,required,allowed_values_or_units,unknown_value_policy
+animals,animal_id,真实动物编号,yes,,留空
+animals,group,实验分组,yes,,留空
+animals,ldn_compound,LDN 完整名称, no,,留空
+records,session_id,一次记录/session 的稳定标识,yes,,留空
+records,l_dopa_day,L-DOPA 给药天数, no,day,留空
+records,ldn_status,LDN 治疗状态, no,pre/post/none/unknown,留空
+records,ldn_day,LDN 治疗天数, no,day,留空
+files,file_id,输入文件的稳定标识,yes,,留空
+files,dose_state,给药前/后状态,yes,pre_dose_baseline/post_dose/unknown,给药前用明确标签
+files,drug,药物记录, no,L-DOPA/LDN,留空
+files,nominal_dose_time_min,名义给药后分钟数, no,min,留空
+files,actual_record_start,已确认的实际记录起始时间, no,datetime or relative time,留空
+files,actual_record_end,已确认的实际记录结束时间, no,datetime or relative time,留空
+epochs,original_candidate_index,原始候选 epoch 索引,yes,index,保留原始值
+epochs,events_raw_value,FIF 原始 events 值,yes,integer,保留原始值
+epochs,selection_value,MNE selection 值,yes,integer,保留原始值
+epochs,confirmed_time_start_s,已确认的时间坐标起点, no,s,留空
+epochs,confirmed_time_end_s,已确认的时间坐标终点, no,s,留空
+behavior,aims_total,AIMs 总分, no,score,留空
+behavior,video_sync_quality,视频同步质量, no,unverified/poor/fair/good,留空

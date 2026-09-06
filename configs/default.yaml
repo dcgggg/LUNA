@@ -1,0 +1,80 @@
+project:
+  schema_version: "0.1"
+  study_species: mouse
+  input_format: fif
+  data_status: real_data_not_found_in_workspace
+
+expected_data:
+  # These are checks, not assertions about a file until that file is read.
+  sampling_rate_hz: 1000.0
+  n_channels: 16
+  n_times_per_epoch: 5000
+  nominal_epoch_duration_s: 5.0
+  preprocessing_history_confirmed: false
+  reference_description: "采集时参考；颅骨参考、接地；四脑区共用参考电极（按当前研究说明）"
+
+quality:
+  flat_std_threshold: 1.0e-15
+  max_abs_z_threshold: 20.0
+  saturation_fraction_threshold: 0.01
+  duplicate_epoch_detection: true
+  line_noise_hz: [50.0, 60.0]
+  line_noise_peak_ratio_threshold: 8.0
+  check_frequency_band_hz: [1.0, 200.0]
+
+psd:
+  method: welch
+  fmin_hz: 1.0
+  fmax_hz: 200.0
+  nperseg: 1000
+  noverlap: 500
+  window: hann
+  detrend: constant
+  scaling: density
+  average: mean
+
+bands:
+  # 起步配置，需结合小鼠数据、研究问题和预注册方案核查。
+  delta: [1.0, 4.0]
+  theta: [4.0, 8.0]
+  alpha: [8.0, 12.0]
+  beta: [12.0, 30.0]
+  low_gamma: [30.0, 55.0]
+  high_gamma: [65.0, 100.0]
+
+relative_power:
+  denominator_hz: [1.0, 100.0]
+  exclude_line_noise_hz: []
+
+parameterization:
+  enabled: false
+  backend: specparam
+  aperiodic_mode: fixed
+  fit_range_hz: [2.0, 150.0]
+  peak_width_limits_hz: [1.0, 12.0]
+  max_n_peaks: 6
+  min_peak_height: 0.0
+  min_peak_prominence: 0.0
+  min_r_squared: 0.90
+
+connectivity:
+  enabled: false
+  methods: [imcoh, wpli2_debiased, coh]
+  mode: fourier
+  fmin_hz: 1.0
+  fmax_hz: 150.0
+  min_epochs: 5
+  region_pair_summary: arithmetic_mean_over_valid_channel_pairs
+
+statistics:
+  animal_unit: animal_id
+  primary_comparison: null
+  multiple_comparison_method: null
+  inferential_model: not_configured
+
+plotting:
+  dpi: 150
+  preview_format: png
+  editable_format: svg
+  max_waveform_epochs: 6
+  waveform_seconds: 1.0

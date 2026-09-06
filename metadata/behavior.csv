@@ -1,0 +1,1 @@
+animal_id,session_id,nominal_dose_time_min,score_observation_window_start_s,score_observation_window_end_s,aims_total,aims_axial,aims_limb,aims_orolingual,video_file,video_sync_method,video_sync_quality,epoch_behavior_labels_confirmed,notes,is_example

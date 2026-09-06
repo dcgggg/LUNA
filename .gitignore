@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.idea/
+src/*.egg-info/
+
+# Real data and generated analysis outputs are kept local by default.
+data/real/
+results/
+logs/
+reports/
+
+# Keep templates and synthetic fixtures under version control.
+!data/real/.gitkeep
+!results/.gitkeep
