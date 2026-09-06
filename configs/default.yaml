@@ -47,7 +47,7 @@ relative_power:
   exclude_line_noise_hz: []
 
 parameterization:
-  enabled: false
+  enabled: true
   backend: specparam
   aperiodic_mode: fixed
   fit_range_hz: [2.0, 150.0]

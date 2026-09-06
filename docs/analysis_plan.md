@@ -46,9 +46,11 @@
 
 ## 阶段 3：specparam/FOOOF 与跨脑区连接
 
-状态：接口已建立，默认关闭，尚未对真实样例作科研解释。
+状态：参数化已实现并在真实 T80 样例上完成单文件验证；连接接口已建立，但因缺少脑区映射仍未对真实样例运行。
 
-- 参数化只接受文件/给药时点内的汇总 PSD；失败记录保留。
+- 默认使用 specparam fixed、无 knee 模型，拟合范围为配置中的 2–150 Hz；参数化只接受文件/给药时点内的汇总 PSD，失败记录保留。
+- T80 实际结果：16/16 通道拟合成功，95 个周期峰，2,384 行逐频率模型曲线；R²、MAE、offset、exponent 以及峰参数均写入结果表。FOOOF 兼容后端也已用真实 PSD 的两个通道独立验证成功。
+- 输出目录：`results/real_LID-T80_parameterized/`，包括 `parameterization_model.csv`、`parameterization_peaks.csv`、`parameterization_curves.csv`、`parameterization_failures.csv` 和 PNG/SVG 拟合图。
 - 连接需确认 `channel_map.csv` 后运行；连接估计只跨有效 epoch，不拼接不连续 epoch。
 - 真实样例当前没有脑区映射，因此不应运行六组脑区连接结果。
 
@@ -64,4 +66,3 @@
 状态：未运行。
 
 原因：当前只有一个未登记动物身份的 T80 文件。不能据此进行 LID 进展、LDN 配对、AIMs 关联或组间推断。
-

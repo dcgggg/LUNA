@@ -7,6 +7,7 @@ import pandas as pd
 
 
 def _model_class(backend: str):
+    """Select the requested parameterization implementation."""
     if backend == "specparam":
         try:
             from specparam import SpectralModel
@@ -22,38 +23,85 @@ def _model_class(backend: str):
         raise ImportError("Install specparam or fooof for parameterization") from exc
 
 
-def fit_single_psd(
+def _extract_fit_components(model: Any, model_class: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Extract model components in log10 space for specparam or FOOOF."""
+    if model_class.__name__ == "SpectralModel" and hasattr(model, "results"):
+        aperiodic = np.asarray(model.results.params.aperiodic.asdict().get("aperiodic_fit", []), dtype=float)
+        peaks = np.asarray(model.results.params.periodic.asdict().get("peak_fit", []), dtype=float)
+        metrics = getattr(model.results.metrics, "results", {})
+        full_log = np.asarray(model.results.model.get_component("full", "log"), dtype=float)
+        aperiodic_log = np.asarray(model.results.model.get_component("aperiodic", "log"), dtype=float)
+        peak_log = np.asarray(model.results.model.get_component("peak", "log"), dtype=float)
+        r_squared = float(metrics.get("gof_rsquared", np.nan))
+        error = float(metrics.get("error_mae", np.nan))
+    else:
+        aperiodic = np.asarray(getattr(model, "aperiodic_params_", []), dtype=float)
+        peaks = np.asarray(getattr(model, "peak_params_", []), dtype=float)
+        full_log = np.asarray(getattr(model, "fooofed_spectrum_", []), dtype=float)
+        aperiodic_log = np.asarray(getattr(model, "_ap_fit", []), dtype=float)
+        peak_log = np.asarray(getattr(model, "_peak_fit", []), dtype=float)
+        r_squared = float(getattr(model, "r_squared_", np.nan))
+        error = float(getattr(model, "error_", np.nan))
+    return aperiodic, peaks, full_log, aperiodic_log, peak_log, r_squared, error
+
+
+def _empty_model_row(context: dict[str, Any], base: dict[str, Any], fit_range: list[float], n_bins: int) -> dict[str, Any]:
+    return {
+        **context,
+        **base,
+        "fit_low_hz": float(fit_range[0]),
+        "fit_high_hz": float(fit_range[1]),
+        "n_frequency_bins": int(n_bins),
+    }
+
+
+def fit_single_psd_detailed(
     frequencies: np.ndarray,
     power: np.ndarray,
     config: dict[str, Any],
     context: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
-    """Fit one aggregated PSD with specparam/FOOOF and retain failures."""
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fit one aggregated linear PSD and return parameters plus model curves.
+
+    The input power is linear PSD. The model is fit in the implementation's
+    documented log10 representation. Failure rows are retained and are never
+    silently dropped.
+    """
     context = context or {}
     parameter_cfg = config.get("parameterization", {})
+    backend_requested = str(parameter_cfg.get("backend", "specparam"))
+    fit_range = list(parameter_cfg.get("fit_range_hz", [2.0, 150.0]))
     base = {
         **context,
-        "backend_requested": parameter_cfg.get("backend", "specparam"),
+        "backend_requested": backend_requested,
+        "backend_used": "",
         "fit_status": "failed",
+        "fit_quality_status": "not_available",
         "failure_reason": "",
         "r_squared": np.nan,
         "error": np.nan,
         "offset": np.nan,
         "exponent": np.nan,
         "knee": np.nan,
+        "min_r_squared_requested": float(parameter_cfg.get("min_r_squared", np.nan)),
     }
     peak_rows: list[dict[str, Any]] = []
     model_rows: list[dict[str, Any]] = []
+    curve_rows: list[pd.DataFrame] = []
     frequencies = np.asarray(frequencies, dtype=float)
     power = np.asarray(power, dtype=float)
     finite = np.isfinite(frequencies) & np.isfinite(power) & (power > 0)
-    fit_range = parameter_cfg.get("fit_range_hz", [2.0, 150.0])
     finite &= (frequencies >= fit_range[0]) & (frequencies <= fit_range[1])
-    if np.sum(finite) < 10:
+    n_bins = int(np.sum(finite))
+    if n_bins < 10:
         base["failure_reason"] = "fewer_than_10_positive_finite_frequency_bins"
-        return base, pd.DataFrame(peak_rows), pd.DataFrame(model_rows)
+        model_rows.append(_empty_model_row(context, base, fit_range, n_bins))
+        return base, pd.DataFrame(peak_rows), pd.DataFrame(model_rows), pd.DataFrame()
+
+    fit_frequencies = frequencies[finite]
+    fit_power = power[finite]
     try:
-        Model = _model_class(str(parameter_cfg.get("backend", "specparam")))
+        Model = _model_class(backend_requested)
         model = Model(
             peak_width_limits=tuple(parameter_cfg.get("peak_width_limits_hz", [1.0, 12.0])),
             max_n_peaks=int(parameter_cfg.get("max_n_peaks", 6)),
@@ -61,33 +109,30 @@ def fit_single_psd(
             aperiodic_mode=str(parameter_cfg.get("aperiodic_mode", "fixed")),
             verbose=False,
         )
-        model.fit(frequencies[finite], power[finite], fit_range)
-        if Model.__name__ == "SpectralModel" and hasattr(model, "results"):
-            aperiodic = np.asarray(model.results.params.aperiodic.asdict().get("aperiodic_fit", []), dtype=float)
-            peaks = np.asarray(model.results.params.periodic.asdict().get("peak_fit", []), dtype=float)
-            metrics = getattr(model.results.metrics, "results", {})
-            r_squared = metrics.get("gof_rsquared", np.nan)
-            error = metrics.get("error_mae", np.nan)
-        else:
-            aperiodic = np.asarray(getattr(model, "aperiodic_params_", []), dtype=float)
-            peaks = np.asarray(getattr(model, "peak_params_", []), dtype=float)
-            r_squared = getattr(model, "r_squared_", np.nan)
-            error = getattr(model, "error_", np.nan)
+        model.fit(fit_frequencies, fit_power, fit_range)
+        aperiodic, peaks, full_log, aperiodic_log, peak_log, r_squared, error = _extract_fit_components(model, Model)
+        if aperiodic.size < 2:
+            raise ValueError("aperiodic_parameters_missing")
+        if not (len(full_log) == len(fit_frequencies) == len(aperiodic_log) == len(peak_log)):
+            raise ValueError("model_component_length_mismatch")
+
         base.update(
             {
                 "fit_status": "ok",
                 "backend_used": Model.__name__,
-                "r_squared": float(r_squared),
-                "error": float(error),
+                "r_squared": r_squared,
+                "error": error,
             }
         )
-        if aperiodic.size >= 2:
-            base["offset"] = float(aperiodic[0])
-            if aperiodic.size == 2:
-                base["exponent"] = float(aperiodic[1])
-            else:
-                base["knee"] = float(aperiodic[1])
-                base["exponent"] = float(aperiodic[2])
+        base["offset"] = float(aperiodic[0])
+        if aperiodic.size == 2:
+            base["exponent"] = float(aperiodic[1])
+        else:
+            base["knee"] = float(aperiodic[1])
+            base["exponent"] = float(aperiodic[2])
+        min_r_squared = float(parameter_cfg.get("min_r_squared", np.nan))
+        base["fit_quality_status"] = "pass" if np.isfinite(r_squared) and r_squared >= min_r_squared else "below_configured_min_r_squared"
+
         for peak_index, peak in enumerate(peaks.reshape(-1, 3)):
             peak_rows.append(
                 {
@@ -97,29 +142,82 @@ def fit_single_psd(
                     "peak_height_log10": float(peak[1]),
                     "bandwidth_hz": float(peak[2]),
                     "fit_status": base["fit_status"],
+                    "fit_quality_status": base["fit_quality_status"],
+                    "r_squared": r_squared,
+                    "error": error,
+                    "fit_low_hz": float(fit_range[0]),
+                    "fit_high_hz": float(fit_range[1]),
                 }
             )
-        model_rows.append({**context, **base, "fit_low_hz": fit_range[0], "fit_high_hz": fit_range[1]})
-        return base, pd.DataFrame(peak_rows), pd.DataFrame(model_rows)
-    except Exception as exc:  # noqa: BLE001 - failed fits are retained as result rows
+
+        observed_log = np.log10(fit_power)
+        full_power = np.power(10.0, full_log)
+        aperiodic_power = np.power(10.0, aperiodic_log)
+        periodic_power = full_power - aperiodic_power
+        curve_rows.append(
+            pd.DataFrame(
+                {
+                    **context,
+                    "frequency_hz": fit_frequencies,
+                    "observed_power": fit_power,
+                    "observed_log10_power": observed_log,
+                    "full_model_power": full_power,
+                    "full_model_log10_power": full_log,
+                    "aperiodic_power": aperiodic_power,
+                    "aperiodic_log10_power": aperiodic_log,
+                    "periodic_component_power": periodic_power,
+                    "periodic_component_log10_additive": peak_log,
+                    "residual_log10": observed_log - full_log,
+                    "periodic_component_negative": periodic_power < 0,
+                    "fit_status": base["fit_status"],
+                    "fit_quality_status": base["fit_quality_status"],
+                    "backend_used": Model.__name__,
+                }
+            )
+        )
+        model_rows.append(_empty_model_row(context, base, fit_range, n_bins))
+        return base, pd.DataFrame(peak_rows), pd.DataFrame(model_rows), pd.concat(curve_rows, ignore_index=True)
+    except Exception as exc:  # noqa: BLE001 - failed fits must be preserved
         base["failure_reason"] = f"{type(exc).__name__}: {exc}"
-        model_rows.append({**context, **base, "fit_low_hz": fit_range[0], "fit_high_hz": fit_range[1]})
-        return base, pd.DataFrame(peak_rows), pd.DataFrame(model_rows)
+        model_rows.append(_empty_model_row(context, base, fit_range, n_bins))
+        return base, pd.DataFrame(peak_rows), pd.DataFrame(model_rows), pd.DataFrame()
+
+
+def fit_single_psd(
+    frequencies: np.ndarray,
+    power: np.ndarray,
+    config: dict[str, Any],
+    context: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    """Backward-compatible wrapper returning parameters and peaks only."""
+    result = fit_single_psd_detailed(frequencies, power, config, context)
+    return result[0], result[1], result[2]
 
 
 def fit_channel_psd_table(psd_summary: pd.DataFrame, config: dict[str, Any]) -> dict[str, pd.DataFrame]:
     model_rows: list[pd.DataFrame] = []
     peak_rows: list[pd.DataFrame] = []
+    curve_rows: list[pd.DataFrame] = []
     for (array_index, channel_name), group in psd_summary.groupby(["channel_array_index", "channel_name"]):
-        _, peaks, model = fit_single_psd(
+        context = {
+            "channel_array_index": array_index,
+            "channel_name": channel_name,
+        }
+        for column in ("source_unit", "psd_unit"):
+            if column in group:
+                context[column] = group[column].iloc[0]
+        _, peaks, model, curves = fit_single_psd_detailed(
             group["frequency_hz"].to_numpy(),
             group["psd_value"].to_numpy(),
             config,
-            {"channel_array_index": array_index, "channel_name": channel_name},
+            context,
         )
         model_rows.append(model)
         peak_rows.append(peaks)
+        if not curves.empty:
+            curve_rows.append(curves)
     return {
         "model": pd.concat(model_rows, ignore_index=True) if model_rows else pd.DataFrame(),
         "peaks": pd.concat(peak_rows, ignore_index=True) if peak_rows else pd.DataFrame(),
+        "curves": pd.concat(curve_rows, ignore_index=True) if curve_rows else pd.DataFrame(),
     }

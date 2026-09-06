@@ -1,6 +1,6 @@
 # 小鼠多脑区同步 tetrode LFP 分析
 
-这是一个本地、可追溯、模块化的 Python 分析项目。当前仓库从空工作区开始建立，真实 FIF 文件尚未在本工作区发现，因此第一阶段提供：
+这是一个本地、可追溯、模块化的 Python 分析项目。当前仓库已经用用户提供的 T80 FIF 样例完成单文件验证；真实实验登记仍需继续补齐。因此当前实现提供：
 
 - FIF 读取与数据结构核查；
 - 物理通道名/编号/脑区映射接口，不按数组位置推断物理通道；
@@ -9,7 +9,7 @@
 - 逐 epoch × 通道 Welch PSD、频段绝对/相对功率；
 - 文件级结果表、质量汇总和基础 PNG/SVG 图；
 - 合成信号标定测试；
-- specparam/FOOOF、跨 epoch 连接、行为、统计和批量运行接口。
+- specparam/FOOOF 参数化、跨 epoch 连接、行为、统计和批量运行接口。
 
 真实实验身份、给药安排、AIMs 和视频同步信息缺失时，代码不会自动补造，也不会将未匹配文件纳入动物层级统计。LDN 保留为独立药物字段，名称、剂量和安排为空时保持为空。
 
@@ -66,7 +66,17 @@ results/                # 运行生成，默认不提交
   --output results/LID-T80
 ```
 
-Windows PowerShell 中可把反斜杠续行改为单行命令。若 `animal_id` 等身份字段为空，文件级质量/频谱仍可运行，但动物层统计会明确标记为不可用。
+Windows PowerShell 中可把反斜杠续行改为单行命令。若 `animal_id` 等身份字段为空，文件级质量/频谱/参数化仍可运行，但动物层统计会明确标记为不可用。
+
+默认配置已启用 specparam 参数化（fixed、无 knee，拟合范围 2–150 Hz）。该范围和峰参数均只是可编辑的起步配置，不是已确认的生理频段边界。参数化输出包括：
+
+- `parameterization_model.csv`：每个汇总通道一行，含 offset、exponent、峰拟合质量；
+- `parameterization_peaks.csv`：周期峰的中心频率、峰高和带宽；
+- `parameterization_curves.csv`：观测 PSD、完整模型、非周期背景、周期成分和残差；
+- `parameterization_failures.csv`：失败或低质量记录，不静默删除；
+- `figures/parameterization_fit.(png|svg)` 和 `figures/parameterization_components.(png|svg)`。
+
+如需使用旧版 FOOOF 后端，把配置中的 `parameterization.backend` 改为 `fooof`；两种后端都写入相同的结果表结构。推荐新项目优先使用 specparam。
 
 ### 批量入口
 
@@ -79,12 +89,13 @@ Windows PowerShell 中可把反斜杠续行改为单行命令。若 `animal_id` 
 
 批量入口只处理登记表中路径存在且身份/键不冲突的文件；所有跳过原因写入运行日志和 `batch_manifest.csv`。
 
-## 已知限制（截至第一阶段）
+## 已知限制
 
-- 本轮没有真实 FIF，因此未核验真实 16 个通道名称、物理编号、脑区归属、MNE 单位、真实删除记录和预处理历史。
+- T80 样例已经核验 16 个通道名称和 MNE 单位，但物理编号/脑区映射、动物编号、session、给药天数、AIMs 和视频同步仍未登记。
 - 采样率、epoch 长度、Welch 窗长/重叠、频段边界以及质量阈值都在配置中作为“起步建议”，不是已确认实验参数。
 - 默认不再次滤波、陷波、重参考或强清洗；质量标记不会静默删除数据。
-- 连接和参数化模块只有在依赖安装、通道映射和有效 epoch 数满足条件时才运行；不会将单个 5 秒 epoch 当成可靠跨 epoch 连接估计。
+- 参数化是在文件/给药时点内按通道汇总 PSD 上拟合，尚未实现逐 5 秒 epoch 动态拟合。
+- 连接需要确认 `channel_map.csv` 后运行；不会将单个 5 秒 epoch 当成可靠跨 epoch 连接估计。
 - 本阶段不做 LID/LDN 组间推断或 AIMs 统计；这需要真实动物编号、记录节点、实际给药后时间和行为关联信息。
 
 ## 官方方法依据

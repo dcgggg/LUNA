@@ -18,7 +18,14 @@ from .io import (
 )
 from .metadata import load_metadata_tables, validate_metadata_tables
 from .parameterization import fit_channel_psd_table
-from .plotting import plot_band_power, plot_psd, plot_quality_matrix, plot_waveforms
+from .plotting import (
+    plot_band_power,
+    plot_parameterization_components,
+    plot_parameterization_fit,
+    plot_psd,
+    plot_quality_matrix,
+    plot_waveforms,
+)
 from .quality import assess_quality
 from .spectral import compute_band_power, compute_psd, summarize_psd
 
@@ -106,7 +113,24 @@ def run_single_file(
         fits = fit_channel_psd_table(psd_summary["channel"], config)
         _write_frame(fits["model"], output / "parameterization_model.csv")
         _write_frame(fits["peaks"], output / "parameterization_peaks.csv")
-        parameterization_status = "completed_with_failure_rows_preserved"
+        _write_frame(fits["curves"], output / "parameterization_curves.csv")
+        failures = fits["model"].loc[fits["model"].get("fit_status", pd.Series(dtype=str)).ne("ok")] if not fits["model"].empty else pd.DataFrame()
+        _write_frame(failures, output / "parameterization_failures.csv")
+        plot_parameterization_fit(
+            fits["curves"],
+            fits["model"],
+            figures / "parameterization_fit",
+            dpi=int(config.get("plotting", {}).get("dpi", 150)),
+        )
+        plot_parameterization_components(
+            fits["curves"],
+            fits["model"],
+            figures / "parameterization_components",
+            dpi=int(config.get("plotting", {}).get("dpi", 150)),
+        )
+        n_failures = len(failures)
+        n_fits = int((fits["model"].get("fit_status", pd.Series(dtype=str)) == "ok").sum())
+        parameterization_status = f"completed_{n_fits}_fits_{n_failures}_failures_preserved"
     else:
         _write_frame(pd.DataFrame([{"status": parameterization_status, "reason": "enable only after PSD scale/range review"}]), output / "parameterization_status.csv")
 
@@ -147,6 +171,7 @@ def run_single_file(
             "times_per_epoch_matches_config": loaded.data.shape[2] == int(expected.get("n_times_per_epoch", loaded.data.shape[2])),
         },
         "parameterization_status": parameterization_status,
+        "parameterization_fit_range_hz": config.get("parameterization", {}).get("fit_range_hz"),
         "connectivity_status": connectivity_status,
         "animal_level_statistics_run": False,
         "limitations": [

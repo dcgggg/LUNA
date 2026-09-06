@@ -1,8 +1,10 @@
+import numpy as np
 import pandas as pd
+import pytest
 
 from lfp_analysis.config import load_config
 from lfp_analysis.connectivity import compute_connectivity
-from lfp_analysis.parameterization import fit_channel_psd_table
+from lfp_analysis.parameterization import fit_channel_psd_table, fit_single_psd_detailed
 from lfp_analysis.quality import assess_quality
 from lfp_analysis.spectral import compute_psd, summarize_psd
 from lfp_analysis.synthetic import make_synthetic_epochs
@@ -21,6 +23,69 @@ def test_specparam_result_fields_are_populated_when_available():
     assert (result["model"]["fit_status"] == "ok").all()
     assert result["model"]["r_squared"].notna().all()
     assert result["model"]["exponent"].notna().all()
+    assert not result["peaks"].empty
+    assert not result["curves"].empty
+    assert {
+        "observed_power",
+        "full_model_power",
+        "aperiodic_power",
+        "periodic_component_log10_additive",
+        "residual_log10",
+    }.issubset(result["curves"].columns)
+
+
+def test_fooof_compatibility_backend_populates_same_outputs():
+    pytest.importorskip("fooof")
+    data, channels = make_synthetic_epochs(n_epochs=6, n_channels=2, n_times=5000, seed=13)
+    config = {
+        "psd": {"fmin_hz": 1.0, "fmax_hz": 150.0, "nperseg": 1000, "noverlap": 500, "window": "hann", "detrend": "constant", "scaling": "density", "average": "mean"},
+        "parameterization": {
+            "enabled": True,
+            "backend": "fooof",
+            "aperiodic_mode": "fixed",
+            "fit_range_hz": [2.0, 150.0],
+            "peak_width_limits_hz": [1.0, 12.0],
+            "max_n_peaks": 6,
+            "min_peak_height": 0.0,
+            "min_peak_prominence": 0.0,
+            "min_r_squared": 0.90,
+        },
+    }
+    psd = summarize_psd(compute_psd(data, 1000.0, channels, config))["channel"]
+    result = fit_channel_psd_table(psd, config)
+    assert (result["model"]["backend_used"] == "FOOOF").all()
+    assert (result["model"]["fit_status"] == "ok").all()
+    assert not result["curves"].empty
+
+
+def test_specparam_recovers_known_aperiodic_exponent_and_peak_frequency():
+    pytest.importorskip("specparam")
+    frequencies = np.arange(1.0, 151.0)
+    log_power = -2.0 - 1.5 * np.log10(frequencies)
+    log_power += 0.6 * np.exp(-0.5 * ((frequencies - 40.0) / 4.0) ** 2)
+    config = {
+        "parameterization": {
+            "backend": "specparam",
+            "aperiodic_mode": "fixed",
+            "fit_range_hz": [2.0, 150.0],
+            "peak_width_limits_hz": [1.0, 12.0],
+            "max_n_peaks": 3,
+            "min_peak_height": 0.0,
+            "min_peak_prominence": 0.0,
+            "min_r_squared": 0.99,
+        }
+    }
+    base, peaks, model, curves = fit_single_psd_detailed(
+        frequencies,
+        10**log_power,
+        config,
+        {"channel_name": "synthetic_known_peak"},
+    )
+    assert base["fit_status"] == "ok"
+    assert abs(base["exponent"] - 1.5) < 0.02
+    assert abs(peaks.iloc[0]["center_frequency_hz"] - 40.0) < 1.0
+    assert model.iloc[0]["r_squared"] > 0.99
+    assert len(curves) == 149
 
 
 def test_connectivity_runs_across_epochs_with_region_pairs():
