@@ -78,6 +78,12 @@ Windows PowerShell 中可把反斜杠续行改为单行命令。若 `animal_id` 
 
 如需使用旧版 FOOOF 后端，把配置中的 `parameterization.backend` 改为 `fooof`；两种后端都写入相同的结果表结构。推荐新项目优先使用 specparam。
 
+### 不使用终端：在 PyCharm 中运行
+
+打开 [scripts/run_single_file.py](scripts/run_single_file.py)，只修改文件顶部的 `INPUT_FILE` 和 `OUTPUT_DIR`，然后在 PyCharm 的项目解释器中右键该文件，选择 `Run 'run_single_file'`。运行结束后，PyCharm 的 Run 窗口会显示结果目录、连接状态和时间延迟状态；详细 CSV、图和 `run_manifest.json` 位于 `OUTPUT_DIR`。
+
+PyCharm 的 Python Interpreter 应选择项目的 `.venv\Scripts\python.exe`。如果提示缺少依赖，在 PyCharm 的 Python Packages 中安装项目的 `.[all]` 依赖，或由项目维护者在该虚拟环境中安装依赖。这个脚本只负责调用现有分析模块，不复制算法逻辑。
+
 ### 单文件功能连接
 
 当前配置已根据用户确认的物理通道范围启用四脑区映射：物理 1–4 为 M1、5–8 为 STR、17–20 为 PF、21–24 为 SNr。映射保存在 `metadata/channel_map.csv`；代码按物理通道名匹配，不按数组位置猜测。若换用新数据，先核对该表并将不适用的行留空或另建映射。
