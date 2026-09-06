@@ -89,6 +89,36 @@ connectivity:
     enabled: false
   region_pair_summary: median_over_valid_channel_pairs_for_wpli_only
 
+time_delay:
+  # PyBispectra bispectrum-based TDE; this is a configurable starting analysis,
+  # not a confirmed biological delay window or frequency band definition.
+  enabled: true
+  backend: pybispectra
+  methods: [1]
+  antisymmetrized: [false, true]
+  min_epochs: 5
+  # TDE-only anti-aliased resampling keeps the original FIF unchanged.
+  analysis_sfreq_hz: 200.0
+  resample_window: kaiser
+  fft_window: hamming
+  n_points: null
+  max_delay_ms: 1000.0
+  fmin_hz: 2.0
+  fmax_hz: 80.0
+  frequency_bands:
+    broadband: [2.0, 80.0]
+    delta: [2.0, 4.0]
+    theta: [4.0, 8.0]
+    alpha: [8.0, 12.0]
+    beta: [12.0, 30.0]
+    low_gamma: [30.0, 55.0]
+    high_gamma: [65.0, 80.0]
+  n_jobs: 1
+  primary_method: 1
+  primary_antisymmetrized: true
+  quality_boundary_margin_ms: 10.0
+  quality_max_channel_pair_mad_ms: 100.0
+
 statistics:
   animal_unit: animal_id
   primary_comparison: null

@@ -9,7 +9,7 @@
 - 逐 epoch × 通道 Welch PSD、频段绝对/相对功率；
 - 文件级结果表、质量汇总和基础 PNG/SVG 图；
 - 合成信号标定测试；
-- specparam/FOOOF 参数化；基于多个有效 epoch 的 MIC、MIM 和去偏平方 wPLI 连接分析；行为、统计和批量运行接口。
+- specparam/FOOOF 参数化；基于多个有效 epoch 的 MIC、MIM 和去偏平方 wPLI 连接分析；基于 PyBispectra 双谱的时间延迟分析；行为、统计和批量运行接口。
 
 真实实验身份、给药安排、AIMs 和视频同步信息缺失时，代码不会自动补造，也不会将未匹配文件纳入动物层级统计。LDN 保留为独立药物字段，名称、剂量和安排为空时保持为空。
 
@@ -104,7 +104,24 @@ Windows PowerShell 中可把反斜杠续行改为单行命令。若 `animal_id` 
 - `connectivity_failures.csv` 和 `connectivity_metadata.json`：失败原因、有效 epoch 数、有效时长、频率栅格和实际估计设置。
 - `figures/connectivity_*.png` 与 `figures/connectivity_*.svg`：冗余/秩图、三种方法频谱、频段矩阵、wPLI 通道对矩阵和秩敏感性图。
 
-当前 Granger/时间反转校正默认关闭；只有在基础连接、有效秩和稳定性检查通过后再扩展。单个未登记动物身份的文件只生成文件级描述性结果，不自动进入动物层统计。
+### 时间延迟分析
+
+默认配置已加入 PyBispectra 的 bispectrum-based TDE。首版同时保留 Method I 的标准结果和 bispectral antisymmetrization 结果，用于检查共同噪声/瞬时混合造成的零延迟偏差。正延迟表示 seed 通道/脑区领先 target，负延迟表示 target 领先 seed；这只是时间符号约定，不是解剖方向或因果证明。该方法依据 [PyBispectra JOSS 文章](https://doi.org/10.21105/joss.08504)、[PyBispectra TDE 官方示例](https://pybispectra.readthedocs.io/latest/auto_examples/plot_compute_tde.html) 和 [混合噪声下 TDE 论文](https://arxiv.org/abs/2502.17474)。
+
+由于原始数据为 1000 Hz、5 秒 epoch，TDE 默认仅在 TDE 内部用 `scipy.signal.resample_poly` 抗混叠降到 200 Hz，原始数据和其他 LFP 指标不受影响。默认延迟窗口为 −1000 到 +1000 ms、5 ms 延迟分辨率；FFT 频率栅格和频段范围同时写入 metadata。所有设置都可在 `configs/default.yaml` 的 `time_delay` 节修改。
+
+新增输出：
+
+- `time_delay_spectrum.csv`：所有六组脑区对、16 个跨脑区通道对、频段、延迟时间点的完整 TDE 曲线。
+- `time_delay_region_spectrum.csv`：脑区对层面的通道对中位数延迟谱。
+- `time_delay_channel_pair_summary.csv`：每个通道对和频段的峰延迟、峰强度和方向符号。
+- `time_delay_band_summary.csv`：脑区层面峰延迟、通道对中位数、MAD 和质量标记。
+- `time_delay_input_checks.csv`、`time_delay_failures.csv`、`time_delay_metadata.json`：有效 epoch、有效时长、降采样、FFT/TDE 点数、频率栅格、延迟窗口和失败原因。
+- `figures/time_delay_*.png|svg`：标准/antisymmetrized 延迟谱和频段延迟矩阵。
+
+`peak_at_delay_window_edge`、`high_channel_pair_delay_dispersion` 和 `region_peak_differs_from_channel_median` 是质量标记，不是自动排除规则。当前 T80 只有文件级结果；不要把 TDE 峰直接解释为脑区之间已经验证的生物学传导速度。
+
+当前 Granger/时间反转校正仍默认关闭；单个未登记动物身份的文件只生成文件级描述性结果，不自动进入动物层统计。
 
 ### 批量入口
 
@@ -126,6 +143,7 @@ Windows PowerShell 中可把反斜杠续行改为单行命令。若 `animal_id` 
 - 连接已在当前 T80 样例上运行；不会将单个 5 秒 epoch 当成可靠跨 epoch 连接估计。T80 本次重新核验为 21 个有效 epoch、105 s 有效时长，而不是把 5 秒片段拼成连续记录。
 - 当前 `mne-connectivity` 为 0.9.0；该版本的 multitaper 结果属性未提供可用的 `n_tapers` 数值，因此结果表保留为空，不自行编造 tapers 数量。
 - 当前只有一个身份未解析的 T80 文件，尚未运行 LID/LDN 比较、AIMs 关联或动物层统计；Granger 默认关闭。
+- 时间延迟首版使用 PyBispectra Method I；标准和 antisymmetrized 结果均保留。TDE 的降采样、延迟窗口和频段是可编辑起步设置，不是已确认的实验参数。
 - 本阶段不做 LID/LDN 组间推断或 AIMs 统计；这需要真实动物编号、记录节点、实际给药后时间和行为关联信息。
 
 ## 官方方法依据

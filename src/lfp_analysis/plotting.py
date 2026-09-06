@@ -360,3 +360,86 @@ def plot_connectivity_rank_sensitivity(
     fig.suptitle("MIC/MIM sensitivity to fixed rank offsets; this is not significance testing")
     fig.tight_layout()
     return _save(fig, output_base, dpi=dpi)
+
+
+def plot_time_delay_spectrum(
+    region_spectrum: pd.DataFrame,
+    method: int,
+    antisymmetrized: bool,
+    output_base: str | Path,
+    dpi: int = 150,
+) -> tuple[Path, Path]:
+    subset = region_spectrum.loc[
+        (region_spectrum["method"] == method)
+        & (region_spectrum["antisymmetrized"].astype(bool) == bool(antisymmetrized))
+    ].copy()
+    pairs = list(subset[["region_a", "region_b"]].drop_duplicates().itertuples(index=False, name=None)) if not subset.empty else []
+    n_columns = 3
+    n_rows = max(1, int(np.ceil(len(pairs) / n_columns)))
+    fig, axes = plt.subplots(n_rows, n_columns, figsize=(4.2 * n_columns, 2.9 * n_rows), squeeze=False)
+    for index, (region_a, region_b) in enumerate(pairs):
+        axis = axes.ravel()[index]
+        pair = subset.loc[(subset["region_a"] == region_a) & (subset["region_b"] == region_b)]
+        for band, band_data in pair.groupby("frequency_band", sort=False):
+            band_data = band_data.sort_values("delay_ms")
+            axis.plot(band_data["delay_ms"], band_data["estimate_strength"], linewidth=0.9, label=str(band))
+            peak = band_data.loc[band_data["estimate_strength"].idxmax()]
+            axis.plot(peak["delay_ms"], peak["estimate_strength"], "o", markersize=3)
+        axis.axvline(0, color="#666666", linestyle="--", linewidth=0.7)
+        axis.set_title(f"{region_a}–{region_b}")
+        axis.set_xlabel("Delay (ms); positive = seed leads target")
+        axis.set_ylabel("TDE estimate strength")
+        axis.grid(True, color="#dddddd", linewidth=0.4)
+        if index == 0:
+            axis.legend(fontsize=7, ncol=2)
+    for axis in axes.ravel()[len(pairs) :]:
+        axis.axis("off")
+    mode = "antisymmetrized" if antisymmetrized else "standard"
+    fig.suptitle(f"PyBispectra TDE method {method} ({mode}); region-median spectra")
+    fig.tight_layout()
+    return _save(fig, output_base, dpi=dpi)
+
+
+def plot_time_delay_band_matrix(
+    band_summary: pd.DataFrame,
+    method: int,
+    antisymmetrized: bool,
+    output_base: str | Path,
+    dpi: int = 150,
+) -> tuple[Path, Path]:
+    subset = band_summary.loc[
+        (band_summary["method"] == method)
+        & (band_summary["antisymmetrized"].astype(bool) == bool(antisymmetrized))
+    ].copy()
+    bands = list(subset.get("frequency_band", pd.Series(dtype=str)).dropna().unique()) if not subset.empty else []
+    regions = [region for region in ("M1", "STR", "PF", "SNr") if region in set(subset.get("region_a", pd.Series(dtype=str))) | set(subset.get("region_b", pd.Series(dtype=str)))]
+    if not bands or not regions:
+        fig, axis = plt.subplots(figsize=(7, 4))
+        axis.text(0.5, 0.5, "No time-delay band estimates", ha="center", va="center")
+        axis.axis("off")
+        return _save(fig, output_base, dpi=dpi)
+    fig, axes = plt.subplots(1, len(bands), figsize=(3.0 * len(bands), 3.0), squeeze=False)
+    values = subset["region_peak_delay_ms"].to_numpy(float)
+    finite = values[np.isfinite(values)]
+    vmax = float(np.max(np.abs(finite))) if finite.size else 1.0
+    vmax = max(vmax, 1.0)
+    for band_index, band in enumerate(bands):
+        axis = axes[0, band_index]
+        matrix = pd.DataFrame(np.nan, index=regions, columns=regions)
+        for _, row in subset.loc[subset["frequency_band"] == band].iterrows():
+            matrix.loc[row["region_a"], row["region_b"]] = row["region_peak_delay_ms"]
+            matrix.loc[row["region_b"], row["region_a"]] = -row["region_peak_delay_ms"]
+        image = axis.imshow(matrix.to_numpy(float), vmin=-vmax, vmax=vmax, cmap="coolwarm", interpolation="nearest")
+        axis.set_title(str(band), fontsize=8)
+        axis.set_xticks(np.arange(len(regions)), regions, rotation=45, ha="right", fontsize=7)
+        axis.set_yticks(np.arange(len(regions)), regions, fontsize=7)
+        axis.set_xlabel("ms; diagonal N/A", fontsize=7)
+        for i in range(len(regions)):
+            for j in range(len(regions)):
+                if i != j and np.isfinite(matrix.iloc[i, j]):
+                    axis.text(j, i, f"{matrix.iloc[i, j]:.0f}", ha="center", va="center", fontsize=7, color="black")
+        fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="Peak delay (ms)")
+    mode = "antisymmetrized" if antisymmetrized else "standard"
+    fig.suptitle(f"PyBispectra TDE method {method} ({mode}); signed seed-to-target delay")
+    fig.tight_layout()
+    return _save(fig, output_base, dpi=dpi)

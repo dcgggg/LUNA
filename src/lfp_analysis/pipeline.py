@@ -29,10 +29,13 @@ from .plotting import (
     plot_parameterization_fit,
     plot_psd,
     plot_quality_matrix,
+    plot_time_delay_band_matrix,
+    plot_time_delay_spectrum,
     plot_waveforms,
 )
 from .quality import assess_quality
 from .spectral import compute_band_power, compute_psd, summarize_psd
+from .time_delay import compute_time_delay
 
 
 def _write_frame(frame: pd.DataFrame, path: Path) -> None:
@@ -191,6 +194,40 @@ def run_single_file(
         connectivity_status = str(connectivity["status"])
     else:
         _write_frame(pd.DataFrame([{"status": connectivity_status, "reason": "requires confirmed mapping and cross-epoch review"}]), output / "connectivity_status.csv")
+    time_delay_status = "disabled_by_config"
+    if bool(config.get("time_delay", {}).get("enabled", False)):
+        time_delay = compute_time_delay(loaded.data, loaded.sfreq, channel_table, quality["epoch"], config)
+        _write_frame(time_delay["spectrum"], output / "time_delay_spectrum.csv")
+        _write_frame(time_delay["region_spectrum"], output / "time_delay_region_spectrum.csv")
+        _write_frame(time_delay["channel_pair_summary"], output / "time_delay_channel_pair_summary.csv")
+        _write_frame(time_delay["band_summary"], output / "time_delay_band_summary.csv")
+        _write_frame(time_delay["input_checks"], output / "time_delay_input_checks.csv")
+        _write_frame(time_delay["failures"], output / "time_delay_failures.csv")
+        write_json(time_delay["metadata"], output / "time_delay_metadata.json")
+        if not time_delay["region_spectrum"].empty:
+            methods = sorted(time_delay["region_spectrum"]["method"].dropna().astype(int).unique())
+            antisym_modes = sorted(time_delay["region_spectrum"]["antisymmetrized"].dropna().astype(bool).unique())
+            for method in methods:
+                for antisymmetrized in antisym_modes:
+                    suffix = "antisym" if antisymmetrized else "standard"
+                    plot_time_delay_spectrum(
+                        time_delay["region_spectrum"],
+                        method,
+                        antisymmetrized,
+                        figures / f"time_delay_method_{method}_{suffix}_spectrum",
+                        dpi=int(config.get("plotting", {}).get("dpi", 150)),
+                    )
+                    if not time_delay["band_summary"].empty:
+                        plot_time_delay_band_matrix(
+                            time_delay["band_summary"],
+                            method,
+                            antisymmetrized,
+                            figures / f"time_delay_method_{method}_{suffix}_band_matrix",
+                            dpi=int(config.get("plotting", {}).get("dpi", 150)),
+                        )
+        time_delay_status = str(time_delay["status"])
+    else:
+        _write_frame(pd.DataFrame([{"status": time_delay_status, "reason": "disabled_by_config"}]), output / "time_delay_status.csv")
 
     expected = config.get("expected_data", {})
     file_quality = quality["file"].iloc[0].to_dict()
@@ -227,6 +264,8 @@ def run_single_file(
             config.get("connectivity", {}).get("fmax_hz", None),
         ],
         "connectivity_effective_duration_s": connectivity.get("metadata", {}).get("effective_valid_duration_s") if "connectivity" in locals() else None,
+        "time_delay_status": time_delay_status,
+        "time_delay_effective_duration_s": time_delay.get("metadata", {}).get("effective_valid_duration_s") if "time_delay" in locals() else None,
         "animal_level_statistics_run": False,
         "limitations": [
             "Actual_record_start/end are not inferred from event values.",

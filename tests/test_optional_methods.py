@@ -8,6 +8,7 @@ from lfp_analysis.parameterization import fit_channel_psd_table, fit_single_psd_
 from lfp_analysis.quality import assess_quality
 from lfp_analysis.spectral import compute_psd, summarize_psd
 from lfp_analysis.synthetic import make_synthetic_epochs
+from lfp_analysis.time_delay import compute_time_delay
 
 
 def test_specparam_result_fields_are_populated_when_available():
@@ -223,3 +224,50 @@ def test_connectivity_calibration_distinguishes_lagged_from_instantaneous_and_in
     assert low_noise["mim"] > high_noise["mim"]
     wpli = lagged_result["spectrum"].query("method == 'wpli2_debiased'")
     assert np.allclose(wpli["value_raw"], wpli["value_strength"], equal_nan=True)
+
+
+def test_time_delay_antisymmetrization_recovers_known_delay_under_common_noise():
+    pytest.importorskip("pybispectra")
+    from scipy.signal import butter, sosfiltfilt
+
+    rng = np.random.default_rng(123)
+    sfreq = 200.0
+    n_epochs, n_times = 30, 400
+    sos = butter(4, [4.0, 70.0], btype="bandpass", fs=sfreq, output="sos")
+    data = []
+    for _ in range(n_epochs):
+        source = sosfiltfilt(sos, rng.normal(size=n_times + 40))[20:-20]
+        source = source / np.std(source)
+        common_noise = 4.0 * rng.normal(size=n_times)
+        data.append(
+            [
+                source + 0.2 * rng.normal(size=n_times) + common_noise,
+                np.roll(source, 10) + 0.2 * rng.normal(size=n_times) + common_noise,
+            ]
+        )
+    data = np.asarray(data)
+    channels = ["seed", "target"]
+    channel_table = pd.DataFrame({"array_index": [0, 1], "channel_name": channels, "region": ["M1", "STR"]})
+    quality_epoch = pd.DataFrame({"quality_status": ["pass"] * n_epochs})
+    config = {
+        "time_delay": {
+            "enabled": True,
+            "analysis_sfreq_hz": 200.0,
+            "fft_window": "hamming",
+            "max_delay_ms": 1000.0,
+            "fmin_hz": 4.0,
+            "fmax_hz": 70.0,
+            "frequency_bands": {"broadband": [4.0, 70.0]},
+            "methods": [1],
+            "antisymmetrized": [False, True],
+            "min_epochs": 5,
+            "n_jobs": 1,
+        }
+    }
+    result = compute_time_delay(data, sfreq, channel_table, quality_epoch, config)
+    assert result["status"] == "ok"
+    summary = result["channel_pair_summary"].set_index("antisymmetrized")
+    assert abs(summary.loc[False, "peak_delay_ms"]) <= 5.0
+    assert abs(summary.loc[True, "peak_delay_ms"] - 50.0) <= 5.0
+    assert result["metadata"]["resampling"]["applied"] is False
+    assert result["metadata"]["delay_resolution_ms"] == 5.0
