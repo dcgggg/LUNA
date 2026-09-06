@@ -14,8 +14,9 @@ from pathlib import Path
 # ========================= Editable configuration =========================
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Change only this path for another FIF file.
-INPUT_FILE = Path(r"C:\Users\PC\Desktop\94\LID-94\T80\LID-T80_all_channels-epo.fif")
+# Put a FIF file in data/real/ or replace this with an absolute path on your
+# own computer. The sample FIF itself is intentionally not stored in Git.
+INPUT_FILE = PROJECT_ROOT / "data" / "real" / "LID-T80_all_channels-epo.fif"
 
 # These paths normally stay unchanged.
 CONFIG_FILE = PROJECT_ROOT / "configs" / "default.yaml"

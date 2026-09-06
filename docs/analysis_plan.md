@@ -4,9 +4,9 @@
 
 状态：已完成。
 
-- 当前工作区：`C:\Users\PC\Documents\ChatGPT\LID_Tetrode_Analysis`。
+- 项目路径由每台电脑自行决定；代码使用项目根目录和相对路径，不依赖特定用户名。
 - Python：本地 `.venv`，Python 3.11.9。
-- 当前仓库只有本地 Git；本项目不自动上传 GitHub。
+- 原始 FIF 样例不纳入版本控制；样例可放在本地 `data/real/` 中运行。
 - 实际样例文件作为只读输入保留在用户提供的位置，不复制、不覆盖。
 - 方法核对：MNE-Connectivity 0.9.0 文档、FOOOF 1.1.1 文档、SciPy Welch 文档。
 
@@ -14,9 +14,7 @@
 
 状态：已完成并在真实样例上运行。
 
-真实样例输入：
-
-`C:\Users\PC\Desktop\94\LID-94\T80\LID-T80_all_channels-epo.fif`
+真实样例输入：用户提供的 T80 FIF 文件；原始文件不复制到仓库，运行时通过本地路径指定。
 
 核验结果：
 

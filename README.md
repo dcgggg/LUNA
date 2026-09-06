@@ -1,21 +1,69 @@
 # 小鼠多脑区同步 tetrode LFP 分析
 
-这是一个本地、可追溯、模块化的 Python 分析项目。当前仓库已经用用户提供的 T80 FIF 样例完成单文件验证；真实实验登记仍需继续补齐。因此当前实现提供：
+这是一个面向小鼠多脑区同步 tetrode LFP 数据的、可追溯的 Python 分析项目。输入为经过预处理的 FIF epoch 文件；每个输入文件可以代表一只小鼠在一次记录节点的结果。项目先保存文件级结果，等动物、记录日期、给药时点和行为信息补齐后，再进行动物层统计。
 
-- FIF 读取与数据结构核查；
-- 物理通道名/编号/脑区映射接口，不按数组位置推断物理通道；
-- `events`、`selection`、`drop_log` 原样留存；
-- 不连续 epoch 的质量检查和实际有效时长计算；
-- 逐 epoch × 通道 Welch PSD、频段绝对/相对功率；
-- 文件级结果表、质量汇总和基础 PNG/SVG 图；
-- 合成信号标定测试；
-- specparam/FOOOF 参数化；基于多个有效 epoch 的 MIC、MIM 和去偏平方 wPLI 连接分析；基于 PyBispectra 双谱的时间延迟分析；行为、统计和批量运行接口。
+当前版本已经在用户提供的 T80 FIF 样例上完成单文件验证。样例原始数据不存放在 GitHub 仓库中，也不会被程序覆盖。
 
-真实实验身份、给药安排、AIMs 和视频同步信息缺失时，代码不会自动补造，也不会将未匹配文件纳入动物层级统计。LDN 保留为独立药物字段，名称、剂量和安排为空时保持为空。
+## 当前已经实现
 
-## 当前环境
+- FIF 读取、通道名称和物理通道映射核查。
+- `events`、`selection`、`drop_log` 和 epoch 追溯信息保存。
+- NaN/Inf、平直信号、异常幅度、饱和、重复片段和残余工频质量检查。
+- 实际有效时长计算；不把不连续 epoch 拼接成连续记录。
+- 逐 epoch、逐通道 Welch PSD。
+- 绝对功率、相对功率和可配置频段汇总。
+- specparam 参数化；保留非周期背景、周期峰、拟合曲线、残差和失败原因。
+- 基于多个有效 epoch 的多变量 MIC、MIM 和去偏平方 wPLI。
+- 基于 PyBispectra 的双谱时间延迟分析，包含标准和 antisymmetrized 结果。
+- 四脑区通道冗余、奇异值、有效秩、维度敏感性和片段稳定性检查。
+- 单文件入口、批量入口、元数据模板、Notebook、CSV 结果表、PNG/SVG 图和运行日志。
+- 动物、记录、文件、epoch 和行为表之间的追溯接口。
 
-建议使用当前目录的 Python 3.11 虚拟环境：
+当前不会自动完成：
+
+- 根据文件名前缀推断动物编号、记录日期或给药天数。
+- 在身份缺失时运行动物层推断统计。
+- 将 AIMs 评分复制到每个 epoch 并当作独立行为样本。
+- 自动进行 LID/LDN 组间比较或治疗效果推断。
+- 默认运行 Granger/时间反转校正；该扩展仍关闭。
+- 分析 spike 数据。
+
+## 项目结构
+
+```text
+configs/                可编辑分析配置
+data/real/              本地真实 FIF；默认不提交
+data/synthetic/         合成验证数据位置
+metadata/               动物、记录、文件、epoch、行为和通道登记模板
+notebooks/              可逐步执行的单文件 Notebook
+scripts/                PyCharm 可直接运行的 .py 入口
+src/lfp_analysis/       读取、质量、频谱、参数化、连接、延迟和绘图模块
+tests/                  单元测试和合成信号验证
+docs/                   分阶段实施记录和分析限制
+results/                运行输出；默认不提交
+pyproject.toml          Python 项目和依赖声明
+requirements-lock.txt   当前 Windows 环境的依赖版本快照
+```
+
+## Python 环境
+
+推荐环境：
+
+- 操作系统：Windows 10/11（当前版本在 Windows 上验证）。
+- Python：3.11，项目约束为 `>=3.11,<3.13`。
+- 虚拟环境：项目根目录下的 `.venv`。
+- 包管理：`pip`。
+- 编辑器：PyCharm、VS Code 或 JupyterLab 均可；计算模块不依赖图形界面。
+
+Python 官方下载：[python.org/downloads](https://www.python.org/downloads/)
+
+Python 虚拟环境文档：[venv documentation](https://docs.python.org/3.11/library/venv.html)
+
+Python Packaging Guide：[pip and virtual environments](https://packaging.python.org/en/latest/guides/installing-using-pip-and-virtual-environments/)
+
+### Windows 安装环境
+
+在项目根目录创建并激活虚拟环境：
 
 ```powershell
 py -3.11 -m venv .venv
@@ -24,71 +72,122 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[all]"
 ```
 
-本项目也会记录可复现的锁定依赖：
+如果 PowerShell 阻止激活脚本，可以不激活，直接使用虚拟环境解释器：
 
 ```powershell
-python -m pip freeze | Out-File -Encoding utf8 requirements-lock.txt
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e ".[all]"
 ```
 
-## 目录约定
+也可以按当前锁定版本安装依赖，再安装本项目：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+`requirements-lock.txt` 是当前 Windows/Python 3.11 环境的可审计快照，其中不再包含本机绝对路径。跨平台安装时，优先使用 `pyproject.toml` 的依赖范围；锁定文件中的个别包可能带有 Windows 或本机环境特征。
+
+### PyCharm 设置
+
+在 PyCharm 中选择：
+
+1. `File` → `Settings` → `Project` → `Python Interpreter`。
+2. 选择项目解释器：`<项目根目录>\.venv\Scripts\python.exe`。
+3. 打开 `scripts/run_single_file.py`。
+4. 修改文件顶部的 `INPUT_FILE` 和 `OUTPUT_DIR`。
+5. 右键文件，选择 `Run 'run_single_file'`。
+
+推荐把 FIF 放入 `data/real/`，这样可以使用项目相对路径：
+
+```python
+INPUT_FILE = PROJECT_ROOT / "data" / "real" / "your-file-epo.fif"
+```
+
+也可以使用自己电脑上的绝对路径。FIF 文件不需要复制进 GitHub 仓库。
+
+## 依赖和官方文档
+
+### 必需依赖
+
+| 包 | 用途 | 官方网站 |
+|---|---|---|
+| NumPy | 数组和数值计算 | [numpy.org](https://numpy.org/) |
+| SciPy | Welch PSD、滤波和信号处理 | [scipy.org](https://scipy.org/) |
+| pandas | 元数据和结果表 | [pandas.pydata.org](https://pandas.pydata.org/) |
+| Matplotlib | PNG/SVG 图形 | [matplotlib.org](https://matplotlib.org/) |
+| PyYAML | YAML 配置文件 | [PyYAML documentation](https://pyyaml.org/wiki/PyYAMLDocumentation) |
+| MNE-Python | FIF 读取和神经信号数据结构 | [mne.tools](https://mne.tools/stable/index.html) |
+
+### 分析和开发依赖
+
+| 包 | 用途 | 官方网站 |
+|---|---|---|
+| MNE-Connectivity | MIC、MIM、wPLI 等连接估计 | [MNE-Connectivity](https://mne.tools/mne-connectivity/stable/) |
+| PyBispectra | 双谱时间延迟分析 | [PyBispectra documentation](https://pybispectra.readthedocs.io/) |
+| specparam | 功率谱非周期/周期参数化 | [specparam on PyPI](https://pypi.org/project/specparam/) |
+| FOOOF | specparam 的兼容后端 | [FOOOF documentation](https://fooof-tools.github.io/fooof/) |
+| JupyterLab | Notebook 运行环境 | [jupyter.org](https://jupyter.org/) |
+| pytest | 自动化测试 | [pytest.org](https://pytest.org/) |
+| Ruff | Python 代码检查 | [docs.astral.sh/ruff](https://docs.astral.sh/ruff/) |
+
+项目依赖分组定义在 `pyproject.toml`：
 
 ```text
-data/
-  real/                 # 本地真实 FIF；默认不提交
-  synthetic/            # 明确标记的合成验证数据
-metadata/               # 登记模板、字段字典、通道映射模板
-configs/                # 可编辑分析配置
-src/lfp_analysis/       # 计算模块和 CLI
-notebooks/              # 可逐步执行的 Notebook
-tests/                  # 算法和边界测试
-results/                # 运行生成，默认不提交
+.[connectivity]       MNE-Connectivity
+.[tde]                PyBispectra
+.[parameterization]   specparam 和 FOOOF
+.[notebook]           JupyterLab、Notebook 和 ipykernel
+.[dev]                pytest 和 Ruff
+.[all]                上述全部依赖
 ```
 
-## 第一阶段运行
+## 输入数据和元数据
 
-### 合成数据标定
+原始 FIF 文件建议放在本地 `data/real/`，但不会提交到仓库。至少需要确认：
+
+- 采样率和 epoch 形状。
+- 实际通道名称与物理通道编号。
+- 脑区映射。
+- 给药前/后状态和名义给药后时间。
+- 动物编号、记录节点和记录日期。
+- AIMs 评分及其观察窗。
+
+当前样例使用的脑区映射为：物理通道 1–4 为 M1，5–8 为 STR，17–20 为 PF，21–24 为 SNr。映射必须在 `metadata/channel_map.csv` 中按实际通道名称确认，代码不会把数组第 9 个位置自动当作物理通道 9。
+
+元数据表的粒度如下：
+
+| 表 | 一行代表什么 | 主要关联 |
+|---|---|---|
+| `animals.csv` | 一只小鼠 | `animal_id` |
+| `records.csv` | 一只小鼠的一次记录/session | `session_id`、`animal_id` |
+| `files.csv` | 一个 FIF 文件及给药节点 | `file_id`、`session_id` |
+| `epochs.csv` | 一个文件中的候选/保留 epoch | `file_id + saved_index` |
+| `behavior.csv` | 动物×记录×给药时点的行为记录 | `animal_id + session_id + nominal_dose_time_min` |
+| `channel_map.csv` | 实际通道名到物理编号/脑区的映射 | `channel_name` |
+
+空值代表未知，不用 `0` 代替未知天数、评分或时间。给药前基线使用 `pre_dose_baseline`，不自动写成给药后 0 分钟。`T80` 只表示名义给药后 80 分钟，不表示每个 epoch 的精确起止时间。
+
+## 运行方式
+
+### 1. 运行测试
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe -m lfp_analysis.cli validate-synthetic --output results/synthetic_validation
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m ruff check src tests scripts
 ```
 
-合成数据仅用于测试频率识别、功率积分、epoch 边界和不连续时长处理，不代表实验结果。
-
-### 单文件 FIF
-
-将 FIF 放入 `data/real/`，先编辑 `metadata/channel_map.csv` 和相关登记表，再运行：
+### 2. 合成信号验证
 
 ```powershell
-.\.venv\Scripts\python.exe -m lfp_analysis.cli single-file \
-  --input data/real/LID-T80_all_channels-epo.fif \
-  --config configs/default.yaml \
-  --output results/LID-T80
+.\.venv\Scripts\python.exe -m lfp_analysis.cli validate-synthetic `
+  --output results/synthetic_validation
 ```
 
-Windows PowerShell 中可把反斜杠续行改为单行命令。若 `animal_id` 等身份字段为空，文件级质量/频谱/参数化仍可运行，但动物层统计会明确标记为不可用。
+合成数据只用于验证频率识别、功率积分、epoch 边界、连接估计和延迟方法的基本标定，不代表真实实验结果。
 
-默认配置已启用 specparam 参数化（fixed、无 knee，拟合范围 2–150 Hz）。该范围和峰参数均只是可编辑的起步配置，不是已确认的生理频段边界。参数化输出包括：
-
-- `parameterization_model.csv`：每个汇总通道一行，含 offset、exponent、峰拟合质量；
-- `parameterization_peaks.csv`：周期峰的中心频率、峰高和带宽；
-- `parameterization_curves.csv`：观测 PSD、完整模型、非周期背景、周期成分和残差；
-- `parameterization_failures.csv`：失败或低质量记录，不静默删除；
-- `figures/parameterization_fit.(png|svg)` 和 `figures/parameterization_components.(png|svg)`。
-
-如需使用旧版 FOOOF 后端，把配置中的 `parameterization.backend` 改为 `fooof`；两种后端都写入相同的结果表结构。推荐新项目优先使用 specparam。
-
-### 不使用终端：在 PyCharm 中运行
-
-打开 [scripts/run_single_file.py](scripts/run_single_file.py)，只修改文件顶部的 `INPUT_FILE` 和 `OUTPUT_DIR`，然后在 PyCharm 的项目解释器中右键该文件，选择 `Run 'run_single_file'`。运行结束后，PyCharm 的 Run 窗口会显示结果目录、连接状态和时间延迟状态；详细 CSV、图和 `run_manifest.json` 位于 `OUTPUT_DIR`。
-
-PyCharm 的 Python Interpreter 应选择项目的 `.venv\Scripts\python.exe`。如果提示缺少依赖，在 PyCharm 的 Python Packages 中安装项目的 `.[all]` 依赖，或由项目维护者在该虚拟环境中安装依赖。这个脚本只负责调用现有分析模块，不复制算法逻辑。
-
-### 单文件功能连接
-
-当前配置已根据用户确认的物理通道范围启用四脑区映射：物理 1–4 为 M1、5–8 为 STR、17–20 为 PF、21–24 为 SNr。映射保存在 `metadata/channel_map.csv`；代码按物理通道名匹配，不按数组位置猜测。若换用新数据，先核对该表并将不适用的行留空或另建映射。
-
-运行同一条 `single-file` 命令即可生成连接结果：
+### 3. 单文件命令行运行
 
 ```powershell
 .\.venv\Scripts\python.exe -m lfp_analysis.cli single-file `
@@ -97,63 +196,77 @@ PyCharm 的 Python Interpreter 应选择项目的 `.venv\Scripts\python.exe`。�
   --output results\your-file
 ```
 
-连接首版在同一文件/记录节点/给药时点内使用全部有效 epoch；不拼接不连续 epoch。默认频率范围为配置中的 2–100 Hz，multitaper 参数、排除的 50/60 Hz 线噪声频点、频段和降维规则都写入 `configs/default.yaml`。这些是可复核的起步设置，不是已经验证的小鼠生理边界。
+如果不想使用终端，使用上面的 [PyCharm 运行脚本](scripts/run_single_file.py)。它只是调用同一套 `src/lfp_analysis` 计算模块，不复制算法逻辑。
 
-主要输出包括：
+### 4. 批量运行
 
-- `connectivity_spectrum.csv`：MIC、MIM 和 `wpli2_debiased` 的完整频谱；MIC 同时保留有符号原值和用于强度展示的绝对值；wPLI 保留有限样本下可能出现的负估计值。
-- `connectivity_region_summary.csv`：多变量脑区对结果，以及 wPLI 的逐通道对结果；不把通道对当成动物样本。
-- `connectivity_band_summary.csv`：按配置频段汇总的脑区对结果；wPLI 首版使用有效通道对的中位数，同时保留通道对数量。
-- `connectivity_redundancy_correlation.csv`、`connectivity_redundancy_singular_values.csv`、`connectivity_rank_summary.csv`：四通道相关矩阵、奇异值/方差贡献和保留维度。
-- `connectivity_rank_sensitivity.csv`、`connectivity_stability.csv`、`connectivity_input_checks.csv`：维度敏感性、片段稳定性、数据量/频率边界/质量检查。
-- `connectivity_patterns.csv`：MNE 提供的 MIC/MIM 空间 pattern（若可用）；它们不是通道生物学贡献权重。
-- `connectivity_failures.csv` 和 `connectivity_metadata.json`：失败原因、有效 epoch 数、有效时长、频率栅格和实际估计设置。
-- `figures/connectivity_*.png` 与 `figures/connectivity_*.svg`：冗余/秩图、三种方法频谱、频段矩阵、wPLI 通道对矩阵和秩敏感性图。
-
-### 时间延迟分析
-
-默认配置已加入 PyBispectra 的 bispectrum-based TDE。首版同时保留 Method I 的标准结果和 bispectral antisymmetrization 结果，用于检查共同噪声/瞬时混合造成的零延迟偏差。正延迟表示 seed 通道/脑区领先 target，负延迟表示 target 领先 seed；这只是时间符号约定，不是解剖方向或因果证明。该方法依据 [PyBispectra JOSS 文章](https://doi.org/10.21105/joss.08504)、[PyBispectra TDE 官方示例](https://pybispectra.readthedocs.io/latest/auto_examples/plot_compute_tde.html) 和 [混合噪声下 TDE 论文](https://arxiv.org/abs/2502.17474)。
-
-由于原始数据为 1000 Hz、5 秒 epoch，TDE 默认仅在 TDE 内部用 `scipy.signal.resample_poly` 抗混叠降到 200 Hz，原始数据和其他 LFP 指标不受影响。默认延迟窗口为 −1000 到 +1000 ms、5 ms 延迟分辨率；FFT 频率栅格和频段范围同时写入 metadata。所有设置都可在 `configs/default.yaml` 的 `time_delay` 节修改。
-
-新增输出：
-
-- `time_delay_spectrum.csv`：所有六组脑区对、16 个跨脑区通道对、频段、延迟时间点的完整 TDE 曲线。
-- `time_delay_region_spectrum.csv`：脑区对层面的通道对中位数延迟谱。
-- `time_delay_channel_pair_summary.csv`：每个通道对和频段的峰延迟、峰强度和方向符号。
-- `time_delay_band_summary.csv`：脑区层面峰延迟、通道对中位数、MAD 和质量标记。
-- `time_delay_input_checks.csv`、`time_delay_failures.csv`、`time_delay_metadata.json`：有效 epoch、有效时长、降采样、FFT/TDE 点数、频率栅格、延迟窗口和失败原因。
-- `figures/time_delay_*.png|svg`：标准/antisymmetrized 延迟谱和频段延迟矩阵。
-
-`peak_at_delay_window_edge`、`high_channel_pair_delay_dispersion` 和 `region_peak_differs_from_channel_median` 是质量标记，不是自动排除规则。当前 T80 只有文件级结果；不要把 TDE 峰直接解释为脑区之间已经验证的生物学传导速度。
-
-当前 Granger/时间反转校正仍默认关闭；单个未登记动物身份的文件只生成文件级描述性结果，不自动进入动物层统计。
-
-### 批量入口
+先在 `metadata/files.csv` 登记文件，再运行：
 
 ```powershell
-.\.venv\Scripts\python.exe -m lfp_analysis.cli batch \
-  --files metadata/files.csv \
-  --config configs/default.yaml \
-  --output results/batch
+.\.venv\Scripts\python.exe -m lfp_analysis.cli batch `
+  --files metadata\files.csv `
+  --config configs\default.yaml `
+  --output results\batch
 ```
 
-批量入口只处理登记表中路径存在且身份/键不冲突的文件；所有跳过原因写入运行日志和 `batch_manifest.csv`。
+不存在、身份冲突或无法解析的文件会写入批量清单和运行日志，不会静默纳入统计。
 
-## 已知限制
+### 5. Notebook
 
-- T80 样例已经核验 16 个通道名称、MNE 单位和用户确认的物理编号/脑区映射；动物编号、session、给药天数、AIMs 和视频同步仍未登记。
-- 采样率、epoch 长度、Welch 窗长/重叠、频段边界以及质量阈值都在配置中作为“起步建议”，不是已确认实验参数。
-- 默认不再次滤波、陷波、重参考或强清洗；质量标记不会静默删除数据。
-- 参数化是在文件/给药时点内按通道汇总 PSD 上拟合，尚未实现逐 5 秒 epoch 动态拟合。
-- 连接已在当前 T80 样例上运行；不会将单个 5 秒 epoch 当成可靠跨 epoch 连接估计。T80 本次重新核验为 21 个有效 epoch、105 s 有效时长，而不是把 5 秒片段拼成连续记录。
-- 当前 `mne-connectivity` 为 0.9.0；该版本的 multitaper 结果属性未提供可用的 `n_tapers` 数值，因此结果表保留为空，不自行编造 tapers 数量。
-- 当前只有一个身份未解析的 T80 文件，尚未运行 LID/LDN 比较、AIMs 关联或动物层统计；Granger 默认关闭。
-- 时间延迟首版使用 PyBispectra Method I；标准和 antisymmetrized 结果均保留。TDE 的降采样、延迟窗口和频段是可编辑起步设置，不是已确认的实验参数。
-- 本阶段不做 LID/LDN 组间推断或 AIMs 统计；这需要真实动物编号、记录节点、实际给药后时间和行为关联信息。
+打开 `notebooks/01_single_file_workflow.ipynb`，选择项目 `.venv` 内核并按顺序执行。Notebook 用于查看结果；核心计算仍在 `src/lfp_analysis`，因此也可以从 PyCharm 或批量入口运行。
 
-## 官方方法依据
+## 主要输出
 
-- MNE-Connectivity 的 `spectral_connectivity_epochs` 文档：输入为多个 epoch，频谱连接跨 epoch 估计；单个或很少 epoch 的估计不可靠，结果不能直接作因果解释。
-- FOOOF/specparam 文档：模型输入为正确尺度的功率谱，输出非周期背景和周期峰参数；本项目不以一条直线替代参数化模型。
-- SciPy `welch` 文档：`nperseg`、`noverlap`、窗口、`scaling` 等均在配置文件中明确记录。
+单文件结果目录通常包含：
+
+- `run_manifest.json`：输入文件哈希、软件/参数摘要、输出状态和限制。
+- `epochs_trace.csv`、`traceability/`：epoch、events、selection 和 drop log 追溯。
+- `quality_epoch_channel.csv`、质量汇总和原始波形图。
+- `psd_channel.csv`、`band_power_channel.csv`、PSD/频段功率图。
+- `parameterization_model.csv`、`parameterization_peaks.csv`、`parameterization_curves.csv` 和拟合图。
+- `connectivity_spectrum.csv`、`connectivity_region_summary.csv`、`connectivity_band_summary.csv`。
+- `connectivity_rank_summary.csv`、`connectivity_stability.csv` 和连接质量图。
+- `time_delay_spectrum.csv`、`time_delay_band_summary.csv`、`time_delay_metadata.json` 和延迟图。
+- `figures/`：预览用 PNG 和可编辑 SVG。
+
+真实 T80 样例当前只支持文件级描述性结果：重新核验得到 21 个有效 epoch、105 秒有效时长。由于动物身份、session、给药天数和 AIMs 关联尚未登记，程序不会运行 LID/LDN 组间推断或行为相关统计。
+
+## 分析约定和重要限制
+
+- 连接估计在同一动物×记录节点×给药时点内使用多个有效 epoch；不跨动物、记录天数或时点混合，也不拼接不连续 epoch。
+- 通道、epoch 和通道对是动物内部重复测量，不能当作独立小鼠样本。
+- MIC 保留有符号原值；图中强度可使用明确标注的绝对值，但不解释为因果方向。
+- MIM 保留原始未归一化值，不强行裁剪到 0–1。
+- 去偏平方 wPLI 不开平方、不把负估计静默截为 0；脑区汇总保留通道对数量和分布。
+- 时间延迟的正负号只表示 seed→target 的时间符号约定，不等于解剖方向或因果证明。
+- 默认不再次强滤波、陷波、重参考或强清洗；质量标记不会静默删除数据。
+- 配置中的频段、阈值、降维和延迟范围是可编辑的起步设置，不是已经验证的小鼠生理边界。
+- LDN 名称、剂量和给药安排未知时留空，不根据文件名推定。
+
+更完整的分阶段记录见 [`docs/analysis_plan.md`](docs/analysis_plan.md)，字段定义见 [`metadata/README.md`](metadata/README.md)。
+
+## 版本和复现
+
+每次运行都会记录输入文件标识、SHA-256、参数配置、有效 epoch 数、有效时长、质量状态和排除/失败原因。建议：
+
+1. 不修改原始 FIF。
+2. 每个输入文件使用独立的输出目录。
+3. 修改分析参数后保留配置文件副本。
+4. 在提交结果前运行 pytest、`pip check` 和 Ruff。
+5. 将动物身份和行为信息登记到 `metadata/`，再进行动物层统计。
+
+当前仓库只包含代码、配置、模板、Notebook 和测试；真实 FIF、`.venv/`、`.idea/`、结果和日志默认被 `.gitignore` 排除。
+
+## 研究方法参考
+
+- [MNE-Connectivity spectral connectivity API](https://mne.tools/mne-connectivity/stable/generated/mne_connectivity.spectral_connectivity_epochs.html)
+- [MNE-Connectivity MIC/MIM example](https://mne.tools/mne-connectivity/stable/auto_examples/mic_mim.html)
+- [SciPy Welch documentation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.welch.html)
+- [FOOOF model fitting tutorial](https://fooof-tools.github.io/fooof/auto_tutorials/plot_02-FOOOF.html)
+- [PyBispectra time-delay examples](https://pybispectra.readthedocs.io/latest/examples.html)
+- [PyBispectra JOSS article](https://doi.org/10.21105/joss.08504)
+- [PyBispectra time-delay paper](https://arxiv.org/abs/2502.17474)
+
+## License
+
+当前仓库尚未声明开源许可证。如需公开复用，建议在 GitHub 仓库中根据作者和数据权限补充许可证；原始实验数据不应随代码仓库公开上传。
