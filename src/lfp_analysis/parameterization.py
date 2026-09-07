@@ -102,13 +102,22 @@ def fit_single_psd_detailed(
     fit_power = power[finite]
     try:
         Model = _model_class(backend_requested)
-        model = Model(
-            peak_width_limits=tuple(parameter_cfg.get("peak_width_limits_hz", [1.0, 12.0])),
-            max_n_peaks=int(parameter_cfg.get("max_n_peaks", 6)),
-            min_peak_height=float(parameter_cfg.get("min_peak_height", 0.0)),
-            aperiodic_mode=str(parameter_cfg.get("aperiodic_mode", "fixed")),
-            verbose=False,
-        )
+        model_kwargs = {
+            "peak_width_limits": tuple(parameter_cfg.get("peak_width_limits_hz", [1.0, 12.0])),
+            "max_n_peaks": int(parameter_cfg.get("max_n_peaks", 6)),
+            "min_peak_height": float(parameter_cfg.get("min_peak_height", 0.0)),
+            "peak_threshold": float(parameter_cfg.get("peak_threshold", 2.0)),
+            "aperiodic_mode": str(parameter_cfg.get("aperiodic_mode", "fixed")),
+            "verbose": False,
+        }
+        try:
+            model = Model(**model_kwargs)
+        except TypeError:
+            # Some specparam development builds expose a smaller constructor;
+            # retain the requested values in the GUI snapshot but only pass
+            # arguments supported by that installed backend.
+            model_kwargs.pop("peak_threshold", None)
+            model = Model(**model_kwargs)
         model.fit(fit_frequencies, fit_power, fit_range)
         aperiodic, peaks, full_log, aperiodic_log, peak_log, r_squared, error = _extract_fit_components(model, Model)
         if aperiodic.size < 2:

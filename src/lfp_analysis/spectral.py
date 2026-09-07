@@ -21,6 +21,8 @@ def compute_psd(data: np.ndarray, sfreq: float, ch_names: list[str], config: dic
     fmax = float(psd_cfg.get("fmax_hz", sfreq / 2))
     requested_nperseg = int(psd_cfg.get("nperseg", min(1000, data.shape[-1])))
     requested_noverlap = int(psd_cfg.get("noverlap", requested_nperseg // 2))
+    requested_nfft = psd_cfg.get("nfft")
+    requested_nfft = None if requested_nfft in (None, "", 0, "0") else int(requested_nfft)
     window = psd_cfg.get("window", "hann")
     detrend = psd_cfg.get("detrend", "constant")
     scaling = psd_cfg.get("scaling", "density")
@@ -50,6 +52,7 @@ def compute_psd(data: np.ndarray, sfreq: float, ch_names: list[str], config: dic
                 window=window,
                 nperseg=nperseg,
                 noverlap=noverlap,
+                nfft=requested_nfft,
                 detrend=detrend,
                 scaling=scaling,
                 average=psd_cfg.get("average", "mean"),
@@ -71,12 +74,17 @@ def compute_psd(data: np.ndarray, sfreq: float, ch_names: list[str], config: dic
     return pd.DataFrame(rows)
 
 
-def summarize_psd(psd: pd.DataFrame, channel_table: pd.DataFrame | None = None) -> dict[str, pd.DataFrame]:
+def summarize_psd(
+    psd: pd.DataFrame,
+    channel_table: pd.DataFrame | None = None,
+    epoch_aggregation: str = "mean",
+) -> dict[str, pd.DataFrame]:
     valid = psd.loc[psd["status"] == "ok"].copy()
+    aggregation = "median" if str(epoch_aggregation).lower() == "median" else "mean"
     channel_summary = (
         valid.groupby(["channel_array_index", "channel_name", "frequency_hz"], as_index=False)
         .agg(
-            psd_value=("psd_value", "mean"),
+            psd_value=("psd_value", aggregation),
             psd_sd=("psd_value", "std"),
             n_epochs=("epoch_index", "nunique"),
         )

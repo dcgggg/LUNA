@@ -67,6 +67,23 @@ def region_channel_pairs(channel_table: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(pairs)
 
 
+def selected_region_pairs(region_names: list[str] | tuple[str, ...], config: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return configured region pairs while preserving the canonical order."""
+    configured = config.get("connectivity", {}).get("selected_region_pairs")
+    all_pairs = list(combinations(region_names, 2))
+    if not configured:
+        return all_pairs
+    allowed: set[frozenset[str]] = set()
+    for item in configured:
+        if isinstance(item, str):
+            parts = [part.strip() for part in item.replace("–", "-").split("-") if part.strip()]
+        else:
+            parts = [str(part).strip() for part in item]
+        if len(parts) == 2:
+            allowed.add(frozenset(parts))
+    return [(region_a, region_b) for region_a, region_b in all_pairs if frozenset((region_a, region_b)) in allowed]
+
+
 def assess_region_redundancy(
     data: np.ndarray,
     sfreq: float,
@@ -500,7 +517,7 @@ def _run_rank_sensitivity(data: np.ndarray, sfreq: float, region_info: dict[str,
         return pd.DataFrame([{"status": "disabled_by_config"}])
     offsets = [int(item) for item in conn_cfg.get("rank_sensitivity_offsets", [-1, 0, 1])]
     rows: list[dict[str, Any]] = []
-    for region_a, region_b in combinations(region_info["groups"], 2):
+    for region_a, region_b in selected_region_pairs(tuple(region_info["groups"]), config):
         seed_group = region_info["groups"][region_a]
         target_group = region_info["groups"][region_b]
         seed_base = region_info["rank_map"][region_a]
@@ -552,7 +569,7 @@ def _run_segment_stability(data: np.ndarray, sfreq: float, region_info: dict[str
     ]
     for subset_name, indices in subsets.items():
         subset_data = data[indices]
-        for region_a, region_b in combinations(region_info["groups"], 2):
+        for region_a, region_b in selected_region_pairs(tuple(region_info["groups"]), config):
             try:
                 multivariate = _estimate_multivariate(subset_data, sfreq, region_info["region_indices"][region_a], region_info["region_indices"][region_b], region_info["rank_map"][region_a], region_info["rank_map"][region_b], config)
                 for method, connection in zip(MULTIVARIATE_METHODS, multivariate):
@@ -618,7 +635,7 @@ def compute_connectivity(
     pattern_rows: list[dict[str, Any]] = []
     failure_rows: list[dict[str, Any]] = []
     effective_duration = float(n_valid * array_data.shape[-1] / sfreq)
-    for region_a, region_b in combinations(region_info["groups"], 2):
+    for region_a, region_b in selected_region_pairs(tuple(region_info["groups"]), config):
         seed_group = region_info["groups"][region_a]
         target_group = region_info["groups"][region_b]
         seed_indices = region_info["region_indices"][region_a]

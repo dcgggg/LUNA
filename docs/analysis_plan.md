@@ -79,3 +79,15 @@
 状态：未运行。
 
 原因：当前只有一个未登记动物身份的 T80 文件。不能据此进行 LID 进展、LDN 配对、AIMs 关联或组间推断。
+
+## 阶段 6：桌面 GUI
+
+状态：已实现并完成真实 T80 文件的程序化/离屏验收；真实桌面人工截图验收受当前工具环境限制，启动入口已提供。
+
+- `scripts/run_gui.py` 启动 PySide6 窗口；`src/lfp_analysis/gui.py` 只负责控件、后台 QThread、图表和表格；`src/lfp_analysis/gui_engine.py` 负责冻结快照、复用现有算法和安全保存。
+- `src/lfp_analysis/gui_specs.py` 是参数定义和验证的共同来源，包含单位、默认值、范围、适用指标、依赖和中文说明。
+- GUI 支持文件/通道/脑区/epoch/epoch 内时间窗选择，Quality、PSD、Band Power、FOOOF、MIC、MIM、wpli2_debiased、Time Delay 指标选择，Welch/specparam/multitaper/rank/频段/TDE 调整。
+- GUI 的 `MIC`、`MIM` 显式映射为后端 `mic`、`mim`；单选 MIM 不会顺带执行 PSD 或 FOOOF。FOOOF 自动使用匹配 PSD，Band Power 自动使用匹配 PSD。
+- 每次运行保存独立 `run_id`，包括输入 SHA-256、参数快照、软件版本、选择数据 NPZ、完整 CSV、PNG/SVG 和错误/警告。历史目录可在原始 FIF 不可用时载入表和图。
+- 真实 T80 GUI 后端验证：PSD/频段/FOOOF、三种连接方法和 Time Delay 均完成；GUI 参数修改实际反映为 Hamming、0.5 s、25% 重叠对应的 `nperseg=500`、`noverlap=125`。
+- 当前限制：GUI 的连接脑区对选择已传入主连接循环；Time Delay 复用现有实现，当前以已映射脑区集合生成跨区通道对，未新增独立的 TDE 脑区对过滤器；真实 Windows 人工鼠标验收需用户在本机启动后确认字体和高 DPI 显示。

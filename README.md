@@ -106,6 +106,30 @@ INPUT_FILE = PROJECT_ROOT / "data" / "real" / "your-file-epo.fif"
 
 也可以使用自己电脑上的绝对路径。FIF 文件不需要复制进 GitHub 仓库。
 
+### PySide6 桌面 GUI
+
+启动入口为 [`scripts/run_gui.py`](scripts/run_gui.py)。在 PyCharm 中右键该文件并运行，或使用可选的预载入参数：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_gui.py
+.\.venv\Scripts\python.exe scripts\run_gui.py `
+  --input "C:\path\to\your-epochs.fif" `
+  --output results\gui
+```
+
+GUI 的日常操作流程是：
+
+1. 添加一个或多个 FIF 文件，核对采样率、形状、有效 epoch 数、有效时长和 SHA-256。
+2. 在“分析范围”中选择脑区、实际通道、epoch 子集、epoch 内时间窗和连接脑区对。
+3. 在“指标”中独立勾选 Quality、PSD、Band Power、FOOOF、MIC、MIM、`wpli2_debiased` 或 Time Delay。
+4. 在参数页调整真正会传入后端的 Welch、specparam、multitaper、秩、频段和时间延迟参数。
+5. 点击“运行勾选指标”；计算在后台线程执行，每个指标完成后立即更新图和表。
+6. 使用“保存预设”保存参数，使用“载入历史”从 `run_manifest.json` 恢复结果，即使原始 FIF 暂时不可用也可以查看已保存图表和表格。
+
+每次 GUI 运行在输出目录中创建独立 `run_id/`，保存 `parameters.json`、`run_manifest.json`、每个文件的 CSV、完整 PSD/选择数据 NPZ、质量信息及 PNG/SVG 图。输入文件内容变化会产生新的 SHA-256，不能误用旧运行结果。修改显示设置只影响当前图；修改计算参数或数据选择会提示需要重新计算。
+
+GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/gui_engine.py`，不依赖 Notebook，也不复制命令行算法。Qt 官方线程文档：[QThread](https://doc.qt.io/qtforpython-6/PySide6/QtCore/QThread.html)；Matplotlib 嵌入 Qt 示例：[Embedding in Qt](https://matplotlib.org/stable/gallery/user_interfaces/embedding_in_qt_sgskip.html)。
+
 ## 依赖和官方文档
 
 ### 必需依赖
@@ -127,6 +151,7 @@ INPUT_FILE = PROJECT_ROOT / "data" / "real" / "your-file-epo.fif"
 | PyBispectra | 双谱时间延迟分析 | [PyBispectra documentation](https://pybispectra.readthedocs.io/) |
 | specparam | 功率谱非周期/周期参数化 | [specparam on PyPI](https://pypi.org/project/specparam/) |
 | FOOOF | specparam 的兼容后端 | [FOOOF documentation](https://fooof-tools.github.io/fooof/) |
+| PySide6 | 桌面 GUI、后台任务和控件 | [Qt for Python](https://doc.qt.io/qtforpython-6/) |
 | JupyterLab | Notebook 运行环境 | [jupyter.org](https://jupyter.org/) |
 | pytest | 自动化测试 | [pytest.org](https://pytest.org/) |
 | Ruff | Python 代码检查 | [docs.astral.sh/ruff](https://docs.astral.sh/ruff/) |

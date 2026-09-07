@@ -94,6 +94,9 @@ python-json-logger==4.2.0
 pytz==2026.3.post1
 pywinpty==3.0.5
 PyYAML==6.0.3
+PySide6==6.11.2
+PySide6_Addons==6.11.2
+PySide6_Essentials==6.11.2
 pyzmq==27.2.0
 referencing==0.37.0
 requests==2.34.2
@@ -105,6 +108,7 @@ ruff==0.16.6
 scikit-learn==1.9.0
 scipy==1.17.1
 Send2Trash==2.1.0
+shiboken6==6.11.2
 six==1.17.0
 soupsieve==2.9.2
 specparam==2.0.0rc7
