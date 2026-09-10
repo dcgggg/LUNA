@@ -21,10 +21,38 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .app_info import DEFAULT_CONFIG_FILENAME
+from .band_power_plots import (
+    ordered_bands,
+    ordered_channels,
+    plot_comparison,
+    plot_overview,
+    prepare_band_power,
+)
 from .config import load_config
 from .connectivity import compute_connectivity
+from .connectivity_plots import (
+    available_bands,
+    available_components,
+    available_methods,
+    plot_matrix,
+    plot_spectrum,
+    prepare_connectivity,
+)
+from .fooof_plots import ordered_channels as ordered_fooof_channels
+from .fooof_plots import (
+    plot_aperiodic_details,
+    plot_fooof_overview,
+    plot_peak_distribution,
+    plot_peak_parameters,
+    plot_periodic_curves,
+    plot_periodic_heatmap,
+    plot_single_channel_detail,
+    prepare_fooof,
+)
 from .gui_specs import normalize_gui_values, validate_snapshot
 from .io import channel_info_table, read_fif, sha256_file
+from .mapping import apply_mapping
 from .metadata import load_metadata_tables
 from .parameterization import fit_channel_psd_table
 from .quality import assess_quality
@@ -109,12 +137,30 @@ def _package_versions() -> dict[str, str]:
     return result
 
 
-def inspect_file(path: str | Path, metadata_dir: str | Path = "metadata") -> dict[str, Any]:
-    """Read one FIF and return UI-facing metadata plus the loaded object."""
+def inspect_file(
+    path: str | Path,
+    metadata_dir: str | Path = "metadata",
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Read one FIF and return UI-facing metadata plus an automatic quality check.
+
+    The check is deliberately performed during background inspection, before any
+    analysis indicator is run.  It uses the configured thresholds and never
+    changes, filters, rejects, or overwrites the input data.
+    """
     input_path = Path(path).expanduser().resolve()
     loaded = read_fif(input_path)
     tables = load_metadata_tables(metadata_dir)
     channel_table = channel_info_table(loaded, tables.get("channel_map"))
+    resolved_config_path = Path(config_path).expanduser().resolve() if config_path else Path(__file__).resolve().parents[2] / "configs" / DEFAULT_CONFIG_FILENAME
+    quality_config = load_config(resolved_config_path) if resolved_config_path.is_file() else {}
+    quality = assess_quality(loaded.data, loaded.sfreq, loaded.ch_names, quality_config)
+    quality_file = quality["file"].iloc[0].to_dict() if not quality["file"].empty else {}
+    dropped_candidates = [
+        {"original_candidate_index": index, "drop_reason": ";".join(reasons)}
+        for index, reasons in enumerate(loaded.drop_log)
+        if reasons
+    ]
     registry_row: dict[str, Any] = {}
     files = tables.get("files", pd.DataFrame())
     if not files.empty and "file_path" in files.columns:
@@ -131,7 +177,14 @@ def inspect_file(path: str | Path, metadata_dir: str | Path = "metadata") -> dic
         "sfreq": float(loaded.sfreq),
         "tmin": float(loaded.tmin),
         "tmax": float(loaded.tmax),
-        "effective_duration_s": float(loaded.data.shape[0] * loaded.data.shape[2] / loaded.sfreq),
+        "nominal_duration_s": float(loaded.data.shape[0] * loaded.data.shape[2] / loaded.sfreq),
+        "effective_duration_s": float(quality_file.get("effective_valid_duration_s", 0.0)),
+        "n_candidate_epochs": len(loaded.drop_log),
+        "n_dropped_candidates": len(dropped_candidates),
+        "dropped_candidates": dropped_candidates,
+        "quality": quality,
+        "quality_file": quality_file,
+        "quality_config_path": str(resolved_config_path),
         "sha256": sha256_file(input_path),
         "registry_row": registry_row,
     }
@@ -170,16 +223,32 @@ def build_runtime_config(base_config: dict[str, Any], snapshot: dict[str, Any], 
         if section in normalized:
             config.setdefault(section, {}).update(normalized[section])
     selected = set(snapshot.get("indicators", []))
-    indicator_to_method = {"MIC": "mic", "MIM": "mim", "wpli2_debiased": "wpli2_debiased"}
-    methods = [indicator_to_method[indicator] for indicator in ("MIC", "MIM", "wpli2_debiased") if indicator in selected]
+    indicator_to_method = {
+        "MIC": "mic",
+        "MIM": "mim",
+        "wpli": "wpli",
+        "dpli": "dpli",
+        "wpli2_debiased": "wpli2_debiased",
+    }
+    methods = [indicator_to_method[indicator] for indicator in ("MIC", "MIM", "wpli", "dpli", "wpli2_debiased") if indicator in selected]
     config.setdefault("connectivity", {})["methods"] = methods
     config["connectivity"]["enabled"] = bool(methods)
     config["connectivity"]["selected_region_pairs"] = snapshot.get("selected_region_pairs", [])
-    config["connectivity"]["fixed_rank_by_region"] = {
-        region: int(values.get("connectivity", {}).get(f"fixed_rank_{region}", 0) or 0)
-        for region in ("M1", "STR", "PF", "SNr")
-        if int(values.get("connectivity", {}).get(f"fixed_rank_{region}", 0) or 0) > 0
-    }
+    gui_connectivity = values.get("connectivity", {}) or {}
+    configured_rank_map = gui_connectivity.get("fixed_rank_by_region", {})
+    if isinstance(configured_rank_map, dict) and configured_rank_map:
+        config["connectivity"]["fixed_rank_by_region"] = {
+            str(region): int(rank)
+            for region, rank in configured_rank_map.items()
+            if str(region).strip() and int(rank or 0) > 0
+        }
+    else:
+        # Preserve direct API/preset compatibility with older fixed-rank keys.
+        config["connectivity"]["fixed_rank_by_region"] = {
+            region: int(gui_connectivity.get(f"fixed_rank_{region}", 0) or 0)
+            for region in ("M1", "STR", "PF", "SNr")
+            if int(gui_connectivity.get(f"fixed_rank_{region}", 0) or 0) > 0
+        }
     config["connectivity"]["stability_n_subsamples"] = int(values.get("connectivity", {}).get("stability_n_subsamples", 2))
     config["parameterization"]["enabled"] = "FOOOF" in selected
     config["time_delay"]["enabled"] = "Time Delay" in selected
@@ -204,6 +273,22 @@ def _save_table_group(base: Path, tables: dict[str, pd.DataFrame], provenance: d
     return paths
 
 
+def _attach_fooof_channel_metadata(fits: dict[str, pd.DataFrame], selected_table: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Add physical channel and region metadata without inferring it from position."""
+    metadata = selected_table[["array_index", "physical_channel_number", "region"]].rename(columns={"array_index": "channel_array_index"}).copy()
+    output: dict[str, pd.DataFrame] = {}
+    for name, table in fits.items():
+        frame = table.copy()
+        if frame.empty or "channel_array_index" not in frame.columns:
+            output[name] = frame
+            continue
+        for column in ("physical_channel_number", "region"):
+            if column in frame.columns:
+                frame = frame.drop(columns=[column])
+        output[name] = frame.merge(metadata, on="channel_array_index", how="left")
+    return output
+
+
 def _save_psd_npz(base: Path, psd: pd.DataFrame, selected_data: np.ndarray, sfreq: float) -> None:
     if psd.empty:
         _atomic_npz(base / "psd_arrays.npz", selected_data=selected_data, sfreq=np.asarray([sfreq]))
@@ -226,6 +311,38 @@ def _save_psd_npz(base: Path, psd: pd.DataFrame, selected_data: np.ndarray, sfre
         epoch_indices=np.asarray(epochs),
         channel_array_indices=np.asarray(channels),
         psd=values,
+    )
+
+
+def _save_connectivity_npz(base: Path, spectrum: pd.DataFrame) -> None:
+    """Save the complete connectivity long table in a compact array bundle."""
+    if spectrum.empty:
+        _atomic_npz(base / "connectivity_arrays.npz")
+        return
+    frame = spectrum.reset_index(drop=True)
+
+    def string_array(column: str) -> np.ndarray:
+        if column not in frame:
+            return np.asarray([], dtype=str)
+        return np.asarray(frame[column].fillna("").astype(str).to_numpy(), dtype=str)
+
+    _atomic_npz(
+        base / "connectivity_arrays.npz",
+        frequency_hz=pd.to_numeric(frame.get("frequency_hz", np.nan), errors="coerce").to_numpy(float),
+        value_raw=pd.to_numeric(frame.get("value_raw", np.nan), errors="coerce").to_numpy(float),
+        value_strength=pd.to_numeric(frame.get("value_strength", np.nan), errors="coerce").to_numpy(float),
+        component_index=pd.to_numeric(frame.get("component_index", np.nan), errors="coerce").to_numpy(float),
+        method=string_array("method"),
+        region_a=string_array("region_a"),
+        region_b=string_array("region_b"),
+        seed_region=string_array("seed_region"),
+        target_region=string_array("target_region"),
+        direction_order=string_array("direction_order"),
+        seed_channel=string_array("seed_channel"),
+        target_channel=string_array("target_channel"),
+        n_epochs=pd.to_numeric(frame.get("n_epochs", np.nan), errors="coerce").to_numpy(float),
+        rank_seed=pd.to_numeric(frame.get("rank_seed", np.nan), errors="coerce").to_numpy(float),
+        rank_target=pd.to_numeric(frame.get("rank_target", np.nan), errors="coerce").to_numpy(float),
     )
 
 
@@ -266,36 +383,199 @@ def _save_metric_figures(metric: str, tables: dict[str, pd.DataFrame], file_dir:
         if not table.empty:
             axis.legend(fontsize=6, ncol=2)
     elif metric == "Band Power":
-        table = tables.get("band_power_summary", pd.DataFrame())
-        if table.empty:
-            table = tables.get("band_power", pd.DataFrame())
-        if not table.empty:
-            summary = table.groupby("band", as_index=False)["absolute_power"].mean()
-            axis.bar(summary["band"].astype(str), summary["absolute_power"])
-            axis.tick_params(axis="x", rotation=45)
-            axis.set_ylabel("Mean absolute power (source unit²)")
-        else:
-            axis.text(0.5, 0.5, "No band-power rows", ha="center", va="center", transform=axis.transAxes)
+        prepared = prepare_band_power(tables, power_kind="absolute", aggregation="mean")
+        bands = ordered_bands(prepared["summary"])
+        channels = ordered_channels(prepared["summary"])
+        overview_fig = fig
+        plot_overview(
+            axis,
+            overview_fig,
+            prepared,
+            power_kind="absolute",
+            scale="linear",
+            selected_channel=channels[0]["channel_name"] if channels else None,
+            selected_band=bands[0]["band"] if bands else None,
+            show_values=False,
+            title=f"{file_id} | Band Power | Overview",
+            language="en",
+        )
+        fig.tight_layout()
+        overview_base = figures_dir / "band_power_overview"
+        fig.savefig(overview_base.with_suffix(".png"), dpi=150)
+        fig.savefig(overview_base.with_suffix(".svg"))
+        plt.close(fig)
+
+        compare_fig, compare_axis = plt.subplots(figsize=(9, 4.5))
+        plot_comparison(
+            compare_axis,
+            prepared,
+            mode="channel",
+            power_kind="absolute",
+            scale="linear",
+            selected_channel=channels[0]["channel_name"] if channels else None,
+            selected_band=bands[0]["band"] if bands else None,
+            show_epoch_distribution=False,
+            title=f"{file_id} | Band Power | Compare channels",
+            language="en",
+        )
+        compare_fig.tight_layout()
+        compare_base = figures_dir / "band_power_compare"
+        compare_fig.savefig(compare_base.with_suffix(".png"), dpi=150)
+        compare_fig.savefig(compare_base.with_suffix(".svg"))
+        plt.close(compare_fig)
+
+        combined_fig, combined_axes = plt.subplots(2, 1, figsize=(10, 10), constrained_layout=True)
+        plot_overview(
+            combined_axes[0],
+            combined_fig,
+            prepared,
+            power_kind="absolute",
+            scale="linear",
+            selected_channel=channels[0]["channel_name"] if channels else None,
+            selected_band=bands[0]["band"] if bands else None,
+            show_values=False,
+            title=f"{file_id} | Band Power | Overview",
+            language="en",
+        )
+        plot_comparison(
+            combined_axes[1],
+            prepared,
+            mode="channel",
+            power_kind="absolute",
+            scale="linear",
+            selected_channel=channels[0]["channel_name"] if channels else None,
+            selected_band=bands[0]["band"] if bands else None,
+            show_epoch_distribution=False,
+            title=f"{file_id} | Band Power | Compare channels",
+            language="en",
+        )
+        combined_base = figures_dir / "band_power_combined"
+        combined_fig.savefig(combined_base.with_suffix(".png"), dpi=150)
+        combined_fig.savefig(combined_base.with_suffix(".svg"))
+        plt.close(combined_fig)
+        return [
+            str(path.relative_to(file_dir))
+            for path in (
+                overview_base.with_suffix(".png"),
+                overview_base.with_suffix(".svg"),
+                compare_base.with_suffix(".png"),
+                compare_base.with_suffix(".svg"),
+                combined_base.with_suffix(".png"),
+                combined_base.with_suffix(".svg"),
+            )
+        ]
     elif metric == "FOOOF":
-        table = tables.get("curves", pd.DataFrame())
-        for channel, group in table.groupby("channel_name") if not table.empty else []:
-            group = group.sort_values("frequency_hz")
-            axis.plot(group["frequency_hz"], group["observed_power"], linewidth=0.7, label=f"{channel} observed")
-            axis.plot(group["frequency_hz"], group["full_model_power"], linewidth=0.9, linestyle="--", label=f"{channel} model")
-        axis.set_xlabel("Frequency (Hz)")
-        axis.set_ylabel("Power")
-        axis.set_yscale("log")
-        if not table.empty:
-            axis.legend(fontsize=6, ncol=2)
+        display_bands = tables.get("display_bands", {})
+        first_band = next(iter(display_bands), None) if isinstance(display_bands, dict) else (display_bands[0].get("name") if display_bands else None)
+        prepared = prepare_fooof(
+            tables,
+            display_bands,
+            selected_band=first_band,
+            peak_mode="representative",
+        )
+        channels = ordered_fooof_channels(prepared["models"], prepared["curves"])
+        selected_channel = channels[0]["channel_name"] if channels else None
+        selected_region = str(channels[0].get("region", "全部")) if channels else "全部"
+        overview_base = figures_dir / "fooof_overview"
+        overview_fig = fig
+        overview_fig.clear()
+        overview_axes = np.asarray(overview_fig.subplots(2, 3), dtype=object)
+        plot_fooof_overview(overview_fig, overview_axes, prepared, selected_region, selected_channel, "overlay", True, True, language="en")
+        overview_fig.savefig(overview_base.with_suffix(".png"), dpi=150)
+        overview_fig.savefig(overview_base.with_suffix(".svg"))
+        plt.close(overview_fig)
+
+        aperiodic_fig = plt.figure(figsize=(10, 5))
+        aperiodic_axes = np.asarray(aperiodic_fig.subplots(1, 2), dtype=object)
+        plot_aperiodic_details(aperiodic_fig, aperiodic_axes, prepared, selected_channel, True, language="en")
+        aperiodic_base = figures_dir / "fooof_aperiodic"
+        aperiodic_fig.savefig(aperiodic_base.with_suffix(".png"), dpi=150)
+        aperiodic_fig.savefig(aperiodic_base.with_suffix(".svg"))
+        plt.close(aperiodic_fig)
+
+        periodic_fig = plt.figure(figsize=(10, 7))
+        plot_periodic_curves(periodic_fig, "region", prepared, selected_region, [row["channel_name"] for row in channels], "overlay", True, True, language="en")
+        periodic_base = figures_dir / "fooof_periodic_curves"
+        periodic_fig.savefig(periodic_base.with_suffix(".png"), dpi=150)
+        periodic_fig.savefig(periodic_base.with_suffix(".svg"))
+        plt.close(periodic_fig)
+
+        heatmap_fig = plt.figure(figsize=(10, 5))
+        plot_periodic_heatmap(heatmap_fig, prepared, language="en")
+        heatmap_base = figures_dir / "fooof_periodic_heatmap"
+        heatmap_fig.savefig(heatmap_base.with_suffix(".png"), dpi=150)
+        heatmap_fig.savefig(heatmap_base.with_suffix(".svg"))
+        plt.close(heatmap_fig)
+
+        peaks_fig = plt.figure(figsize=(12, 4.5))
+        plot_peak_parameters(peaks_fig, prepared, selected_channel, True, language="en")
+        peaks_base = figures_dir / "fooof_peak_parameters"
+        peaks_fig.savefig(peaks_base.with_suffix(".png"), dpi=150)
+        peaks_fig.savefig(peaks_base.with_suffix(".svg"))
+        plt.close(peaks_fig)
+
+        distribution_fig = plt.figure(figsize=(9, 5))
+        plot_peak_distribution(distribution_fig, prepared, language="en")
+        distribution_base = figures_dir / "fooof_peak_distribution"
+        distribution_fig.savefig(distribution_base.with_suffix(".png"), dpi=150)
+        distribution_fig.savefig(distribution_base.with_suffix(".svg"))
+        plt.close(distribution_fig)
+
+        detail_fig = plt.figure(figsize=(11, 7))
+        plot_single_channel_detail(detail_fig, prepared, selected_channel, True, language="en")
+        detail_base = figures_dir / "fooof_channel_detail"
+        detail_fig.savefig(detail_base.with_suffix(".png"), dpi=150)
+        detail_fig.savefig(detail_base.with_suffix(".svg"))
+        plt.close(detail_fig)
+        return [
+            str(path.relative_to(file_dir))
+            for base in (overview_base, aperiodic_base, periodic_base, heatmap_base, peaks_base, distribution_base, detail_base)
+            for path in (base.with_suffix(".png"), base.with_suffix(".svg"))
+        ]
     elif metric == "Connectivity":
-        table = tables.get("region_summary", pd.DataFrame())
-        for (region_a, region_b), group in table.groupby(["region_a", "region_b"]) if not table.empty else []:
-            method = str(group["method"].iloc[0])
-            axis.plot(group["frequency_hz"], group["value_strength"], linewidth=0.8, label=f"{method} {region_a}-{region_b}")
-        axis.set_xlabel("Frequency (Hz)")
-        axis.set_ylabel("Connection strength (method-specific)")
-        if not table.empty:
-            axis.legend(fontsize=6, ncol=2)
+        methods = available_methods(tables)
+        if not methods:
+            axis.text(0.5, 0.5, "No connectivity result", ha="center", va="center", transform=axis.transAxes)
+            axis.set_axis_off()
+        else:
+            summary = tables.get("region_summary", pd.DataFrame())
+            selected_pairs = (
+                [list(pair) for pair in summary[["region_a", "region_b"]].drop_duplicates().itertuples(index=False, name=None)]
+                if isinstance(summary, pd.DataFrame) and not summary.empty
+                else None
+            )
+            component = available_components(tables)[0]
+            bands = available_bands(tables)
+            band = bands[0] if bands else None
+            saved: list[str] = []
+            for method in methods:
+                prepared = prepare_connectivity(tables, method, component, selected_pairs)
+                spectrum_base = figures_dir / f"connectivity_{method}_spectrum"
+                plot_spectrum(axis, prepared, band, "linear", f"{file_id} | ", 9)
+                fig.savefig(spectrum_base.with_suffix(".png"), dpi=150)
+                fig.savefig(spectrum_base.with_suffix(".svg"))
+                saved.extend(str(path.relative_to(file_dir)) for path in (spectrum_base.with_suffix(".png"), spectrum_base.with_suffix(".svg")))
+                plt.close(fig)
+                fig, axis = plt.subplots(figsize=(9, 5))
+
+                matrix_fig, matrix_axis = plt.subplots(figsize=(6.5, 5.5), constrained_layout=True)
+                plot_matrix(matrix_axis, matrix_fig, prepared, band, "linear", f"{file_id} | ", 9)
+                matrix_base = figures_dir / f"connectivity_{method}_matrix"
+                matrix_fig.savefig(matrix_base.with_suffix(".png"), dpi=150)
+                matrix_fig.savefig(matrix_base.with_suffix(".svg"))
+                saved.extend(str(path.relative_to(file_dir)) for path in (matrix_base.with_suffix(".png"), matrix_base.with_suffix(".svg")))
+                plt.close(matrix_fig)
+
+                combined_fig, combined_axes = plt.subplots(2, 1, figsize=(10, 9), constrained_layout=True)
+                plot_spectrum(combined_axes[0], prepared, band, "linear", f"{file_id} | ", 9)
+                plot_matrix(combined_axes[1], combined_fig, prepared, band, "linear", f"{file_id} | ", 9)
+                combined_base = figures_dir / f"connectivity_{method}_combined"
+                combined_fig.savefig(combined_base.with_suffix(".png"), dpi=150)
+                combined_fig.savefig(combined_base.with_suffix(".svg"))
+                saved.extend(str(path.relative_to(file_dir)) for path in (combined_base.with_suffix(".png"), combined_base.with_suffix(".svg")))
+                plt.close(combined_fig)
+            plt.close(fig)
+            return saved
     elif metric == "Time Delay":
         table = tables.get("region_spectrum", pd.DataFrame())
         if not table.empty:
@@ -368,10 +648,14 @@ def run_gui_analysis(
             input_path = Path(input_file).expanduser().resolve()
             update(f"读取 {input_path.name} ({file_position + 1}/{len(input_files)})")
             try:
-                loaded_info = inspect_file(input_path, metadata_dir)
+                loaded_info = inspect_file(input_path, metadata_dir, config_path)
                 loaded = loaded_info["loaded"]
                 full_channel_table = loaded_info["channel_table"]
-                quality = assess_quality(loaded.data, loaded.sfreq, loaded.ch_names, base_config)
+                mapping_by_file = snapshot.get("channel_mappings_by_file", {})
+                mapping_rows_for_file = mapping_by_file.get(str(input_path), snapshot.get("channel_mapping", [])) if isinstance(mapping_by_file, dict) else snapshot.get("channel_mapping", [])
+                if isinstance(mapping_rows_for_file, list) and mapping_rows_for_file:
+                    full_channel_table = apply_mapping(full_channel_table, {"channels": mapping_rows_for_file})
+                quality = loaded_info["quality"]
                 channel_indices = _selected_channel_indices(snapshot, full_channel_table)
                 epoch_indices = _selected_epoch_indices(snapshot, loaded.data.shape[0])
                 start_index, end_index, actual_start, actual_end = _time_slice(snapshot, loaded)
@@ -463,9 +747,24 @@ def run_gui_analysis(
                 if "Band Power" in selected and psd_result is not None:
                     begin_metric("Band Power")
                     bands = compute_band_power(psd_result["epoch"], runtime_config)
+                    channel_metadata = selected_table[["array_index", "physical_channel_number", "region"]].rename(
+                        columns={"array_index": "channel_array_index"}
+                    )
+                    bands = bands.merge(channel_metadata, on="channel_array_index", how="left")
                     aggregation = str(runtime_config.get("psd", {}).get("epoch_aggregation", "mean"))
                     band_summary = (
-                        bands.groupby(["channel_array_index", "channel_name", "band", "band_low_hz", "band_high_hz"], as_index=False)
+                        bands.groupby(
+                            [
+                                "channel_array_index",
+                                "channel_name",
+                                "physical_channel_number",
+                                "region",
+                                "band",
+                                "band_low_hz",
+                                "band_high_hz",
+                            ],
+                            as_index=False,
+                        )
                         .agg(
                             absolute_power=("absolute_power", aggregation),
                             relative_power=("relative_power", aggregation),
@@ -482,21 +781,35 @@ def run_gui_analysis(
 
                 if "FOOOF" in selected and psd_result is not None:
                     begin_metric("FOOOF")
-                    fits = fit_channel_psd_table(psd_result["channel"], runtime_config)
+                    fits = _attach_fooof_channel_metadata(fit_channel_psd_table(psd_result["channel"], runtime_config), selected_table)
                     paths = _save_table_group(file_dir / "fooof", fits, provenance)
-                    figure_paths = _save_metric_figures("FOOOF", fits, file_dir, file_id)
-                    record = {"metric": "FOOOF", "status": "completed", "paths": {"tables": paths, "figures": figure_paths}, "parameters": runtime_config.get("parameterization", {})}
+                    fooof_payload_tables = {
+                        **fits,
+                        "channel_table": selected_table,
+                        "display_bands": runtime_config.get("bands", {}),
+                    }
+                    figure_paths = _save_metric_figures("FOOOF", fooof_payload_tables, file_dir, file_id)
+                    record = {
+                        "metric": "FOOOF",
+                        "status": "completed",
+                        "paths": {"tables": paths, "figures": figure_paths},
+                        "parameters": {**runtime_config.get("parameterization", {}), "display_bands": runtime_config.get("bands", {})},
+                    }
                     metric_records.append(record)
-                    result_callback({**_metric_plot_data("FOOOF", fits), "file_id": file_id, "file_dir": str(file_dir), "record": record})
+                    result_callback({**_metric_plot_data("FOOOF", fooof_payload_tables), "file_id": file_id, "file_dir": str(file_dir), "record": record})
                     completed_steps += 1
 
-                if selected.intersection({"MIC", "MIM", "wpli2_debiased"}):
+                if selected.intersection({"MIC", "MIM", "wpli", "dpli", "wpli2_debiased"}):
                     begin_metric("Connectivity")
                     connectivity = compute_connectivity(selected_data, loaded.sfreq, selected_table, selected_quality, runtime_config)
-                    paths = _save_table_group(file_dir / "connectivity", {key: connectivity[key] for key in ("spectrum", "region_summary", "band_summary", "patterns", "redundancy_correlation", "redundancy_singular_values", "rank_summary", "rank_sensitivity", "stability", "epoch_profile", "input_checks", "failures")}, provenance)
+                    # Keep the exact mapping used by this run in the live
+                    # payload so custom region names also drive the viewer.
+                    connectivity["channel_table"] = selected_table
+                    paths = _save_table_group(file_dir / "connectivity", {key: connectivity[key] for key in ("spectrum", "region_summary", "band_summary", "channel_pair_band_summary", "patterns", "redundancy_correlation", "redundancy_singular_values", "rank_summary", "rank_sensitivity", "stability", "epoch_profile", "input_checks", "failures")}, provenance)
+                    _save_connectivity_npz(file_dir / "connectivity", connectivity.get("spectrum", pd.DataFrame()))
                     _atomic_json(connectivity.get("metadata", {}), file_dir / "connectivity" / "connectivity_metadata.json")
                     figure_paths = _save_metric_figures("Connectivity", connectivity, file_dir, file_id)
-                    record = {"metric": "Connectivity", "status": str(connectivity.get("status", "unknown")), "paths": {"tables": paths, "figures": figure_paths, "metadata": "connectivity/connectivity_metadata.json"}, "parameters": runtime_config.get("connectivity", {})}
+                    record = {"metric": "Connectivity", "status": str(connectivity.get("status", "unknown")), "paths": {"tables": paths, "figures": figure_paths, "arrays": "connectivity/connectivity_arrays.npz", "metadata": "connectivity/connectivity_metadata.json"}, "parameters": runtime_config.get("connectivity", {})}
                     metric_records.append(record)
                     result_callback({**_metric_plot_data("Connectivity", connectivity), "file_id": file_id, "file_dir": str(file_dir), "record": record})
                     completed_steps += 3

@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mouse-lfp-analysis"
-version = "0.1.0"
-description = "Traceable LFP analysis for synchronized multi-region mouse tetrode recordings"
+name = "luna-analysis"
+dynamic = ["version"]
+description = "LUNA: Local field potential Unified Network Analysis platform"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 authors = [{name = "Local analysis project"}]
@@ -40,9 +40,13 @@ all = [
 
 [project.scripts]
 lfp-analysis = "lfp_analysis.cli:main"
+luna = "lfp_analysis.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "lfp_analysis.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

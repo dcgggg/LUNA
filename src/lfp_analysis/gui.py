@@ -1,4 +1,4 @@
-"""PySide6 desktop application for interactive LFP analysis.
+"""LUNA PySide6 desktop application for interactive LFP analysis.
 
 The window is deliberately a thin client over :mod:`gui_engine`: all numeric
 work remains in the existing analysis modules and the worker thread never
@@ -21,20 +21,364 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolb
 from matplotlib.figure import Figure
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .app_info import (
+    APP_DESCRIPTION,
+    APP_FULL_NAME,
+    APP_NAME,
+    APP_VERSION,
+    DEFAULT_CONFIG_FILENAME,
+    DEFAULT_MAPPING_FILENAME,
+    DEFAULT_OUTPUT_DIRNAME,
+    window_title,
+)
+from .band_power_plots import (
+    band_label,
+    ordered_bands,
+    ordered_channels,
+    plot_comparison,
+    plot_overview,
+    power_label,
+    prepare_band_power,
+)
 from .config import load_config
+from .connectivity_gui import ConnectivityView
+from .fooof_plots import (
+    normalize_bands,
+    plot_aperiodic_details,
+    plot_fooof_overview,
+    plot_peak_distribution,
+    plot_peak_parameters,
+    plot_periodic_curves,
+    plot_periodic_heatmap,
+    plot_single_channel_detail,
+    prepare_fooof,
+)
+from .fooof_plots import ordered_channels as ordered_fooof_channels
 from .gui_engine import inspect_file, load_saved_run, run_gui_analysis
 from .gui_specs import (
     PARAMETER_DEFINITIONS,
-    REGION_ORDER,
-    REGION_PAIRS,
     config_value,
     parameter_schema,
     set_config_value,
     validate_snapshot,
 )
+from .mapping import (
+    DEFAULT_TEMPLATE_REGIONS,
+    apply_mapping,
+    load_mapping,
+    mapping_rows,
+    region_order,
+    region_pairs,
+    save_mapping,
+    validate_mapping,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-INDICATORS = ("Quality", "PSD", "Band Power", "FOOOF", "MIC", "MIM", "wpli2_debiased", "Time Delay")
+INDICATORS = ("Quality", "PSD", "Band Power", "FOOOF", "MIC", "MIM", "wpli", "dpli", "wpli2_debiased", "Time Delay")
+
+
+# Qt styling is kept here, instead of being scattered across individual pages,
+# so the analysis views remain responsible only for scientific plotting.
+GUI_COLORS = {
+    "window": "#f4f6f8",
+    "surface": "#ffffff",
+    "surface_alt": "#f8fafc",
+    "border": "#d6dce3",
+    "text": "#1f2933",
+    "muted": "#5f6b76",
+    "accent": "#1769aa",
+    "accent_hover": "#12588f",
+    "accent_pressed": "#0d466f",
+    "danger": "#b42318",
+}
+
+
+class FlowLayout(QtWidgets.QLayout):
+    """Small wrapping layout used for compact, non-scrolling checkbox rows."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None, margin: int = 0, hspacing: int = 8, vspacing: int = 4) -> None:
+        super().__init__(parent)
+        self._items: list[QtWidgets.QLayoutItem] = []
+        self._hspacing = hspacing
+        self._vspacing = vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item: QtWidgets.QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> QtWidgets.QLayoutItem | None:
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int) -> QtWidgets.QLayoutItem | None:
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> QtCore.Qt.Orientation:
+        return QtCore.Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QtCore.QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect: QtCore.QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QtCore.QSize:
+        size = QtCore.QSize(0, 0)
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QtCore.QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def _do_layout(self, rect: QtCore.QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        effective = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x = effective.x()
+        y = effective.y()
+        line_height = 0
+        for item in self._items:
+            size = item.sizeHint()
+            next_x = x + size.width() + (self._hspacing if line_height else 0)
+            if next_x - self._hspacing > effective.right() and line_height:
+                x = effective.x()
+                y += line_height + self._vspacing
+                next_x = x + size.width()
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), size))
+            x = next_x
+            line_height = max(line_height, size.height())
+        return y + line_height - rect.y() + margins.bottom()
+
+
+class FlowCheckBoxGroup(QtWidgets.QWidget):
+    """Wrapping checkbox collection with a QListWidget-like count API."""
+
+    changed = QtCore.Signal()
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.flow_layout = FlowLayout(hspacing=10, vspacing=5)
+        self.setLayout(self.flow_layout)
+        self._checks: list[tuple[QtWidgets.QCheckBox, Any]] = []
+
+    def clear(self) -> None:
+        while self.flow_layout.count():
+            item = self.flow_layout.takeAt(0)
+            if item is not None and item.widget() is not None:
+                item.widget().deleteLater()
+        self._checks.clear()
+        self.updateGeometry()
+
+    def add_item(self, text: str, data: Any, checked: bool = True, tooltip: str = "") -> None:
+        checkbox = QtWidgets.QCheckBox(text)
+        checkbox.setMinimumWidth(max(90, checkbox.fontMetrics().horizontalAdvance(text) + 30))
+        checkbox.setToolTip(tooltip or text)
+        checkbox.setChecked(checked)
+        checkbox.stateChanged.connect(self.changed)
+        self.flow_layout.addWidget(checkbox)
+        self._checks.append((checkbox, data))
+
+    def count(self) -> int:
+        return len(self._checks)
+
+    def checked_data(self) -> list[Any]:
+        return [data for checkbox, data in self._checks if checkbox.isChecked()]
+
+    def items(self) -> list[tuple[QtWidgets.QCheckBox, Any]]:
+        return list(self._checks)
+
+
+class CollapsiblePanel(QtWidgets.QWidget):
+    """A compact section whose content can be folded without losing values."""
+
+    def __init__(self, title: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        self.toggle = QtWidgets.QToolButton()
+        self.toggle.setObjectName("panelToggle")
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(True)
+        self.toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(QtCore.Qt.ArrowType.DownArrow)
+        self.toggle.toggled.connect(self._set_expanded)
+        outer.addWidget(self.toggle)
+        self.content = QtWidgets.QWidget()
+        self.content_layout = QtWidgets.QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(8, 3, 8, 7)
+        self.content_layout.setSpacing(7)
+        outer.addWidget(self.content)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.content.setVisible(bool(expanded))
+        self.toggle.setArrowType(QtCore.Qt.ArrowType.DownArrow if expanded else QtCore.Qt.ArrowType.RightArrow)
+
+    def setTitle(self, title: str) -> None:
+        self.toggle.setText(title)
+
+
+def _gui_stylesheet() -> str:
+    """Return the compact, high-DPI-friendly Qt style for the application."""
+    return f"""
+    QMainWindow, QWidget {{
+        background: {GUI_COLORS['window']};
+        color: {GUI_COLORS['text']};
+    }}
+    QGroupBox {{
+        background: {GUI_COLORS['surface']};
+        border: 1px solid {GUI_COLORS['border']};
+        border-radius: 6px;
+        margin-top: 10px;
+        padding: 12px 10px 10px 10px;
+        font-weight: 600;
+    }}
+    QGroupBox::title {{
+        subcontrol-origin: margin;
+        left: 10px;
+        padding: 0 5px;
+        color: {GUI_COLORS['text']};
+    }}
+    QLabel {{
+        background: transparent;
+    }}
+    QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTableWidget, QListWidget,
+    QPlainTextEdit {{
+        background: {GUI_COLORS['surface']};
+        border: 1px solid {GUI_COLORS['border']};
+        border-radius: 4px;
+        padding: 4px 6px;
+        selection-background-color: #cfe8fb;
+        selection-color: {GUI_COLORS['text']};
+    }}
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+    QTableWidget:focus, QListWidget:focus, QPlainTextEdit:focus {{
+        border: 1px solid {GUI_COLORS['accent']};
+    }}
+    QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{
+        min-height: 28px;
+    }}
+    QPushButton {{
+        background: {GUI_COLORS['surface']};
+        border: 1px solid {GUI_COLORS['border']};
+        border-radius: 4px;
+        min-height: 28px;
+        padding: 4px 10px;
+    }}
+    QPushButton:hover {{
+        background: #eef5fb;
+        border-color: #8ab8da;
+    }}
+    QPushButton:pressed {{
+        background: #dcecf8;
+    }}
+    QPushButton:checked {{
+        background: #e2f0fb;
+        border-color: {GUI_COLORS['accent']};
+        color: {GUI_COLORS['accent_pressed']};
+    }}
+    QPushButton:disabled {{
+        color: #9aa5af;
+        background: #eef1f3;
+    }}
+    QPushButton#primaryAction {{
+        background: {GUI_COLORS['accent']};
+        border-color: {GUI_COLORS['accent']};
+        color: white;
+        font-weight: 600;
+    }}
+    QPushButton#primaryAction:hover {{
+        background: {GUI_COLORS['accent_hover']};
+    }}
+    QPushButton#cancelAction {{
+        color: {GUI_COLORS['danger']};
+    }}
+    QToolButton#sectionToggle {{
+        border: none;
+        padding: 4px 6px;
+        color: {GUI_COLORS['accent']};
+    }}
+    QToolButton#panelToggle {{
+        background: {GUI_COLORS['surface']};
+        border: 1px solid {GUI_COLORS['border']};
+        border-radius: 6px;
+        padding: 6px 8px;
+        text-align: left;
+        font-weight: 600;
+        color: {GUI_COLORS['text']};
+    }}
+    QToolButton#panelToggle:hover {{
+        background: #eef5fb;
+        border-color: #8ab8da;
+    }}
+    QProgressBar {{
+        min-height: 8px;
+        max-height: 12px;
+        border: 1px solid {GUI_COLORS['border']};
+        border-radius: 5px;
+        background: #e9edf1;
+        text-align: center;
+    }}
+    QProgressBar::chunk {{
+        background: {GUI_COLORS['accent']};
+        border-radius: 4px;
+    }}
+    QTabWidget::pane {{
+        border: 1px solid {GUI_COLORS['border']};
+        background: {GUI_COLORS['surface']};
+    }}
+    QTabBar::tab {{
+        background: #e9eef3;
+        border: 1px solid {GUI_COLORS['border']};
+        padding: 6px 10px;
+    }}
+    QTabBar::tab:selected {{
+        background: {GUI_COLORS['surface']};
+        color: {GUI_COLORS['accent_pressed']};
+    }}
+    QHeaderView::section {{
+        background: #eef2f5;
+        border: none;
+        border-bottom: 1px solid {GUI_COLORS['border']};
+        padding: 4px 6px;
+        font-weight: 600;
+    }}
+    QSplitter::handle {{
+        background: #d9e0e7;
+    }}
+    QToolTip {{
+        background: #263238;
+        color: white;
+        border: 1px solid #455a64;
+        padding: 5px;
+    }}
+    """
+
+
+def _load_windows_cjk_font() -> str | None:
+    """Load a bundled system CJK font when Qt does not expose Windows fonts."""
+    for candidate in (
+        Path(r"C:\Windows\Fonts\Noto Sans SC (TrueType).otf"),
+        Path(r"C:\Windows\Fonts\simhei.ttf"),
+        Path(r"C:\Windows\Fonts\Deng.ttf"),
+    ):
+        if not candidate.is_file():
+            continue
+        font_id = QtGui.QFontDatabase.addApplicationFont(str(candidate))
+        families = QtGui.QFontDatabase.applicationFontFamilies(font_id)
+        if families:
+            return str(families[0])
+    return None
 
 
 class AnalysisWorker(QtCore.QObject):
@@ -69,15 +413,16 @@ class InspectWorker(QtCore.QObject):
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, paths: list[str], metadata_dir: Path) -> None:
+    def __init__(self, paths: list[str], metadata_dir: Path, config_path: Path) -> None:
         super().__init__()
         self.paths = paths
         self.metadata_dir = metadata_dir
+        self.config_path = config_path
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            self.finished.emit([inspect_file(path, self.metadata_dir) for path in self.paths])
+            self.finished.emit([inspect_file(path, self.metadata_dir, self.config_path) for path in self.paths])
         except Exception as exc:  # noqa: BLE001 - display the readable error
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
@@ -94,7 +439,37 @@ class ResultCanvas(FigureCanvasQTAgg):
         metric = str(payload.get("metric", "Result"))
         tables = payload.get("tables", {})
         file_id = payload.get("file_id", "")
-        if metric == "Quality":
+        if metric == "Raw Waveform":
+            data = np.asarray(payload.get("raw_data", np.empty((0, 0))), dtype=float)
+            channel_names = [str(value) for value in payload.get("channel_names", [])]
+            epoch_index = int(payload.get("preview_epoch_index", 0))
+            times = np.asarray(payload.get("times_s", []), dtype=float)
+            if data.ndim == 2 and data.shape[0] and data.shape[1]:
+                if not times.size:
+                    sfreq = float(payload.get("sfreq", 1.0))
+                    times = np.arange(data.shape[1], dtype=float) / sfreq + float(payload.get("tmin", 0.0))
+                finite = np.isfinite(data)
+                centered = data - np.nanmedian(data, axis=1, keepdims=True)
+                centered[~finite] = np.nan
+                q05 = np.nanpercentile(np.abs(centered), 5) if np.any(finite) else 0.0
+                q95 = np.nanpercentile(np.abs(centered), 95) if np.any(finite) else 0.0
+                scale = max(float(q95 - q05), float(np.nanmax(np.abs(centered))) * 0.25 if np.any(finite) else 0.0, np.finfo(float).eps)
+                offsets = np.arange(data.shape[0], dtype=float)[::-1] * scale * 3.0
+                axis.plot(times, (centered + offsets[:, None]).T, linewidth=0.65)
+                axis.set_yticks(offsets, channel_names)
+                axis.set_xlabel("Epoch time (s)")
+                axis.set_ylabel("Channel (vertical display offset)")
+                axis.grid(True, color="#dddddd", linewidth=0.4)
+                quality_epoch = tables.get("quality_epoch", pd.DataFrame())
+                status = ""
+                if isinstance(quality_epoch, pd.DataFrame) and not quality_epoch.empty and "epoch_index" in quality_epoch:
+                    matched = quality_epoch.loc[quality_epoch["epoch_index"].astype(int) == epoch_index]
+                    if not matched.empty:
+                        status = f"；质量状态={matched.iloc[0].get('quality_status', '')}"
+                axis.set_title(f"{file_id} | 原始波形 | epoch {epoch_index}{status}\n通道按垂直偏移显示，未改变原始数据")
+            else:
+                axis.text(0.5, 0.5, "没有可显示的原始波形；请至少勾选一个通道。", ha="center", va="center", transform=axis.transAxes)
+        elif metric == "Quality":
             table = tables.get("quality_epoch_channel", pd.DataFrame())
             if not table.empty:
                 matrix = table.pivot(index="epoch_index", columns="channel_name", values="issue_score").fillna(0)
@@ -158,18 +533,863 @@ class ResultCanvas(FigureCanvasQTAgg):
                 axis.legend(fontsize=7, ncol=2)
             else:
                 axis.text(0.5, 0.5, "No time-delay result", ha="center", va="center", transform=axis.transAxes)
-        axis.set_title(f"{file_id} | {metric}")
+        if not axis.get_title():
+            axis.set_title(f"{file_id} | {metric}")
+        axis.title.set_fontsize(10)
+        axis.xaxis.label.set_fontsize(9)
+        axis.yaxis.label.set_fontsize(9)
+        axis.tick_params(axis="both", labelsize=8)
+        legend = axis.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_fontsize(8)
+        self.figure.subplots_adjust(left=0.10, right=0.97, bottom=0.12, top=0.90)
         axis.grid(True, color="#dddddd", linewidth=0.4)
         self.draw_idle()
+
+
+class BandPowerView(QtWidgets.QWidget):
+    """Two-panel, presentation-only view over saved band-power tables."""
+
+    export_requested = QtCore.Signal(str)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.payload: dict[str, Any] | None = None
+        self.selected_channels: set[str] | None = None
+        self.selected_regions: set[str] | None = None
+        self._prepared: dict[str, pd.DataFrame] = {"epoch": pd.DataFrame(), "summary": pd.DataFrame()}
+        self._overview_info: dict[str, Any] = {}
+        self._compare_items: list[str] = []
+        self._updating_controls = False
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+        controls = QtWidgets.QGridLayout()
+        controls.setHorizontalSpacing(8)
+        controls.setVerticalSpacing(6)
+        self.power_combo = QtWidgets.QComboBox()
+        self.power_combo.addItem("绝对功率", "absolute")
+        self.power_combo.addItem("相对功率 (%)", "relative")
+        self.scale_combo = QtWidgets.QComboBox()
+        self.scale_combo.addItem("线性", "linear")
+        self.scale_combo.addItem("对数", "log")
+        self.aggregation_combo = QtWidgets.QComboBox()
+        self.aggregation_combo.addItem("均值", "mean")
+        self.aggregation_combo.addItem("中位数", "median")
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItem("比较通道", "channel")
+        self.mode_combo.addItem("比较频带", "band")
+        self.band_combo = QtWidgets.QComboBox()
+        self.channel_combo = QtWidgets.QComboBox()
+        self.show_values_check = QtWidgets.QCheckBox("热图显示数值")
+        self.show_distribution_check = QtWidgets.QCheckBox("显示 epoch 分布")
+        self.selection_label = QtWidgets.QLabel("当前选择：—")
+        self.selection_label.setWordWrap(True)
+        controls.addWidget(QtWidgets.QLabel("功率"), 0, 0)
+        controls.addWidget(self.power_combo, 0, 1)
+        controls.addWidget(QtWidgets.QLabel("色标/纵轴"), 0, 2)
+        controls.addWidget(self.scale_combo, 0, 3)
+        controls.addWidget(QtWidgets.QLabel("epoch 汇总"), 0, 4)
+        controls.addWidget(self.aggregation_combo, 0, 5)
+        controls.addWidget(QtWidgets.QLabel("比较模式"), 1, 0)
+        controls.addWidget(self.mode_combo, 1, 1)
+        controls.addWidget(QtWidgets.QLabel("选择频带"), 1, 2)
+        controls.addWidget(self.band_combo, 1, 3)
+        controls.addWidget(QtWidgets.QLabel("选择通道"), 1, 4)
+        controls.addWidget(self.channel_combo, 1, 5)
+        controls.addWidget(self.show_values_check, 2, 0, 1, 2)
+        controls.addWidget(self.show_distribution_check, 2, 2, 1, 2)
+        controls.addWidget(self.selection_label, 2, 4, 1, 2)
+        root.addLayout(controls)
+
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.addWidget(QtWidgets.QLabel("频带筛选"))
+        self.band_filter_list = FlowCheckBoxGroup()
+        self.band_filter_list.setToolTip("勾选需要显示的频带；控件会随窗口宽度自动换行。")
+        filter_row.addWidget(self.band_filter_list, stretch=1)
+        for label, kind in (("导出热图", "overview"), ("导出比较图", "comparison"), ("导出组合图", "combined")):
+            button = QtWidgets.QPushButton(label)
+            button.clicked.connect(lambda _checked=False, value=kind: self.export_requested.emit(value))
+            filter_row.addWidget(button)
+        root.addLayout(filter_row)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        overview_panel = QtWidgets.QWidget()
+        overview_layout = QtWidgets.QVBoxLayout(overview_panel)
+        overview_layout.addWidget(QtWidgets.QLabel("通道 × 频带总览"))
+        self.overview_figure = Figure(figsize=(9, 5.8), tight_layout=False)
+        self.overview_canvas = FigureCanvasQTAgg(self.overview_figure)
+        self.overview_toolbar = NavigationToolbar2QT(self.overview_canvas, self)
+        self.overview_toolbar.setMaximumHeight(34)
+        overview_layout.addWidget(self.overview_toolbar)
+        overview_layout.addWidget(self.overview_canvas, stretch=1)
+        splitter.addWidget(overview_panel)
+
+        comparison_panel = QtWidgets.QWidget()
+        comparison_layout = QtWidgets.QVBoxLayout(comparison_panel)
+        comparison_layout.addWidget(QtWidgets.QLabel("当前选择的比较图"))
+        self.comparison_figure = Figure(figsize=(9, 4.4), tight_layout=False)
+        self.comparison_canvas = FigureCanvasQTAgg(self.comparison_figure)
+        self.comparison_toolbar = NavigationToolbar2QT(self.comparison_canvas, self)
+        self.comparison_toolbar.setMaximumHeight(34)
+        comparison_layout.addWidget(self.comparison_toolbar)
+        comparison_layout.addWidget(self.comparison_canvas, stretch=1)
+        splitter.addWidget(comparison_panel)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([580, 400])
+        root.addWidget(splitter, stretch=1)
+
+        for widget in (self.power_combo, self.scale_combo, self.aggregation_combo, self.mode_combo, self.band_combo, self.channel_combo, self.show_values_check, self.show_distribution_check):
+            if isinstance(widget, QtWidgets.QComboBox):
+                widget.currentIndexChanged.connect(self._controls_changed)
+            else:
+                widget.stateChanged.connect(self._controls_changed)
+        self.band_filter_list.changed.connect(self._controls_changed)
+        self.overview_canvas.mpl_connect("button_press_event", self._overview_clicked)
+        self.comparison_canvas.mpl_connect("button_press_event", self._comparison_clicked)
+
+    def set_payload(
+        self,
+        payload: dict[str, Any],
+        selected_channels: list[str] | None = None,
+        selected_regions: list[str] | None = None,
+    ) -> None:
+        self.payload = payload
+        self.selected_channels = None if selected_channels is None else set(map(str, selected_channels))
+        self.selected_regions = None if selected_regions is None else set(map(str, selected_regions))
+        self._populate_controls()
+        self._refresh()
+
+    def set_filters(self, selected_channels: list[str] | None, selected_regions: list[str] | None) -> None:
+        if self.payload is None:
+            return
+        self.selected_channels = None if selected_channels is None else set(map(str, selected_channels))
+        self.selected_regions = None if selected_regions is None else set(map(str, selected_regions))
+        self._refresh()
+
+    def _tables(self) -> dict[str, pd.DataFrame]:
+        return self.payload.get("tables", {}) if self.payload else {}
+
+    def _all_prepared(self) -> dict[str, pd.DataFrame]:
+        return prepare_band_power(
+            self._tables(),
+            power_kind=str(self.power_combo.currentData() or "absolute"),
+            aggregation=str(self.aggregation_combo.currentData() or "mean"),
+            selected_channels=self.selected_channels,
+            selected_regions=self.selected_regions,
+        )
+
+    def _populate_controls(self) -> None:
+        if self.payload is None:
+            return
+        self._updating_controls = True
+        try:
+            all_prepared = self._all_prepared()
+            bands = ordered_bands(all_prepared["summary"])
+            channels = ordered_channels(all_prepared["summary"])
+            old_band = self.band_combo.currentData()
+            old_channel = self.channel_combo.currentData()
+            old_filters = set(map(str, self.band_filter_list.checked_data()))
+            self.band_combo.clear()
+            self.channel_combo.clear()
+            self.band_filter_list.clear()
+            for row in bands:
+                self.band_combo.addItem(band_label(row), row["band"])
+                self.band_filter_list.add_item(str(row["band"]), row["band"], checked=not old_filters or row["band"] in old_filters, tooltip=band_label(row))
+            for row in channels:
+                self.channel_combo.addItem(f"{row['channel_label']} ({row['region']})", row["channel_name"])
+            if self.band_combo.count():
+                index = self.band_combo.findData(old_band)
+                self.band_combo.setCurrentIndex(max(index, 0))
+            if self.channel_combo.count():
+                index = self.channel_combo.findData(old_channel)
+                self.channel_combo.setCurrentIndex(max(index, 0))
+            is_relative = str(self.power_combo.currentData()) == "relative"
+            if is_relative:
+                self.scale_combo.setCurrentIndex(0)
+            self.scale_combo.setEnabled(not is_relative)
+        finally:
+            self._updating_controls = False
+
+    def _selected_band_names(self) -> list[str]:
+        return [str(value) for value in self.band_filter_list.checked_data()]
+
+    def _controls_changed(self, *_args: Any) -> None:
+        if self._updating_controls:
+            return
+        if self.sender() is self.power_combo:
+            self._populate_controls()
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if self.payload is None:
+            return
+        power_kind = str(self.power_combo.currentData() or "absolute")
+        aggregation = str(self.aggregation_combo.currentData() or "mean")
+        scale = str(self.scale_combo.currentData() or "linear")
+        selected_bands = self._selected_band_names()
+        self._prepared = prepare_band_power(
+            self._tables(),
+            power_kind=power_kind,
+            aggregation=aggregation,
+            selected_channels=self.selected_channels,
+            selected_regions=self.selected_regions,
+            selected_bands=selected_bands,
+        )
+        selected_band = self.band_combo.currentData()
+        selected_channel = self.channel_combo.currentData()
+        valid_bands = [row["band"] for row in ordered_bands(self._prepared["summary"])]
+        valid_channels = [row["channel_name"] for row in ordered_channels(self._prepared["summary"])]
+        if selected_band not in valid_bands:
+            selected_band = valid_bands[0] if valid_bands else None
+            if selected_band is not None:
+                self._set_current_data(None, selected_band)
+        if selected_channel not in valid_channels:
+            selected_channel = valid_channels[0] if valid_channels else None
+            if selected_channel is not None:
+                self._set_current_data(selected_channel, None)
+        file_id = str(self.payload.get("file_id", "file"))
+        denominator = self._denominator_hz()
+        unit_label = power_label(power_kind, denominator)
+        self.overview_figure.clear()
+        overview_axis = self.overview_figure.add_subplot(111)
+        self._overview_info = plot_overview(
+            overview_axis,
+            self.overview_figure,
+            self._prepared,
+            power_kind=power_kind,
+            scale=scale,
+            selected_channel=str(selected_channel) if selected_channel else None,
+            selected_band=str(selected_band) if selected_band else None,
+            show_values=self.show_values_check.isChecked(),
+            title=f"{file_id} | 频带功率总览 | {unit_label} | {aggregation}",
+            denominator_hz=denominator,
+        )
+        self.overview_figure.tight_layout(pad=0.7)
+        self.overview_figure.subplots_adjust(left=0.14, right=0.92, bottom=0.22, top=0.88)
+        self.overview_canvas.draw_idle()
+
+        self.comparison_figure.clear()
+        comparison_axis = self.comparison_figure.add_subplot(111)
+        mode = str(self.mode_combo.currentData() or "channel")
+        self._compare_items = [
+            row["channel_name"] for row in ordered_channels(self._prepared["summary"])
+        ] if mode == "channel" else [row["band"] for row in ordered_bands(self._prepared["summary"])]
+        comparison_context = (
+            f"频带：{selected_band or '—'}" if mode == "channel" else f"通道：{selected_channel or '—'}"
+        )
+        comparison_info = plot_comparison(
+            comparison_axis,
+            self._prepared,
+            mode=mode,
+            power_kind=power_kind,
+            scale=scale,
+            selected_channel=str(selected_channel) if selected_channel else None,
+            selected_band=str(selected_band) if selected_band else None,
+            show_epoch_distribution=self.show_distribution_check.isChecked(),
+            title=f"{file_id} | {'比较通道' if mode == 'channel' else '比较频带'} | {comparison_context} | {unit_label}",
+            denominator_hz=denominator,
+        )
+        self.comparison_figure.tight_layout(pad=0.7)
+        self.comparison_figure.subplots_adjust(left=0.11, right=0.98, bottom=0.22, top=0.88)
+        self.comparison_canvas.draw_idle()
+        selected_value = comparison_info.get("selection_value", np.nan)
+        selected_text = "—" if not np.isfinite(selected_value) else f"{float(selected_value):.5g}"
+        selection_name = str(selected_band if mode == "channel" else selected_channel or "—")
+        self.selection_label.setText(f"当前选择：{selection_name}；显示值={selected_text}；单位={unit_label}")
+
+    def _denominator_hz(self) -> tuple[float, float] | None:
+        for table in (self._tables().get("band_power", pd.DataFrame()), self._tables().get("band_power_epoch_channel", pd.DataFrame()), self._tables().get("band_power_summary", pd.DataFrame())):
+            if isinstance(table, pd.DataFrame) and not table.empty and {"relative_denominator_low_hz", "relative_denominator_high_hz"}.issubset(table.columns):
+                row = table.iloc[0]
+                return float(row["relative_denominator_low_hz"]), float(row["relative_denominator_high_hz"])
+        return None
+
+    def _overview_clicked(self, event: Any) -> None:
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        channels = self._overview_info.get("channels", [])
+        bands = self._overview_info.get("bands", [])
+        column = round(float(event.xdata))
+        row = round(float(event.ydata))
+        if not (0 <= row < len(channels) and 0 <= column < len(bands)):
+            return
+        self._set_current_data(channels[row]["channel_name"], bands[column]["band"])
+        self._refresh()
+
+    def _comparison_clicked(self, event: Any) -> None:
+        if event.inaxes is None or event.xdata is None or not self._compare_items:
+            return
+        index = round(float(event.xdata))
+        if not 0 <= index < len(self._compare_items):
+            return
+        if str(self.mode_combo.currentData()) == "channel":
+            self._set_current_data(self._compare_items[index], self.band_combo.currentData())
+        else:
+            self._set_current_data(self.channel_combo.currentData(), self._compare_items[index])
+        self._refresh()
+
+    def _set_current_data(self, channel_name: str | None, band_name: str | None) -> None:
+        self._updating_controls = True
+        try:
+            if channel_name is not None:
+                index = self.channel_combo.findData(channel_name)
+                if index >= 0:
+                    self.channel_combo.setCurrentIndex(index)
+            if band_name is not None:
+                index = self.band_combo.findData(band_name)
+                if index >= 0:
+                    self.band_combo.setCurrentIndex(index)
+        finally:
+            self._updating_controls = False
+
+    def save_figure(self, kind: str, path: str | Path) -> None:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if kind == "overview":
+            self.overview_figure.savefig(output, dpi=300)
+            return
+        if kind == "comparison":
+            self.comparison_figure.savefig(output, dpi=300)
+            return
+        if kind != "combined":
+            raise ValueError(f"Unknown band-power figure kind: {kind}")
+        import matplotlib.pyplot as plt
+
+        combined, axes = plt.subplots(2, 1, figsize=(10, 10), constrained_layout=True)
+        power_kind = str(self.power_combo.currentData() or "absolute")
+        scale = str(self.scale_combo.currentData() or "linear")
+        mode = str(self.mode_combo.currentData() or "channel")
+        selected_channel = self.channel_combo.currentData()
+        selected_band = self.band_combo.currentData()
+        unit_label = power_label(power_kind, self._denominator_hz())
+        plot_overview(
+            axes[0],
+            combined,
+            self._prepared,
+            power_kind,
+            scale,
+            selected_channel,
+            selected_band,
+            self.show_values_check.isChecked(),
+            f"{self.payload.get('file_id', 'file')} | 频带功率总览 | {unit_label}",
+            self._denominator_hz(),
+        )
+        plot_comparison(
+            axes[1],
+            self._prepared,
+            mode,
+            power_kind,
+            scale,
+            selected_channel,
+            selected_band,
+            self.show_distribution_check.isChecked(),
+            f"{self.payload.get('file_id', 'file')} | {'比较通道' if mode == 'channel' else '比较频带'} | {unit_label}",
+            self._denominator_hz(),
+        )
+        combined.savefig(output, dpi=300)
+        plt.close(combined)
+
+    def save_csv(self, path: str | Path) -> None:
+        """Save the numerical values represented by the current two-panel view."""
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        export = self._prepared["summary"].copy()
+        if export.empty:
+            pd.DataFrame(
+                columns=[
+                    "channel_name",
+                    "physical_channel_number",
+                    "region",
+                    "band",
+                    "band_low_hz",
+                    "band_high_hz",
+                ]
+            ).to_csv(output, index=False, encoding="utf-8-sig")
+            return
+        aggregation = str(self.aggregation_combo.currentData() or "mean")
+        epoch_tables = {"band_power": self._prepared["epoch"]}
+        for power_kind in ("absolute", "relative"):
+            summary = prepare_band_power(epoch_tables, power_kind=power_kind, aggregation=aggregation)["summary"]
+            keep = [
+                "channel_name",
+                "physical_channel_number",
+                "region",
+                "band",
+                "band_low_hz",
+                "band_high_hz",
+                "raw_value",
+                "n_epochs",
+            ]
+            summary = summary[[column for column in keep if column in summary.columns]].rename(
+                columns={"raw_value": f"{power_kind}_power", "n_epochs": f"{power_kind}_n_epochs"}
+            )
+            keys = [
+                "channel_name",
+                "physical_channel_number",
+                "region",
+                "band",
+                "band_low_hz",
+                "band_high_hz",
+            ]
+            export = export.merge(summary, on=[key for key in keys if key in export.columns and key in summary.columns], how="left", suffixes=("", f"_{power_kind}"))
+        export = export.rename(columns={"raw_value": "selected_raw_value"})
+        power_kind = str(self.power_combo.currentData() or "absolute")
+        export["selected_power_kind"] = power_kind
+        export["selected_power_unit"] = "%" if power_kind == "relative" else "source unit²"
+        export["display_scale"] = str(self.scale_combo.currentData() or "linear")
+        export["aggregation"] = aggregation
+        export["comparison_mode"] = str(self.mode_combo.currentData() or "channel")
+        export["selected_channel"] = self.channel_combo.currentData() or ""
+        export["selected_band"] = self.band_combo.currentData() or ""
+        denominator = self._denominator_hz()
+        export["relative_denominator_low_hz"] = denominator[0] if denominator else np.nan
+        export["relative_denominator_high_hz"] = denominator[1] if denominator else np.nan
+        export["source_file_id"] = str(self.payload.get("file_id", "")) if self.payload else ""
+        export.to_csv(output, index=False, encoding="utf-8-sig")
+
+
+class FooofView(QtWidgets.QWidget):
+    """Interactive FOOOF/specparam comparison and detail view."""
+
+    export_requested = QtCore.Signal(str)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.payload: dict[str, Any] | None = None
+        self.selected_channels: set[str] | None = None
+        self.selected_regions: set[str] | None = None
+        self.bands: list[dict[str, Any]] = []
+        self.prepared: dict[str, Any] = prepare_fooof({}, [])
+        self._updating_controls = False
+        self._overview_info: dict[str, Any] = {}
+        self._peak_points: list[dict[str, Any]] = []
+
+        root = QtWidgets.QVBoxLayout(self)
+        controls = QtWidgets.QGridLayout()
+        self.quality_combo = QtWidgets.QComboBox()
+        self.quality_combo.addItem("全部拟合结果", False)
+        self.quality_combo.addItem("仅质量通过", True)
+        self.region_combo = QtWidgets.QComboBox()
+        self.channel_combo = QtWidgets.QComboBox()
+        self.band_combo = QtWidgets.QComboBox()
+        self.peak_mode_combo = QtWidgets.QComboBox()
+        self.peak_mode_combo.addItem("频段代表峰（PW最大）", "representative")
+        self.peak_mode_combo.addItem("全部峰", "all")
+        self.curve_mode_combo = QtWidgets.QComboBox()
+        self.curve_mode_combo.addItem("两者叠加", "overlay")
+        self.curve_mode_combo.addItem("去背景后的观测谱", "observed")
+        self.curve_mode_combo.addItem("拟合周期成分", "model")
+        self.layout_combo = QtWidgets.QComboBox()
+        self.layout_combo.addItem("按脑区 2×2", "region")
+        self.layout_combo.addItem("选定通道叠加", "overlay")
+        self.unified_check = QtWidgets.QCheckBox("统一坐标")
+        self.unified_check.setChecked(True)
+        self.legend_check = QtWidgets.QCheckBox("显示图例")
+        self.legend_check.setChecked(True)
+        self.font_spin = QtWidgets.QSpinBox()
+        self.font_spin.setRange(7, 16)
+        self.font_spin.setValue(9)
+        control_specs = (
+            ("质量筛选", self.quality_combo),
+            ("脑区曲线", self.region_combo),
+            ("详情通道", self.channel_combo),
+            ("比较频段", self.band_combo),
+            ("峰选择", self.peak_mode_combo),
+            ("曲线显示", self.curve_mode_combo),
+            ("曲线布局", self.layout_combo),
+            ("字号", self.font_spin),
+        )
+        for index, (label, widget) in enumerate(control_specs):
+            row = index // 4
+            column = (index % 4) * 2
+            controls.addWidget(QtWidgets.QLabel(label), row, column)
+            controls.addWidget(widget, row, column + 1)
+        controls.addWidget(self.unified_check, 2, 0, 1, 2)
+        controls.addWidget(self.legend_check, 2, 2, 1, 2)
+        self.status_label = QtWidgets.QLabel("FOOOF 结果尚未载入")
+        self.status_label.setWordWrap(True)
+        controls.addWidget(self.status_label, 2, 4, 1, 4)
+        root.addLayout(controls)
+
+        export_row = QtWidgets.QHBoxLayout()
+        for label, kind in (("导出当前图", "current"), ("导出全部图", "all"), ("导出数值表", "tables")):
+            button = QtWidgets.QPushButton(label)
+            button.clicked.connect(lambda _checked=False, value=kind: self.export_requested.emit(value))
+            export_row.addWidget(button)
+        export_row.addStretch(1)
+        root.addLayout(export_row)
+
+        self.tabs = QtWidgets.QTabWidget()
+        root.addWidget(self.tabs, stretch=1)
+        self.overview_figure, self.overview_canvas = self._new_canvas("总览")
+        self.aperiodic_figure, self.aperiodic_canvas, self.aperiodic_table = self._new_canvas_with_table("非周期参数")
+        self.periodic_figure, self.periodic_canvas = self._new_canvas("周期曲线")
+        self.periodic_heatmap_figure, self.periodic_heatmap_canvas = self._new_canvas("周期热图")
+        self.peaks_figure, self.peaks_canvas = self._new_canvas("峰参数")
+        self.peak_distribution_figure, self.peak_distribution_canvas = self._new_canvas("峰分布")
+        self.peak_table = QtWidgets.QTableWidget()
+        self.detail_figure, self.detail_canvas = self._new_canvas("单通道详情")
+        self.detail_table = QtWidgets.QTableWidget()
+        self._add_page("总览", self.overview_canvas, self.overview_figure)
+        self._add_page("非周期参数", self.aperiodic_canvas, self.aperiodic_figure, self.aperiodic_table)
+        self._add_page("周期曲线", self.periodic_canvas, self.periodic_figure, self.periodic_heatmap_canvas)
+        self._add_page("峰参数", self.peaks_canvas, self.peaks_figure, self.peak_distribution_canvas, self.peak_table)
+        self._add_page("单通道详情", self.detail_canvas, self.detail_figure, self.detail_table)
+
+        widgets = (
+            self.quality_combo,
+            self.region_combo,
+            self.channel_combo,
+            self.band_combo,
+            self.peak_mode_combo,
+            self.curve_mode_combo,
+            self.layout_combo,
+            self.unified_check,
+            self.legend_check,
+            self.font_spin,
+        )
+        for widget in widgets:
+            signal = widget.stateChanged if isinstance(widget, QtWidgets.QCheckBox) else widget.valueChanged if isinstance(widget, QtWidgets.QSpinBox) else widget.currentIndexChanged
+            signal.connect(self._controls_changed)
+        self.overview_canvas.mpl_connect("button_press_event", self._overview_clicked)
+        self.peak_distribution_canvas.mpl_connect("button_press_event", self._peak_clicked)
+
+    def _new_canvas(self, _name: str) -> tuple[Figure, FigureCanvasQTAgg]:
+        figure = Figure(figsize=(10, 5), tight_layout=True)
+        return figure, FigureCanvasQTAgg(figure)
+
+    def _new_canvas_with_table(self, _name: str) -> tuple[Figure, FigureCanvasQTAgg, QtWidgets.QTableWidget]:
+        figure, canvas = self._new_canvas(_name)
+        return figure, canvas, QtWidgets.QTableWidget()
+
+    def _add_page(self, name: str, canvas: FigureCanvasQTAgg, figure: Figure, *extras: QtWidgets.QWidget) -> None:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        toolbar = NavigationToolbar2QT(canvas, self)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas, stretch=3)
+        for extra in extras:
+            if isinstance(extra, FigureCanvasQTAgg):
+                layout.addWidget(NavigationToolbar2QT(extra, self))
+                layout.addWidget(extra, stretch=2)
+            else:
+                extra.setMaximumHeight(180)
+                layout.addWidget(extra, stretch=1)
+        self.tabs.addTab(page, name)
+
+    def set_payload(
+        self,
+        payload: dict[str, Any],
+        selected_channels: list[str] | None = None,
+        selected_regions: list[str] | None = None,
+        bands: Any = None,
+    ) -> None:
+        self.payload = payload
+        self.selected_channels = None if selected_channels is None else set(map(str, selected_channels))
+        self.selected_regions = None if selected_regions is None else set(map(str, selected_regions))
+        record_bands = payload.get("record", {}).get("parameters", {}).get("display_bands", {}) if isinstance(payload.get("record", {}), dict) else {}
+        table_bands = payload.get("tables", {}).get("display_bands", {}) if isinstance(payload.get("tables", {}), dict) else {}
+        self.bands = normalize_bands(bands if bands is not None else table_bands or record_bands)
+        self._populate_controls()
+        self._refresh()
+
+    def set_filters(self, selected_channels: list[str] | None, selected_regions: list[str] | None, bands: Any = None) -> None:
+        if self.payload is None:
+            return
+        self.selected_channels = None if selected_channels is None else set(map(str, selected_channels))
+        self.selected_regions = None if selected_regions is None else set(map(str, selected_regions))
+        if bands is not None:
+            self.bands = normalize_bands(bands)
+        self._populate_controls()
+        self._refresh()
+
+    def _tables(self) -> dict[str, pd.DataFrame]:
+        return self.payload.get("tables", {}) if self.payload else {}
+
+    def _populate_controls(self) -> None:
+        if self.payload is None:
+            return
+        self._updating_controls = True
+        try:
+            available = prepare_fooof(self._tables(), self.bands, self.selected_channels, self.selected_regions)
+            channels = ordered_fooof_channels(available["models"], available["curves"])
+            old_region = self.region_combo.currentData()
+            old_region_index = self.region_combo.currentIndex()
+            old_channel = self.channel_combo.currentData()
+            old_band = self.band_combo.currentData()
+            old_band_index = self.band_combo.currentIndex()
+            self.region_combo.clear()
+            self.region_combo.addItem("全部", "全部")
+            regions: list[str] = []
+            for row in channels:
+                region = str(row.get("region", "")).strip()
+                if region and region not in regions:
+                    regions.append(region)
+            for region in regions:
+                self.region_combo.addItem(region, region)
+            region_index = self.region_combo.findData(old_region)
+            if old_region_index < 0 and regions:
+                preferred = next((region for region in regions if self.selected_regions and region in self.selected_regions), regions[0])
+                region_index = self.region_combo.findData(preferred)
+            self.region_combo.setCurrentIndex(max(region_index, 0))
+            self.channel_combo.clear()
+            self.channel_combo.addItem("当前所有通道", None)
+            for row in channels:
+                self.channel_combo.addItem(f"{row['channel_label']} ({row['region']})", row["channel_name"])
+            channel_index = self.channel_combo.findData(old_channel)
+            self.channel_combo.setCurrentIndex(max(channel_index, 0))
+            self.band_combo.clear()
+            self.band_combo.addItem("全部拟合范围", None)
+            for band in self.bands:
+                self.band_combo.addItem(f"{band['name']} [{band['low_hz']:g}–{band['high_hz']:g} Hz]", band["name"])
+            band_index = self.band_combo.findData(old_band)
+            if old_band_index < 0 and self.bands:
+                band_index = 1
+            self.band_combo.setCurrentIndex(max(band_index, 0))
+        finally:
+            self._updating_controls = False
+
+    def _controls_changed(self, *_args: Any) -> None:
+        if not self._updating_controls:
+            self._refresh()
+
+    def _selected_region(self) -> str:
+        return str(self.region_combo.currentData() or "全部")
+
+    def _selected_channel(self) -> str | None:
+        value = self.channel_combo.currentData()
+        return None if value in (None, "") else str(value)
+
+    def _refresh(self) -> None:
+        if self.payload is None:
+            return
+        selected_band = self.band_combo.currentData()
+        self.prepared = prepare_fooof(
+            self._tables(),
+            self.bands,
+            self.selected_channels,
+            self.selected_regions,
+            quality_only=bool(self.quality_combo.currentData()),
+            selected_band=str(selected_band) if selected_band else None,
+            peak_mode=str(self.peak_mode_combo.currentData() or "representative"),
+        )
+        channels = ordered_fooof_channels(self.prepared["models"], self.prepared["curves"])
+        selected_channel = self._selected_channel()
+        valid_names = {str(row["channel_name"]) for row in channels}
+        if selected_channel not in valid_names:
+            selected_channel = str(channels[0]["channel_name"]) if channels else None
+            self._updating_controls = True
+            try:
+                index = self.channel_combo.findData(selected_channel)
+                self.channel_combo.setCurrentIndex(max(index, 0))
+            finally:
+                self._updating_controls = False
+        region = self._selected_region()
+        font_size = int(self.font_spin.value())
+        show_legend = self.legend_check.isChecked()
+        curve_mode = str(self.curve_mode_combo.currentData() or "overlay")
+        unified_axis = self.unified_check.isChecked()
+
+        self.overview_figure.clear()
+        overview_axes = np.asarray(self.overview_figure.subplots(2, 3), dtype=object)
+        self._overview_info = plot_fooof_overview(self.overview_figure, overview_axes, self.prepared, region, selected_channel, curve_mode, unified_axis, show_legend, font_size)
+        self.overview_canvas.draw_idle()
+
+        self.aperiodic_figure.clear()
+        aperiodic_axes = np.asarray(self.aperiodic_figure.subplots(1, 2), dtype=object).ravel()
+        plot_aperiodic_details(self.aperiodic_figure, aperiodic_axes, self.prepared, selected_channel, show_legend, font_size)
+        self._set_table(self.aperiodic_table, self.prepared["models"])
+        self.aperiodic_canvas.draw_idle()
+
+        overlay_channels = [
+            str(row["channel_name"])
+            for row in channels
+            if self.selected_channels is None or str(row["channel_name"]) in self.selected_channels
+        ]
+        if selected_channel and selected_channel not in overlay_channels:
+            overlay_channels.append(selected_channel)
+        plot_periodic_curves(self.periodic_figure, str(self.layout_combo.currentData() or "region"), self.prepared, region, overlay_channels, curve_mode, unified_axis, show_legend, font_size)
+        self.periodic_canvas.draw_idle()
+        plot_periodic_heatmap(self.periodic_heatmap_figure, self.prepared, font_size)
+        self.periodic_heatmap_canvas.draw_idle()
+
+        plot_peak_parameters(self.peaks_figure, self.prepared, selected_channel, show_legend, font_size)
+        self.peaks_canvas.draw_idle()
+        self._peak_points = plot_peak_distribution(self.peak_distribution_figure, self.prepared, font_size)
+        self.peak_distribution_canvas.draw_idle()
+        self._set_table(self.peak_table, self.prepared["peaks_all"])
+
+        plot_single_channel_detail(self.detail_figure, self.prepared, selected_channel, show_legend, font_size)
+        self.detail_canvas.draw_idle()
+        detail = self.prepared["models"].loc[self.prepared["models"]["channel_name"].astype(str) == str(selected_channel)] if selected_channel else pd.DataFrame()
+        self._set_table(self.detail_table, pd.concat([detail, self.prepared["peaks_all"].loc[self.prepared["peaks_all"]["channel_name"].astype(str) == str(selected_channel)]], ignore_index=True, sort=False) if selected_channel else pd.DataFrame())
+        self.status_label.setText(self._status_text())
+
+    def _status_text(self) -> str:
+        models = self.prepared["models"]
+        peaks = self.prepared["peaks_all"]
+        if models.empty:
+            return "当前筛选下没有 FOOOF/specparam 结果。"
+        quality = models["fit_quality_status"].astype(str).value_counts().to_dict() if "fit_quality_status" in models else {}
+        no_peak = int((models.get("peak_status", pd.Series(dtype=str)).astype(str) == "no_peaks_detected").sum())
+        failed = int((models.get("fit_status", pd.Series(dtype=str)).astype(str) != "ok").sum())
+        band = self.prepared.get("selected_band")
+        band_text = "全部拟合范围" if band is None else f"{band['name']} [{band['low_hz']:g}–{band['high_hz']:g} Hz]（左闭右开）"
+        return f"通道={len(models)}；全部峰={len(peaks)}；质量={quality}；无峰={no_peak}；拟合失败={failed}；峰筛选={band_text}。PW 为高于非周期背景的 log10 功率差；BW=2σ。"
+
+    @staticmethod
+    def _set_table(table: QtWidgets.QTableWidget, frame: pd.DataFrame) -> None:
+        display = frame.head(1000).copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        table.clear()
+        table.setRowCount(len(display))
+        table.setColumnCount(len(display.columns))
+        table.setHorizontalHeaderLabels([str(column) for column in display.columns])
+        for row_index, row in enumerate(display.itertuples(index=False, name=None)):
+            for column_index, value in enumerate(row):
+                table.setItem(row_index, column_index, QtWidgets.QTableWidgetItem("" if pd.isna(value) else str(value)))
+        table.resizeColumnsToContents()
+        table.setToolTip(f"显示前 {len(display)} 行；完整结果保存在运行目录。")
+
+    def _overview_clicked(self, event: Any) -> None:
+        if event.inaxes is None or event.xdata is None:
+            return
+        channels = self._overview_info.get("channels", [])
+        if not channels:
+            return
+        index = int(np.clip(round(float(event.xdata)), 0, len(channels) - 1))
+        name = channels[index]["channel_name"]
+        self._updating_controls = True
+        try:
+            combo_index = self.channel_combo.findData(name)
+            if combo_index >= 0:
+                self.channel_combo.setCurrentIndex(combo_index)
+        finally:
+            self._updating_controls = False
+        self._refresh()
+
+    def _peak_clicked(self, event: Any) -> None:
+        if event.inaxes is None or event.xdata is None or event.ydata is None or not self._peak_points:
+            return
+        channels = ordered_fooof_channels(self.prepared["models"], self.prepared["curves"])
+        if not channels:
+            return
+        channel_index = int(np.clip(round(float(event.ydata)), 0, len(channels) - 1))
+        channel_name = channels[channel_index]["channel_name"]
+        candidates = [row for row in self._peak_points if str(row.get("channel_name")) == str(channel_name) and np.isfinite(_to_float(row.get("center_frequency_hz")))]
+        if candidates:
+            selected = min(candidates, key=lambda row: abs(_to_float(row.get("center_frequency_hz")) - float(event.xdata)))
+            channel_name = str(selected.get("channel_name"))
+        self._updating_controls = True
+        try:
+            combo_index = self.channel_combo.findData(channel_name)
+            if combo_index >= 0:
+                self.channel_combo.setCurrentIndex(combo_index)
+        finally:
+            self._updating_controls = False
+        self._refresh()
+
+    def save_figure(self, kind: str, path: str | Path) -> None:
+        figures = {
+            "overview": self.overview_figure,
+            "aperiodic": self.aperiodic_figure,
+            "periodic": self.periodic_figure,
+            "periodic_heatmap": self.periodic_heatmap_figure,
+            "peaks": self.peaks_figure,
+            "peak_distribution": self.peak_distribution_figure,
+            "detail": self.detail_figure,
+        }
+        if kind == "current":
+            kind = ("overview", "aperiodic", "periodic", "peaks", "detail")[self.tabs.currentIndex()]
+        figure = figures.get(kind)
+        if figure is None:
+            raise ValueError(f"Unknown FOOOF figure kind: {kind}")
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output, dpi=300)
+
+    def save_all(self, output_dir: str | Path) -> list[Path]:
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        saved: list[Path] = []
+        for kind in ("overview", "aperiodic", "periodic", "periodic_heatmap", "peaks", "peak_distribution", "detail"):
+            for suffix in (".png", ".svg"):
+                path = output / f"fooof_{kind}{suffix}"
+                self.save_figure(kind, path)
+                saved.append(path)
+        return saved
+
+    def save_tables(self, prefix: str | Path) -> list[Path]:
+        base = Path(prefix)
+        if base.suffix:
+            base = base.with_suffix("")
+        base.parent.mkdir(parents=True, exist_ok=True)
+        frames = {
+            "models": self.prepared["models"],
+            "peaks_all": self.prepared["peaks_all"],
+            "peaks_selected": self.prepared["peaks_display"],
+            "curves": self.prepared["curves"],
+        }
+        saved: list[Path] = []
+        for name, frame in frames.items():
+            path = base.parent / f"{base.name}_{name}.csv"
+            frame.to_csv(path, index=False, encoding="utf-8-sig")
+            saved.append(path)
+        settings = pd.DataFrame(
+            [
+                {
+                    "file_id": self.payload.get("file_id", "") if self.payload else "",
+                    "quality_filter": "pass" if self.quality_combo.currentData() else "all",
+                    "selected_region": self._selected_region(),
+                    "selected_channel": self._selected_channel() or "",
+                    "selected_band": self.band_combo.currentData() or "",
+                    "peak_mode": self.peak_mode_combo.currentData(),
+                    "curve_mode": self.curve_mode_combo.currentData(),
+                    "fit_range_note": "显示频段只筛选已有峰；扩展拟合范围需重新运行 FOOOF/specparam",
+                    "band_boundary_rule": "left_closed_right_open",
+                    "pw_definition": "backend peak height above aperiodic model in log10 power",
+                    "bw_definition": "FOOOF/specparam bandwidth = 2 sigma; distribution line is CF +/- BW/2",
+                }
+            ]
+        )
+        settings_path = base.parent / f"{base.name}_settings.csv"
+        settings.to_csv(settings_path, index=False, encoding="utf-8-sig")
+        saved.append(settings_path)
+        return saved
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
 
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, input_files: list[str] | None = None, output_dir: str | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("小鼠多脑区 LFP 分析 GUI")
+        font_family = _load_windows_cjk_font() or "Noto Sans SC"
+        # Set the font on the application as well as the main window.  Several
+        # result widgets are created without a parent first; using the
+        # application font prevents those widgets from falling back to a
+        # CJK-incomplete default font on Windows/high-DPI displays.
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app_font = QtGui.QFont(font_family, 9)
+            app.setFont(app_font)
+        self.setFont(QtGui.QFont(font_family, 9))
+        self.setStyleSheet(_gui_stylesheet())
+        self.setWindowTitle(window_title())
         self.resize(1500, 980)
-        self.config_path = PROJECT_ROOT / "configs" / "default.yaml"
+        self.setMinimumSize(980, 620)
+        self.config_path = PROJECT_ROOT / "configs" / DEFAULT_CONFIG_FILENAME
         self.metadata_dir = PROJECT_ROOT / "metadata"
+        self.current_mapping_path: Path | None = None
         self.base_config = load_config(self.config_path)
         self.file_infos: list[dict[str, Any]] = []
         self.current_info: dict[str, Any] | None = None
@@ -181,7 +1401,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.inspect_thread: QtCore.QThread | None = None
         self._running = False
         self._dirty = False
+        self._last_progress_message = ""
         self._build_ui()
+        help_menu = self.menuBar().addMenu("Help")
+        about_action = QtGui.QAction("About LUNA", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
         self._restore_defaults()
         if output_dir:
             self.output_edit.setText(str(Path(output_dir).expanduser()))
@@ -191,66 +1416,203 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        root = QtWidgets.QHBoxLayout(central)
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+        root.addWidget(self._build_top_toolbar())
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
         root.addWidget(splitter)
 
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
+        left_scroll.setMinimumWidth(350)
+        left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         left_panel = QtWidgets.QWidget()
+        left_panel.setMinimumWidth(338)
         left_scroll.setWidget(left_panel)
         left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(2, 2, 8, 2)
+        left_layout.setSpacing(10)
         left_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         splitter.addWidget(left_scroll)
 
         right = QtWidgets.QWidget()
+        right.setMinimumWidth(560)
         right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(2, 2, 2, 2)
+        right_layout.setSpacing(7)
         splitter.addWidget(right)
-        splitter.setSizes([520, 980])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([430, 1070])
 
         left_layout.addWidget(self._build_data_group())
+        left_layout.addWidget(self._build_mapping_group())
         left_layout.addWidget(self._build_selection_group())
         left_layout.addWidget(self._build_indicator_group())
         left_layout.addWidget(self._build_parameter_group())
         left_layout.addWidget(self._build_task_group())
 
         self.result_combo = QtWidgets.QComboBox()
+        self.result_combo.setToolTip("选择已读取的预览、分析结果或载入的历史结果。")
         self.result_combo.currentTextChanged.connect(self._show_selected_result)
         right_layout.addWidget(self.result_combo)
+
+        self.general_plot_widget = QtWidgets.QWidget()
+        general_plot_layout = QtWidgets.QVBoxLayout(self.general_plot_widget)
         self.canvas = ResultCanvas()
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
-        right_layout.addWidget(self.toolbar)
-        right_layout.addWidget(self.canvas, stretch=3)
+        self.toolbar.setMaximumHeight(34)
+        general_plot_layout.addWidget(self.toolbar)
+        general_plot_layout.addWidget(self.canvas, stretch=1)
+        self.general_plot_widget.setMinimumHeight(300)
+        right_layout.addWidget(self.general_plot_widget, stretch=6)
+
+        self.band_power_view = BandPowerView()
+        self.band_power_view.setFont(self.font())
+        self.band_power_view.export_requested.connect(self._export_band_figure)
+        self.band_power_view.setVisible(False)
+        right_layout.addWidget(self.band_power_view, stretch=3)
+
+        self.fooof_view = FooofView()
+        self.fooof_view.setFont(self.font())
+        self.fooof_view.export_requested.connect(self._export_fooof)
+        self.fooof_view.setVisible(False)
+        right_layout.addWidget(self.fooof_view, stretch=3)
+
+        self.connectivity_view = ConnectivityView(right)
+        self.connectivity_view.setFont(self.font())
+        self.connectivity_view.export_requested.connect(self._export_connectivity)
+        self.connectivity_view.setVisible(False)
+        right_layout.addWidget(self.connectivity_view, stretch=3)
+
         self.table = QtWidgets.QTableWidget()
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
+        self.table.setMinimumHeight(120)
+        self.table.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
         right_layout.addWidget(self.table, stretch=2)
+        log_header = QtWidgets.QHBoxLayout()
+        log_header.setContentsMargins(0, 0, 0, 0)
+        log_header.addWidget(QtWidgets.QLabel("状态与日志"))
+        self.result_status_label = QtWidgets.QLabel("就绪：请导入 FIF 文件。")
+        self.result_status_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        self.result_status_label.setWordWrap(True)
+        log_header.addWidget(self.result_status_label, stretch=1)
+        self.log_toggle = QtWidgets.QToolButton()
+        self.log_toggle.setObjectName("sectionToggle")
+        self.log_toggle.setText("展开详细日志")
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.setChecked(False)
+        self.log_toggle.toggled.connect(self._toggle_log)
+        log_header.addWidget(self.log_toggle)
+        right_layout.addLayout(log_header)
         self.status_text = QtWidgets.QPlainTextEdit()
         self.status_text.setReadOnly(True)
         self.status_text.setMaximumBlockCount(2000)
-        right_layout.addWidget(self.status_text, stretch=1)
+        self.status_text.setPlaceholderText("详细运行日志已折叠；需要排查时点击“展开详细日志”。")
+        self.status_text.setMaximumHeight(150)
+        self.status_text.setVisible(False)
+        right_layout.addWidget(self.status_text, stretch=0)
+        quality_header = QtWidgets.QLabel("自动质量检查 / 异常提示")
+        quality_header.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        right_layout.addWidget(quality_header)
+        self.quality_alert_text = QtWidgets.QPlainTextEdit()
+        self.quality_alert_text.setReadOnly(True)
+        self.quality_alert_text.setMaximumBlockCount(1000)
+        self.quality_alert_text.setMinimumHeight(62)
+        self.quality_alert_text.setMaximumHeight(112)
+        self.quality_alert_text.setPlaceholderText("添加 FIF 后，这里会列出可疑通道、epoch 和上游删除记录。")
+        right_layout.addWidget(self.quality_alert_text, stretch=0)
 
-    def _group(self, title: str) -> tuple[QtWidgets.QGroupBox, QtWidgets.QVBoxLayout]:
-        box = QtWidgets.QGroupBox(title)
-        layout = QtWidgets.QVBoxLayout(box)
+    def _build_top_toolbar(self) -> QtWidgets.QWidget:
+        """Global project and execution controls, independent of parameters."""
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(3)
+        info_row = QtWidgets.QHBoxLayout()
+        info_row.setSpacing(10)
+        brand = QtWidgets.QLabel(f"<b>{APP_NAME}</b><br><small>{APP_FULL_NAME}</small>")
+        brand.setToolTip(APP_DESCRIPTION)
+        brand.setMinimumWidth(260)
+        info_row.addWidget(brand)
+        self.header_dataset_label = QtWidgets.QLabel("未载入数据集")
+        self.header_dataset_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        self.header_dataset_label.setWordWrap(True)
+        self.header_dataset_label.setMinimumWidth(180)
+        info_row.addWidget(self.header_dataset_label, stretch=1)
+        self.header_task_label = QtWidgets.QLabel("就绪")
+        self.header_task_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        self.header_task_label.setMinimumWidth(150)
+        self.header_task_label.setWordWrap(True)
+        info_row.addWidget(self.header_task_label)
+        layout.addLayout(info_row)
+        # Keep the existing worker/status code independent of the layout.
+        self.task_label = self.header_task_label
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addStretch(1)
+        self.run_button = QtWidgets.QPushButton("Run Analysis")
+        self.run_button.setObjectName("primaryAction")
+        self.run_button.setToolTip("按当前文件、通道、epoch、脑区对和计算参数运行已勾选指标。")
+        self.run_button.clicked.connect(self._run)
+        self.cancel_button = QtWidgets.QPushButton("Stop")
+        self.cancel_button.setObjectName("cancelAction")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setToolTip("请求取消后台任务；已经完成的结果会保留。")
+        self.cancel_button.clicked.connect(self._cancel)
+        self.save_result_button = QtWidgets.QPushButton("Save Result")
+        self.save_result_button.setToolTip("保存当前结果视图对应的图和数值表；不重新计算。")
+        self.save_result_button.clicked.connect(self._save_result)
+        self.export_figure_button = QtWidgets.QPushButton("Export Figure")
+        self.export_figure_button.setToolTip("导出当前结果图；具体指标视图会提供相应格式。")
+        self.export_figure_button.clicked.connect(self._export_figure)
+        for button in (self.run_button, self.cancel_button, self.save_result_button, self.export_figure_button):
+            button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 28)
+            button.setMinimumHeight(32)
+            action_row.addWidget(button)
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedWidth(86)
+        self.progress.setToolTip("后台任务进度；无法估计时会使用不确定进度。")
+        action_row.addWidget(self.progress)
+        layout.addLayout(action_row)
+        return panel
+
+    def _group(self, title: str) -> tuple[CollapsiblePanel, QtWidgets.QVBoxLayout]:
+        box = CollapsiblePanel(title)
+        layout = box.content_layout
         return box, layout
 
     def _build_data_group(self) -> QtWidgets.QGroupBox:
         box, layout = self._group("数据")
         row = QtWidgets.QHBoxLayout()
-        add = QtWidgets.QPushButton("添加 FIF")
+        add = QtWidgets.QPushButton("导入文件")
+        add.setObjectName("primaryAction")
+        add.setToolTip("选择一个或多个 FIF 文件。读取后自动显示波形、质量和实际有效时长。")
         add.clicked.connect(self._choose_files)
-        clear = QtWidgets.QPushButton("清空")
+        clear = QtWidgets.QPushButton("清空文件")
+        clear.setToolTip("移除当前已载入文件和内存中的显示结果。不会删除磁盘文件。")
         clear.clicked.connect(self._clear_files)
         row.addWidget(add)
         row.addWidget(clear)
+        row.addStretch(1)
         layout.addLayout(row)
         self.file_combo = QtWidgets.QComboBox()
+        self.file_combo.setMinimumWidth(180)
+        self.file_combo.setToolTip("当前文件；悬停可查看完整路径。")
         self.file_combo.currentIndexChanged.connect(self._file_changed)
         layout.addWidget(self.file_combo)
         output_row = QtWidgets.QHBoxLayout()
-        self.output_edit = QtWidgets.QLineEdit(str(PROJECT_ROOT / "results" / "gui"))
+        self.output_edit = QtWidgets.QLineEdit(str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME))
+        self.output_edit.setToolTip("分析结果保存目录；完整路径可直接编辑、复制。")
         choose_output = QtWidgets.QPushButton("输出目录")
+        choose_output.setToolTip("选择分析结果保存目录。")
         choose_output.clicked.connect(self._choose_output)
         output_row.addWidget(self.output_edit)
         output_row.addWidget(choose_output)
@@ -260,28 +1622,239 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.data_info_label)
         return box
 
+    def _build_mapping_group(self) -> CollapsiblePanel:
+        box, layout = self._group("Channel Mapping")
+        self.mapping_hint = QtWidgets.QLabel("导入文件后编辑脑区和标签；空白脑区不会参与脑区级连接。")
+        self.mapping_hint.setWordWrap(True)
+        self.mapping_hint.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        layout.addWidget(self.mapping_hint)
+        self.mapping_table = QtWidgets.QTableWidget(0, 4)
+        self.mapping_table.setHorizontalHeaderLabels(["Channel", "Physical", "Region", "Label"])
+        self.mapping_table.setAlternatingRowColors(True)
+        self.mapping_table.setMinimumHeight(120)
+        self.mapping_table.setMaximumHeight(250)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.mapping_table.itemChanged.connect(self._mapping_edited)
+        layout.addWidget(self.mapping_table)
+        mapping_buttons = QtWidgets.QHBoxLayout()
+        apply_button = QtWidgets.QPushButton("Apply Mapping")
+        apply_button.setToolTip("应用当前表格中的 Region/Label 到当前文件；不会改写 FIF。")
+        apply_button.clicked.connect(self._apply_mapping_from_table)
+        save_button = QtWidgets.QPushButton("Save Mapping")
+        save_button.setToolTip("将当前通道映射保存为可复用的 JSON。")
+        save_button.clicked.connect(self._save_mapping_file)
+        load_button = QtWidgets.QPushButton("Load Mapping")
+        load_button.setToolTip("载入 JSON，并按通道名或物理编号匹配当前文件。")
+        load_button.clicked.connect(self._load_mapping_file)
+        for button in (apply_button, save_button, load_button):
+            button.setMinimumHeight(30)
+            mapping_buttons.addWidget(button)
+        layout.addLayout(mapping_buttons)
+        self.mapping_status_label = QtWidgets.QLabel("尚未载入文件。")
+        self.mapping_status_label.setWordWrap(True)
+        self.mapping_status_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        layout.addWidget(self.mapping_status_label)
+        return box
+
+    def _mapping_edited(self, *_args: Any) -> None:
+        if getattr(self, "_mapping_table_loading", False):
+            return
+        self._set_dirty(True)
+
+    def _populate_mapping_table(self) -> None:
+        table = self.current_info.get("channel_table", pd.DataFrame()) if self.current_info else pd.DataFrame()
+        self._mapping_table_loading = True
+        try:
+            self.mapping_table.setRowCount(0)
+            for row_index, row in enumerate(mapping_rows(table)):
+                self.mapping_table.insertRow(row_index)
+                values = (
+                    row.get("channel_name", ""),
+                    row.get("physical_channel_number", ""),
+                    row.get("region", ""),
+                    row.get("label", ""),
+                )
+                for column, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem("" if pd.isna(value) else str(value))
+                    if column < 2:
+                        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    self.mapping_table.setItem(row_index, column, item)
+            if self.current_info:
+                mapped = len(region_order(table))
+                total = len(table)
+                self.mapping_status_label.setText(f"当前映射：{mapped} 个脑区，{total} 个通道；可直接编辑 Region 和 Label。")
+            else:
+                self.mapping_status_label.setText("尚未载入文件。")
+        finally:
+            self._mapping_table_loading = False
+
+    def _mapping_table_dataframe(self) -> pd.DataFrame:
+        if self.current_info is None:
+            return pd.DataFrame()
+        table = self.current_info["channel_table"].copy()
+        by_name = {str(row.channel_name): index for index, row in table.iterrows()}
+        for row_index in range(self.mapping_table.rowCount()):
+            name_item = self.mapping_table.item(row_index, 0)
+            if name_item is None:
+                continue
+            name = name_item.text().strip()
+            if name not in by_name:
+                continue
+            target = by_name[name]
+            region_item = self.mapping_table.item(row_index, 2)
+            label_item = self.mapping_table.item(row_index, 3)
+            table.at[target, "region"] = region_item.text().strip() if region_item else ""
+            table.at[target, "label"] = label_item.text().strip() if label_item else ""
+            table.at[target, "mapping_status"] = "mapped" if table.at[target, "region"] else "unmapped"
+        return table
+
+    def _populate_rank_mapping_table(self) -> None:
+        old: dict[str, str] = {}
+        for row in range(getattr(self, "rank_mapping_table", QtWidgets.QTableWidget()).rowCount()):
+            region_item = self.rank_mapping_table.item(row, 0)
+            rank_item = self.rank_mapping_table.item(row, 1)
+            if region_item is not None and rank_item is not None:
+                old[region_item.text().strip()] = rank_item.text().strip()
+        table = self.current_info.get("channel_table", pd.DataFrame()) if self.current_info else pd.DataFrame()
+        regions = region_order(table) if not table.empty else list(DEFAULT_TEMPLATE_REGIONS)
+        self.rank_mapping_table.blockSignals(True)
+        try:
+            self.rank_mapping_table.setRowCount(0)
+            for row_index, region in enumerate(regions):
+                self.rank_mapping_table.insertRow(row_index)
+                region_item = QtWidgets.QTableWidgetItem(region)
+                region_item.setFlags(region_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.rank_mapping_table.setItem(row_index, 0, region_item)
+                self.rank_mapping_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(old.get(region, "0")))
+        finally:
+            self.rank_mapping_table.blockSignals(False)
+
+    def _apply_channel_table(self, table: pd.DataFrame, source: str = "当前编辑") -> None:
+        if self.current_info is None:
+            return
+        issues = validate_mapping(table)
+        self.current_info["channel_table"] = table
+        for info in self.file_infos:
+            if str(info.get("path")) == str(self.current_info.get("path")):
+                info["channel_table"] = table
+        if source and source not in {"当前编辑", "预设"}:
+            self.current_mapping_path = Path(source)
+        self._populate_current_file()
+        if issues:
+            self.mapping_status_label.setText("映射已应用，但有提示：" + "；".join(issues))
+        else:
+            self.mapping_status_label.setText(f"映射已应用：{len(region_order(table))} 个脑区。")
+        self._set_dirty(True)
+        self._log(f"已应用通道映射：{len(region_order(table))} 个脑区。")
+
+    def _apply_mapping_from_table(self) -> None:
+        if self.current_info is None:
+            self._show_message(QtWidgets.QMessageBox.Icon.Information, "尚未载入文件", "请先导入 FIF 文件。")
+            return
+        self._apply_channel_table(self._mapping_table_dataframe())
+
+    def _save_mapping_file(self) -> None:
+        if self.current_info is None:
+            self._show_message(QtWidgets.QMessageBox.Icon.Information, "尚未载入文件", "请先导入 FIF 文件。")
+            return
+        table = self._mapping_table_dataframe()
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "保存通道映射",
+            str(PROJECT_ROOT / DEFAULT_MAPPING_FILENAME),
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            output = save_mapping(table, path)
+            self.current_mapping_path = output
+            self._apply_channel_table(table, str(output))
+            self._log(f"已保存通道映射：{output}")
+        except Exception as exc:  # noqa: BLE001 - user-facing file operation
+            self._show_message(QtWidgets.QMessageBox.Icon.Warning, "保存通道映射失败", str(exc))
+
+    def _load_mapping_file(self) -> None:
+        if self.current_info is None:
+            self._show_message(QtWidgets.QMessageBox.Icon.Information, "尚未载入文件", "请先导入 FIF 文件。")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "载入通道映射", str(PROJECT_ROOT), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            table = apply_mapping(self.current_info["channel_table"], load_mapping(path))
+            self.current_mapping_path = Path(path).resolve()
+            self._apply_channel_table(table, str(self.current_mapping_path))
+            self._log(f"已载入通道映射：{path}")
+        except Exception as exc:  # noqa: BLE001 - user-facing file operation
+            self._show_message(QtWidgets.QMessageBox.Icon.Warning, "载入通道映射失败", str(exc))
+
+    def _rebuild_region_controls(self) -> None:
+        old_selected = {name for name, checkbox in self.region_checks.items() if checkbox.isChecked()}
+        table = self.current_info.get("channel_table", pd.DataFrame()) if self.current_info else pd.DataFrame()
+        regions = region_order(table)
+        self.region_checks_group.blockSignals(True)
+        self.region_checks_group.clear()
+        self.region_checks = {}
+        preserve_selection = bool(old_selected.intersection(regions))
+        for region in regions:
+            checked = region in old_selected if preserve_selection else True
+            self.region_checks_group.add_item(region, region, checked=checked, tooltip=f"选择脑区 {region} 的全部已映射通道。")
+            self.region_checks[region] = self.region_checks_group.items()[-1][0]
+        self.region_checks_group.blockSignals(False)
+        self.region_checks_group.updateGeometry()
+
+    def _rebuild_pair_controls(self) -> None:
+        old_selected = {pair for pair, checkbox in self.pair_checks.items() if checkbox.isChecked()}
+        table = self.current_info.get("channel_table", pd.DataFrame()) if self.current_info else pd.DataFrame()
+        pairs = region_pairs(table) if not table.empty else [
+            (DEFAULT_TEMPLATE_REGIONS[i], DEFAULT_TEMPLATE_REGIONS[j])
+            for i in range(len(DEFAULT_TEMPLATE_REGIONS))
+            for j in range(i + 1, len(DEFAULT_TEMPLATE_REGIONS))
+        ]
+        self.pair_checks_group.blockSignals(True)
+        self.pair_checks_group.clear()
+        self.pair_checks = {}
+        preserve_selection = bool(old_selected.intersection(pairs))
+        for pair in pairs:
+            checked = pair in old_selected if preserve_selection else True
+            self.pair_checks_group.add_item(f"{pair[0]}–{pair[1]}", pair, checked=checked, tooltip=f"选择 {pair[0]} 与 {pair[1]} 的跨脑区连接。")
+            self.pair_checks[pair] = self.pair_checks_group.items()[-1][0]
+        self.pair_checks_group.blockSignals(False)
+        self.pair_checks_group.updateGeometry()
+
     def _build_selection_group(self) -> QtWidgets.QGroupBox:
         box, layout = self._group("分析范围")
-        layout.addWidget(QtWidgets.QLabel("脑区（用于批量选择通道）"))
-        region_row = QtWidgets.QHBoxLayout()
+        region_label = QtWidgets.QLabel("脑区（用于批量选择通道）")
+        region_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        layout.addWidget(region_label)
+        self.region_checks_group = FlowCheckBoxGroup()
         self.region_checks: dict[str, QtWidgets.QCheckBox] = {}
-        for region in REGION_ORDER:
-            checkbox = QtWidgets.QCheckBox(region)
-            checkbox.setChecked(True)
-            self.region_checks[region] = checkbox
-            region_row.addWidget(checkbox)
+        self.region_checks_group.changed.connect(self._selection_changed)
+        layout.addWidget(self.region_checks_group)
+        apply_row = QtWidgets.QHBoxLayout()
         apply_regions = QtWidgets.QPushButton("应用脑区选择")
+        apply_regions.setToolTip("将勾选的脑区应用到下方实际通道。")
         apply_regions.clicked.connect(self._apply_region_selection)
-        region_row.addWidget(apply_regions)
-        layout.addLayout(region_row)
-        layout.addWidget(QtWidgets.QLabel("实际通道（按 FIF 通道名和映射显示）"))
+        apply_row.addWidget(apply_regions)
+        apply_row.addStretch(1)
+        layout.addLayout(apply_row)
+        channel_label = QtWidgets.QLabel("实际通道（按 FIF 通道名和物理映射显示）")
+        channel_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        layout.addWidget(channel_label)
         self.channel_list = QtWidgets.QListWidget()
         self.channel_list.setMaximumHeight(190)
-        self.channel_list.itemChanged.connect(self._selection_changed)
+        self.channel_list.setMinimumHeight(92)
+        self.channel_list.setToolTip("勾选参与计算和波形预览的通道；物理编号来自 FIF 通道映射。")
+        self.channel_list.itemChanged.connect(self._channel_selection_changed)
         layout.addWidget(self.channel_list)
         epoch_row = QtWidgets.QHBoxLayout()
         epoch_row.addWidget(QtWidgets.QLabel("epoch 子集"))
         self.epoch_edit = QtWidgets.QLineEdit("all")
+        self.epoch_edit.setMinimumWidth(100)
         self.epoch_edit.setToolTip("可写 all、0-20、0,2,4；索引为本次 FIF 保存数组索引。")
         self.epoch_edit.editingFinished.connect(self._selection_changed)
         epoch_row.addWidget(self.epoch_edit)
@@ -298,18 +1871,35 @@ class MainWindow(QtWidgets.QMainWindow):
         time_row.addWidget(QtWidgets.QLabel("至"))
         time_row.addWidget(self.time_end)
         layout.addLayout(time_row)
+        preview_row = QtWidgets.QHBoxLayout()
+        preview_row.addWidget(QtWidgets.QLabel("右侧预览 epoch"))
+        self.preview_prev_button = QtWidgets.QPushButton("‹")
+        self.preview_prev_button.setMinimumSize(40, 32)
+        self.preview_prev_button.setEnabled(False)
+        self.preview_prev_button.setToolTip("切换到上一段预览；不改变正式分析的 epoch 子集。")
+        self.preview_prev_button.clicked.connect(lambda: self._step_preview(-1))
+        preview_row.addWidget(self.preview_prev_button)
+        self.preview_epoch = QtWidgets.QSpinBox()
+        self.preview_epoch.setRange(0, 0)
+        self.preview_epoch.setVisible(False)
+        self.preview_epoch.setToolTip("仅改变右侧原始波形预览；正式分析使用下方 epoch 子集设置。")
+        self.preview_epoch.valueChanged.connect(self._preview_changed)
+        preview_row.addWidget(self.preview_epoch)
+        self.preview_epoch_label = QtWidgets.QLabel("Epoch — / —")
+        self.preview_epoch_label.setMinimumWidth(108)
+        self.preview_epoch_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.preview_epoch_label.setToolTip("显示编号从 1 开始；波形标题和分析表保留保存数组索引。")
+        preview_row.addWidget(self.preview_epoch_label)
+        self.preview_next_button = QtWidgets.QPushButton("›")
+        self.preview_next_button.setMinimumSize(40, 32)
+        self.preview_next_button.setEnabled(False)
+        self.preview_next_button.setToolTip("切换到下一段预览；不改变正式分析的 epoch 子集。")
+        self.preview_next_button.clicked.connect(lambda: self._step_preview(1))
+        preview_row.addWidget(self.preview_next_button)
+        preview_row.addStretch(1)
+        layout.addLayout(preview_row)
         self.selection_label = QtWidgets.QLabel("选择数据量：尚未载入")
         layout.addWidget(self.selection_label)
-        layout.addWidget(QtWidgets.QLabel("连接脑区对"))
-        self.pair_checks: dict[tuple[str, str], QtWidgets.QCheckBox] = {}
-        pair_grid = QtWidgets.QGridLayout()
-        for index, pair in enumerate(REGION_PAIRS):
-            checkbox = QtWidgets.QCheckBox(f"{pair[0]}–{pair[1]}")
-            checkbox.setChecked(True)
-            checkbox.stateChanged.connect(self._selection_changed)
-            self.pair_checks[pair] = checkbox
-            pair_grid.addWidget(checkbox, index // 3, index % 3)
-        layout.addLayout(pair_grid)
         return box
 
     def _build_indicator_group(self) -> QtWidgets.QGroupBox:
@@ -317,19 +1907,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.indicator_checks: dict[str, QtWidgets.QCheckBox] = {}
         descriptions = {
             "Quality": "读取质量和有效时长",
-            "PSD": "Welch 功率谱",
+            "PSD": "Welch / Multitaper 功率谱",
             "Band Power": "频段绝对/相对功率",
             "FOOOF": "specparam/FOOOF 参数化",
             "MIC": "多变量 MIC",
             "MIM": "多变量 MIM",
+            "wpli": "通道对加权相位滞后指数",
+            "dpli": "通道对有向相位滞后指数",
             "wpli2_debiased": "通道对去偏平方 wPLI",
             "Time Delay": "PyBispectra 时间延迟",
         }
-        for name in INDICATORS:
-            checkbox = QtWidgets.QCheckBox(f"{name}  —  {descriptions[name]}")
+        connectivity_box = QtWidgets.QGroupBox("功能连接 Connectivity")
+        connectivity_layout = QtWidgets.QVBoxLayout(connectivity_box)
+        pair_hint = QtWidgets.QLabel("连接脑区对（先选择脑区对，再选择分析指标）")
+        pair_hint.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        connectivity_layout.addWidget(pair_hint)
+        self.pair_checks: dict[tuple[str, str], QtWidgets.QCheckBox] = {}
+        self.pair_checks_group = FlowCheckBoxGroup()
+        self.pair_checks_group.changed.connect(self._selection_changed)
+        connectivity_layout.addWidget(self.pair_checks_group)
+        method_hint = QtWidgets.QLabel("Analysis method / 分析指标")
+        method_hint.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        connectivity_layout.addWidget(method_hint)
+        method_grid = QtWidgets.QGridLayout()
+        method_names = ("MIC", "MIM", "wpli", "dpli", "wpli2_debiased", "Time Delay")
+        method_display_names = {"wpli": "wPLI", "dpli": "dPLI", "wpli2_debiased": "wPLI²_debiased", "Time Delay": "TDE"}
+        for index, name in enumerate(method_names):
+            checkbox = QtWidgets.QCheckBox(method_display_names.get(name, name))
+            checkbox.setToolTip(descriptions[name])
+            checkbox.stateChanged.connect(self._indicator_changed)
+            self.indicator_checks[name] = checkbox
+            method_grid.addWidget(checkbox, index // 3, index % 3)
+        connectivity_layout.addLayout(method_grid)
+        layout.addWidget(connectivity_box)
+        for name in ("Quality", "PSD", "Band Power", "FOOOF"):
+            checkbox = QtWidgets.QCheckBox(name)
+            checkbox.setToolTip(descriptions[name])
             checkbox.stateChanged.connect(self._indicator_changed)
             self.indicator_checks[name] = checkbox
             layout.addWidget(checkbox)
+        self._rebuild_pair_controls()
         return box
 
     def _build_parameter_group(self) -> QtWidgets.QGroupBox:
@@ -338,29 +1955,130 @@ class MainWindow(QtWidgets.QMainWindow):
         self.parameter_widgets: dict[str, QtWidgets.QWidget] = {}
         self.parameter_labels: dict[str, QtWidgets.QLabel] = {}
         tab_layouts: dict[str, QtWidgets.QFormLayout] = {}
-        for tab_name in ("PSD / Welch", "FOOOF", "Connectivity", "频段功率", "Time Delay"):
+        for tab_name in ("PSD 方法 / 参数", "FOOOF", "Connectivity", "频段功率"):
             tab = QtWidgets.QWidget()
             form = QtWidgets.QFormLayout(tab)
+            form.setContentsMargins(10, 10, 10, 10)
+            form.setHorizontalSpacing(10)
+            form.setVerticalSpacing(7)
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+            form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+            form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
             tab_layouts[tab_name] = form
             self.parameter_tabs.addTab(tab, tab_name)
+        self.parameter_tabs.setUsesScrollButtons(True)
+        self.parameter_tabs.tabBar().setExpanding(False)
+        self.parameter_tabs.setToolTip("参数按功能分组；切换分析指标后，仅启用相关参数。")
         for definition in PARAMETER_DEFINITIONS:
+            if definition.key.startswith(("connectivity.", "time_delay.")):
+                continue
             tab_name = {
-                "psd": "PSD / Welch",
+                "psd": "PSD 方法 / 参数",
                 "parameterization": "FOOOF",
-                "connectivity": "Connectivity",
-                "time_delay": "Time Delay",
-            }.get(definition.key.split(".")[0], "PSD / Welch")
+            }.get(definition.key.split(".")[0], "PSD 方法 / 参数")
             widget = self._make_parameter_widget(definition)
             self.parameter_widgets[definition.key] = widget
             label = QtWidgets.QLabel(f"{definition.label} ({definition.unit})" if definition.unit else definition.label)
+            label.setWordWrap(True)
             label.setToolTip(definition.help_text)
             self.parameter_labels[definition.key] = label
             tab_layouts[tab_name].addRow(label, widget)
+
+        self._connectivity_panels: dict[str, QtWidgets.QGroupBox] = {}
+        self._connectivity_panel_forms: dict[str, QtWidgets.QFormLayout] = {}
+        connectivity_content = QtWidgets.QWidget()
+        connectivity_layout = QtWidgets.QVBoxLayout(connectivity_content)
+        connectivity_layout.setContentsMargins(0, 0, 0, 0)
+        connectivity_layout.setSpacing(8)
+        connectivity_scroll = QtWidgets.QScrollArea()
+        connectivity_scroll.setWidgetResizable(True)
+        connectivity_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        connectivity_scroll.setWidget(connectivity_content)
+        self._connectivity_scroll = connectivity_scroll
+
+        common_panel = self._new_connectivity_panel(
+            "共同频谱参数",
+            "仅对 MIC、MIM、wPLI、dPLI 和 wPLI²_debiased 显示；TDE 使用下方独立参数。",
+        )
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.mode")
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.fmin_hz")
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.fmax_hz")
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.mt_bandwidth_hz")
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.mt_adaptive")
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.mt_low_bias")
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.min_epochs")
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.n_jobs")
+        self._add_parameter_to_connectivity_panel(common_panel, "connectivity.stability_n_subsamples")
+        connectivity_layout.addWidget(common_panel)
+
+        multivariate_panel = self._new_connectivity_panel(
+            "多变量 rank（MIC / MIM）",
+            "rank 表示每个脑区保留的信号维度；MIC 和 MIM 共用同一套 rank。",
+        )
+        for key in (
+            "connectivity.rank_strategy",
+            "connectivity.rank_variance_threshold",
+        ):
+            self._add_parameter_to_connectivity_panel(multivariate_panel, key)
+        self.rank_mapping_table = QtWidgets.QTableWidget(0, 2)
+        self.rank_mapping_table.setHorizontalHeaderLabels(["Region", "Fixed rank (0=auto)"])
+        self.rank_mapping_table.setMaximumHeight(155)
+        self.rank_mapping_table.horizontalHeader().setStretchLastSection(True)
+        self.rank_mapping_table.itemChanged.connect(self._selection_changed)
+        multivariate_panel.layout().addWidget(QtWidgets.QLabel("手动 rank（按当前 Channel Mapping 动态生成）"))  # type: ignore[union-attr]
+        multivariate_panel.layout().addWidget(self.rank_mapping_table)  # type: ignore[union-attr]
+        connectivity_layout.addWidget(multivariate_panel)
+
+        mic_panel = self._new_connectivity_panel("MIC 专属参数", "MIC 输出成分数；MIM 不使用此参数。")
+        self._add_parameter_to_connectivity_panel(mic_panel, "connectivity.n_components")
+        connectivity_layout.addWidget(mic_panel)
+
+        bivariate_panel = self._new_connectivity_panel(
+            "wPLI / wPLI²_debiased 专属参数",
+            "wPLI²_debiased 是独立指标；去偏结果不会通过开关覆盖普通 wPLI。",
+        )
+        self._add_parameter_to_connectivity_panel(bivariate_panel, "connectivity.region_pair_summary")
+        debias_note = QtWidgets.QLabel("普通 wPLI 不提供额外 debias 开关；需要去偏平方结果时勾选 wPLI²_debiased。")
+        debias_note.setWordWrap(True)
+        bivariate_panel.layout().addWidget(debias_note)  # type: ignore[union-attr]
+        connectivity_layout.addWidget(bivariate_panel)
+
+        dpli_panel = self._new_connectivity_panel(
+            "dPLI 专属说明",
+            "dPLI 使用有序 seed → target 约定；seed/target 不是因果方向。",
+        )
+        direction_note = QtWidgets.QLabel("phase direction convention：数值 0.5 为中性；结果范围和方向解释沿用当前后端。")
+        direction_note.setWordWrap(True)
+        dpli_panel.layout().addWidget(direction_note)  # type: ignore[union-attr]
+        connectivity_layout.addWidget(dpli_panel)
+
+        tde_panel = self._new_connectivity_panel(
+            "TDE 专属参数",
+            "TDE 使用 PyBispectra 时间延迟参数；不会读取 MIC/MIM 的 rank 或 component。",
+        )
+        for key in (
+            "time_delay.analysis_sfreq_hz",
+            "time_delay.max_delay_ms",
+            "time_delay.fmin_hz",
+            "time_delay.fmax_hz",
+            "time_delay.fft_window",
+            "time_delay.n_points",
+            "time_delay.n_jobs",
+        ):
+            self._add_parameter_to_connectivity_panel(tde_panel, key)
+        tde_note = QtWidgets.QLabel("延迟正负号沿用当前后端约定；频率范围和延迟窗口均为 TDE 专属设置。")
+        tde_note.setWordWrap(True)
+        tde_panel.layout().addWidget(tde_note)  # type: ignore[union-attr]
+        connectivity_layout.addWidget(tde_panel)
+        connectivity_layout.addStretch(1)
+        tab_layouts["Connectivity"].addRow(connectivity_scroll)
+
         band_box = QtWidgets.QGroupBox("可编辑频段（频段边界改动只重新汇总已有 PSD）")
         band_layout = QtWidgets.QVBoxLayout(band_box)
         self.band_table = QtWidgets.QTableWidget(0, 3)
         self.band_table.setHorizontalHeaderLabels(["名称", "下限 Hz", "上限 Hz"])
+        self.band_table.setMinimumHeight(120)
+        self.band_table.setAlternatingRowColors(True)
         self.band_table.horizontalHeader().setStretchLastSection(True)
         self.band_table.itemChanged.connect(self._selection_changed)
         band_layout.addWidget(self.band_table)
@@ -386,8 +2104,48 @@ class MainWindow(QtWidgets.QMainWindow):
         band_layout.addLayout(denominator_row)
         tab_layouts["频段功率"].addRow(band_box)
         self.parameter_tabs.currentChanged.connect(self._selection_changed)
+        method_widget = self.parameter_widgets.get("psd.method")
+        if isinstance(method_widget, QtWidgets.QComboBox):
+            method_widget.currentTextChanged.connect(self._update_psd_method_controls)
+        connectivity_mode_widget = self.parameter_widgets.get("connectivity.mode")
+        if isinstance(connectivity_mode_widget, QtWidgets.QComboBox):
+            connectivity_mode_widget.currentTextChanged.connect(self._update_connectivity_controls)
+        self._update_psd_method_controls()
+        self._update_parameter_tabs()
         layout.addWidget(self.parameter_tabs)
         return box
+
+    def _new_connectivity_panel(self, title: str, note: str) -> QtWidgets.QGroupBox:
+        panel = QtWidgets.QGroupBox(title)
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(8, 10, 8, 8)
+        panel_layout.setSpacing(5)
+        label = QtWidgets.QLabel(note)
+        label.setWordWrap(True)
+        label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        panel_layout.addWidget(label)
+        form = QtWidgets.QFormLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        panel_layout.addLayout(form)
+        self._connectivity_panels[title] = panel
+        self._connectivity_panel_forms[title] = form
+        panel.setVisible(False)
+        return panel
+
+    def _add_parameter_to_connectivity_panel(self, panel: QtWidgets.QGroupBox, key: str) -> None:
+        definition = next(item for item in PARAMETER_DEFINITIONS if item.key == key)
+        widget = self._make_parameter_widget(definition)
+        label = QtWidgets.QLabel(f"{definition.label} ({definition.unit})" if definition.unit else definition.label)
+        label.setWordWrap(True)
+        label.setToolTip(definition.help_text)
+        self.parameter_widgets[key] = widget
+        self.parameter_labels[key] = label
+        form = self._connectivity_panel_forms[panel.title()]
+        form.addRow(label, widget)
 
     def _make_parameter_widget(self, definition: Any) -> QtWidgets.QWidget:
         current = config_value(self.base_config, definition.key, definition.default)
@@ -407,20 +2165,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if definition.value_type == "choice":
             widget = QtWidgets.QComboBox()
             choices = {
+                "psd.method": ["welch", "multitaper"],
                 "psd.window": ["hann", "hamming", "blackman", "boxcar"],
                 "psd.detrend": ["constant", "linear", "none"],
                 "psd.average": ["mean", "median"],
                 "psd.epoch_aggregation": ["mean", "median"],
                 "parameterization.aperiodic_mode": ["fixed", "knee"],
+                "connectivity.mode": ["multitaper", "fourier"],
+                "connectivity.region_pair_summary": ["mean", "median"],
                 "connectivity.rank_strategy": ["data_driven_energy_99pct", "fixed_rank"],
+                "time_delay.fft_window": ["hamming", "hann", "blackman", "boxcar"],
             }.get(definition.key, [str(current)])
             widget.addItems(choices)
             index = widget.findText(str(current))
             widget.setCurrentIndex(max(0, index))
             widget.currentTextChanged.connect(self._selection_changed)
+        elif definition.value_type == "bool":
+            widget = QtWidgets.QCheckBox("启用")
+            widget.setChecked(bool(current))
+            widget.stateChanged.connect(self._selection_changed)
         elif definition.value_type == "int":
             widget = QtWidgets.QSpinBox()
-            widget.setRange(int(definition.minimum or -2_000_000_000), int(definition.maximum or 2_000_000_000))
+            lower = int(definition.minimum if definition.minimum is not None else -2_000_000_000)
+            upper = int(definition.maximum if definition.maximum is not None else 2_000_000_000)
+            widget.setRange(lower, upper)
             widget.setValue(int(current or 0))
             widget.valueChanged.connect(self._selection_changed)
         else:
@@ -432,37 +2200,123 @@ class MainWindow(QtWidgets.QMainWindow):
         widget.setToolTip(definition.help_text)
         return widget
 
+    def _update_psd_method_controls(self, *_args: Any) -> None:
+        method_widget = self.parameter_widgets.get("psd.method")
+        method = method_widget.currentText().strip().lower() if isinstance(method_widget, QtWidgets.QComboBox) else "welch"
+        welch_keys = ("psd.window", "psd.window_seconds", "psd.overlap_percent", "psd.nfft", "psd.detrend", "psd.average")
+        multitaper_keys = (
+            "psd.multitaper_bandwidth_hz",
+            "psd.multitaper_adaptive",
+            "psd.multitaper_low_bias",
+            "psd.multitaper_normalization",
+            "psd.multitaper_remove_dc",
+            "psd.multitaper_n_jobs",
+        )
+        for key in welch_keys:
+            enabled = method == "welch"
+            if key in self.parameter_widgets:
+                self.parameter_widgets[key].setEnabled(enabled)
+            if key in self.parameter_labels:
+                self.parameter_labels[key].setEnabled(enabled)
+        for key in multitaper_keys:
+            enabled = method == "multitaper"
+            if key in self.parameter_widgets:
+                self.parameter_widgets[key].setEnabled(enabled)
+            if key in self.parameter_labels:
+                self.parameter_labels[key].setEnabled(enabled)
+
+    def _update_connectivity_controls(self, *_args: Any) -> None:
+        """Show only parameters belonging to the selected connectivity methods."""
+        selected = set(self._selected_indicators()) if hasattr(self, "indicator_checks") else set()
+        has_static_connectivity = bool(selected & {"MIC", "MIM", "wpli", "dpli", "wpli2_debiased"})
+        has_tde = "Time Delay" in selected
+        has_connectivity = has_static_connectivity or has_tde
+        has_multivariate = bool(selected & {"MIC", "MIM"})
+        has_bivariate = bool(selected & {"wpli", "dpli", "wpli2_debiased"})
+        has_mic = "MIC" in selected
+        mode_widget = self.parameter_widgets.get("connectivity.mode")
+        mode = mode_widget.currentText().strip().lower() if isinstance(mode_widget, QtWidgets.QComboBox) else "multitaper"
+        panel_visibility = {
+            "共同频谱参数": has_static_connectivity,
+            "多变量 rank（MIC / MIM）": has_multivariate,
+            "MIC 专属参数": has_mic,
+            "wPLI / wPLI²_debiased 专属参数": bool(selected & {"wpli", "wpli2_debiased"}),
+            "dPLI 专属说明": "dpli" in selected,
+            "TDE 专属参数": has_tde,
+        }
+        for title, panel in getattr(self, "_connectivity_panels", {}).items():
+            panel.setVisible(panel_visibility.get(title, False))
+
+        common_keys = (
+            "connectivity.mode",
+            "connectivity.fmin_hz",
+            "connectivity.fmax_hz",
+            "connectivity.min_epochs",
+            "connectivity.n_jobs",
+            "connectivity.stability_n_subsamples",
+        )
+        for key in common_keys:
+            if key in self.parameter_widgets:
+                self.parameter_widgets[key].setEnabled(has_connectivity)
+            if key in self.parameter_labels:
+                self.parameter_labels[key].setEnabled(has_connectivity)
+        aggregation_key = "connectivity.region_pair_summary"
+        if aggregation_key in self.parameter_widgets:
+            self.parameter_widgets[aggregation_key].setEnabled(has_bivariate)
+        if aggregation_key in self.parameter_labels:
+            self.parameter_labels[aggregation_key].setEnabled(has_bivariate)
+        for key in (
+            "connectivity.rank_strategy",
+            "connectivity.rank_variance_threshold",
+            "connectivity.fixed_rank_M1",
+            "connectivity.fixed_rank_STR",
+            "connectivity.fixed_rank_PF",
+            "connectivity.fixed_rank_SNr",
+        ):
+            if key in self.parameter_widgets:
+                self.parameter_widgets[key].setEnabled(has_multivariate)
+            if key in self.parameter_labels:
+                self.parameter_labels[key].setEnabled(has_multivariate)
+        for key in ("connectivity.mt_bandwidth_hz", "connectivity.mt_adaptive", "connectivity.mt_low_bias"):
+            enabled = has_static_connectivity and mode == "multitaper"
+            if key in self.parameter_widgets:
+                self.parameter_widgets[key].setEnabled(enabled)
+            if key in self.parameter_labels:
+                self.parameter_labels[key].setEnabled(enabled)
+        if "connectivity.n_components" in self.parameter_widgets:
+            self.parameter_widgets["connectivity.n_components"].setVisible(has_mic)
+            self.parameter_widgets["connectivity.n_components"].setEnabled(has_mic)
+        if "connectivity.n_components" in self.parameter_labels:
+            self.parameter_labels["connectivity.n_components"].setVisible(has_mic)
+            self.parameter_labels["connectivity.n_components"].setEnabled(has_mic)
+        for key in (
+            "time_delay.analysis_sfreq_hz",
+            "time_delay.max_delay_ms",
+            "time_delay.fmin_hz",
+            "time_delay.fmax_hz",
+            "time_delay.fft_window",
+            "time_delay.n_points",
+            "time_delay.n_jobs",
+        ):
+            if key in self.parameter_widgets:
+                self.parameter_widgets[key].setEnabled(has_tde)
+            if key in self.parameter_labels:
+                self.parameter_labels[key].setEnabled(has_tde)
+
     def _build_task_group(self) -> QtWidgets.QGroupBox:
-        box, layout = self._group("任务与结果")
-        self.run_button = QtWidgets.QPushButton("运行勾选指标")
-        self.run_button.clicked.connect(self._run)
-        self.cancel_button = QtWidgets.QPushButton("取消")
-        self.cancel_button.setEnabled(False)
-        self.cancel_button.clicked.connect(self._cancel)
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.run_button)
-        row.addWidget(self.cancel_button)
-        layout.addLayout(row)
-        row2 = QtWidgets.QHBoxLayout()
+        box, layout = self._group("预设与历史")
+        row2 = QtWidgets.QGridLayout()
         for text, callback in (("保存预设", self._save_preset), ("载入预设", self._load_preset), ("恢复默认", self._restore_defaults), ("载入历史", self._load_history)):
             button = QtWidgets.QPushButton(text)
             button.clicked.connect(callback)
-            row2.addWidget(button)
+            button.setToolTip({"保存预设": "保存当前指标、选择范围和参数。", "载入预设": "载入已保存的指标和参数。", "恢复默认": "恢复配置文件中的默认值。", "载入历史": "载入已有运行目录并重新查看结果。"}[text])
+            index = row2.count()
+            row2.addWidget(button, index // 2, index % 2)
         layout.addLayout(row2)
-        row3 = QtWidgets.QHBoxLayout()
-        export_button = QtWidgets.QPushButton("导出当前图")
-        export_button.clicked.connect(self._export_figure)
         open_button = QtWidgets.QPushButton("打开结果目录")
+        open_button.setToolTip("在文件管理器中打开当前输出目录。")
         open_button.clicked.connect(self._open_output)
-        row3.addWidget(export_button)
-        row3.addWidget(open_button)
-        layout.addLayout(row3)
-        self.progress = QtWidgets.QProgressBar()
-        self.progress.setRange(0, 100)
-        layout.addWidget(self.progress)
-        self.task_label = QtWidgets.QLabel("状态：待运行")
-        self.task_label.setWordWrap(True)
-        layout.addWidget(self.task_label)
+        layout.addWidget(open_button)
         return box
 
     def _restore_defaults(self) -> None:
@@ -474,8 +2328,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if isinstance(widget, QtWidgets.QComboBox):
                 index = widget.findText(str(value))
                 widget.setCurrentIndex(max(0, index))
+            elif isinstance(widget, QtWidgets.QCheckBox):
+                widget.setChecked(bool(value))
             elif isinstance(widget, QtWidgets.QSpinBox):
-                widget.setValue(int(value))
+                widget.setValue(int(value or 0))
             else:
                 widget.setValue(float(value))
         self.band_table.setRowCount(0)
@@ -484,6 +2340,10 @@ class MainWindow(QtWidgets.QMainWindow):
         denominator = self.base_config.get("relative_power", {}).get("denominator_hz", [1.0, 100.0])
         self.denominator_low.setValue(float(denominator[0]))
         self.denominator_high.setValue(float(denominator[1]))
+        for row in range(self.rank_mapping_table.rowCount()):
+            item = self.rank_mapping_table.item(row, 1)
+            if item is not None:
+                item.setText("0")
         self._set_dirty(False)
 
     def _make_parameter_value_from_config(self, definition: Any) -> Any:
@@ -521,10 +2381,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.load_paths(paths)
 
     def load_paths(self, paths: list[str]) -> None:
+        self.result_payloads.clear()
+        self.result_records.clear()
+        self.result_combo.clear()
+        self.table.clear()
+        self.quality_alert_text.clear()
+        self.status_text.clear()
+        self._log(f"开始读取 {len(paths)} 个 FIF；将自动计算质量和实际有效时长…")
         self.task_label.setText("状态：正在读取 FIF 和通道映射…")
         self.run_button.setEnabled(False)
         self.inspect_thread = QtCore.QThread(self)
-        worker = InspectWorker(paths, self.metadata_dir)
+        worker = InspectWorker(paths, self.metadata_dir, self.config_path)
         self.inspect_thread.worker = worker  # type: ignore[attr-defined]
         worker.moveToThread(self.inspect_thread)
         self.inspect_thread.started.connect(worker.run)
@@ -541,27 +2408,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_combo.blockSignals(True)
         self.file_combo.clear()
         for info in infos:
-            self.file_combo.addItem(Path(info["path"]).name)
+            self.file_combo.addItem(Path(info["path"]).name, str(info["path"]))
+            index = self.file_combo.count() - 1
+            self.file_combo.setItemData(index, str(info["path"]), QtCore.Qt.ItemDataRole.ToolTipRole)
         self.file_combo.blockSignals(False)
         if infos:
             self.file_combo.setCurrentIndex(0)
             self._file_changed(0)
+            for info in infos:
+                quality_file = info.get("quality_file", {})
+                self._log(
+                    f"自动质量检查完成：{Path(info['path']).name}；"
+                    f"实际有效时长={float(info.get('effective_duration_s', 0.0)):g} s；"
+                    f"异常 epoch-channel={int(quality_file.get('n_fail_epoch_channel_rows', 0))} fail / "
+                    f"{int(quality_file.get('n_warn_epoch_channel_rows', 0))} warn。"
+                )
         self.run_button.setEnabled(True)
+        self.run_button.setText("Run Analysis")
         self.task_label.setText(f"状态：已读取 {len(infos)} 个文件。")
         self._set_dirty(True)
 
     def _inspection_failed(self, message: str) -> None:
         self.run_button.setEnabled(True)
+        self.run_button.setText("Failed")
         self.task_label.setText(f"读取失败：{message}")
-        QtWidgets.QMessageBox.critical(self, "读取 FIF 失败", message)
+        self._show_message(QtWidgets.QMessageBox.Icon.Critical, "读取 FIF 失败", message)
 
     def _clear_files(self) -> None:
         self.file_infos = []
         self.current_info = None
+        self.result_payloads.clear()
+        self.result_records.clear()
         self.file_combo.clear()
+        self.result_combo.clear()
         self.channel_list.clear()
+        self.mapping_table.setRowCount(0)
+        self.region_checks_group.clear()
+        self.pair_checks_group.clear()
+        self.region_checks.clear()
+        self.pair_checks.clear()
+        self.mapping_status_label.setText("尚未载入文件。")
+        self.header_dataset_label.setText("未载入数据集")
+        self.run_button.setText("Run Analysis")
         self.data_info_label.setText("尚未载入文件。")
         self.selection_label.setText("选择数据量：尚未载入")
+        self._update_preview_epoch_label()
+        self.preview_prev_button.setEnabled(False)
+        self.preview_next_button.setEnabled(False)
+        self.quality_alert_text.clear()
+        self.table.clear()
+        self.status_text.clear()
+        self.band_power_view.setVisible(False)
+        self.fooof_view.setVisible(False)
+        self.connectivity_view.setVisible(False)
+        self.general_plot_widget.setVisible(True)
+        self.canvas.figure.clear()
+        self.canvas.draw_idle()
         self._set_dirty(True)
 
     def _file_changed(self, index: int) -> None:
@@ -574,31 +2476,78 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         info = self.current_info
         table = info["channel_table"]
+        self._populate_mapping_table()
+        self._rebuild_region_controls()
+        self._rebuild_pair_controls()
+        self._populate_rank_mapping_table()
         mapping = {str(row.channel_name): row for row in table.itertuples()}
+        quality_channel = info.get("quality", {}).get("channel", pd.DataFrame())
+        quality_by_name = {
+            str(row.channel_name): row
+            for row in quality_channel.itertuples()
+        } if isinstance(quality_channel, pd.DataFrame) and not quality_channel.empty else {}
         self.channel_list.blockSignals(True)
         self.channel_list.clear()
         for name in info["loaded"].ch_names:
             row = mapping.get(str(name))
             region = str(getattr(row, "region", "")) if row else ""
             physical = getattr(row, "physical_channel_number", "") if row else ""
-            text = f"{name} | 物理 {physical or '?'} | {region or '未映射'}"
+            quality_row = quality_by_name.get(str(name))
+            n_fail = int(getattr(quality_row, "n_fail_epochs", 0)) if quality_row else 0
+            n_warn = int(getattr(quality_row, "n_warn_epochs", 0)) if quality_row else 0
+            quality_marker = " ⚠" if n_fail or n_warn else ""
+            text = f"{name}{quality_marker} | 物理 {physical or '?'} | {region or '未映射'}"
             item = QtWidgets.QListWidgetItem(text)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, str(name))
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(QtCore.Qt.CheckState.Checked)
+            if quality_row is not None and (n_fail or n_warn):
+                flags = set()
+                rows = info["quality"]["epoch_channel"].loc[
+                    info["quality"]["epoch_channel"]["channel_name"].astype(str) == str(name), "quality_flags"
+                ]
+                for value in rows.astype(str):
+                    flags.update(flag for flag in value.split(";") if flag)
+                severity = "fail" if n_fail else "warn"
+                item.setToolTip(
+                    f"自动质量：{severity}\n"
+                    f"fail epoch={n_fail}；warn epoch={n_warn}\n"
+                    f"原因：{', '.join(sorted(flags)) or '见右侧质量提示'}"
+                )
+                item.setForeground(QtGui.QColor("#b00020" if n_fail else "#a06000"))
+            else:
+                item.setToolTip("自动质量：当前阈值下未发现 fail/warn")
             self.channel_list.addItem(item)
         self.channel_list.blockSignals(False)
         self.time_start.setRange(info["tmin"], info["tmax"] + 1.0 / info["sfreq"])
         self.time_end.setRange(info["tmin"], info["tmax"] + 1.0 / info["sfreq"])
         self.time_start.setValue(info["tmin"])
         self.time_end.setValue(info["tmax"] + 1.0 / info["sfreq"])
+        self.preview_epoch.blockSignals(True)
+        self.preview_epoch.setRange(0, max(0, info["n_epochs"] - 1))
+        self.preview_epoch.setValue(0)
+        self.preview_epoch.blockSignals(False)
+        self._update_preview_epoch_label()
+        has_epochs = int(info.get("n_epochs", 0)) > 0
+        self.preview_prev_button.setEnabled(has_epochs)
+        self.preview_next_button.setEnabled(has_epochs)
+        quality_file = info.get("quality_file", {})
+        quality_status = "fail" if int(quality_file.get("n_fail_epoch_channel_rows", 0)) else ("warn" if int(quality_file.get("n_warn_epoch_channel_rows", 0)) else "ok")
         self.data_info_label.setText(
             f"文件：{Path(info['path']).name}\n"
             f"采样率：{info['sfreq']:g} Hz；形状：{info['n_epochs']} × {info['n_channels']} × {info['n_times']}\n"
-            f"epoch 时间：{info['tmin']:g}–{info['tmax']:g} s；文件级名义时长：{info['effective_duration_s']:g} s\n"
+            f"epoch 时间：{info['tmin']:g}–{info['tmax']:g} s；保留数据名义时长：{float(info.get('nominal_duration_s', 0.0)):g} s\n"
+            f"实际有效时长：{float(info.get('effective_duration_s', 0.0)):g} s；"
+            f"候选 epoch：{info.get('n_candidate_epochs', info['n_epochs'])}，上游删除：{info.get('n_dropped_candidates', 0)}\n"
+            f"自动质量：{quality_status}；fail={int(quality_file.get('n_fail_epoch_channel_rows', 0))}，"
+            f"warn={int(quality_file.get('n_warn_epoch_channel_rows', 0))}\n"
             f"SHA-256：{info['sha256'][:16]}…"
         )
+        self.header_dataset_label.setText(f"{Path(info['path']).name} · {info['n_epochs']} epochs · {info['n_channels']} channels")
+        self.data_info_label.setToolTip(str(info["path"]))
         self._update_selection_label()
+        self._show_quality_alert()
+        self._update_raw_preview()
 
     def _apply_region_selection(self) -> None:
         if self.current_info is None:
@@ -613,10 +2562,44 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setCheckState(QtCore.Qt.CheckState.Checked if name in names else QtCore.Qt.CheckState.Unchecked)
         self.channel_list.blockSignals(False)
         self._selection_changed()
+        self._update_raw_preview()
+        self._refresh_band_power_filters()
+        self._refresh_fooof_filters()
 
     def _selection_changed(self, *_args: Any) -> None:
         self._update_selection_label()
         self._set_dirty(True)
+        self._refresh_fooof_filters()
+        if hasattr(self, "_refresh_connectivity_filters"):
+            self._refresh_connectivity_filters()
+
+    def _channel_selection_changed(self, *_args: Any) -> None:
+        self._selection_changed()
+        self._update_raw_preview()
+        self._refresh_band_power_filters()
+        self._refresh_fooof_filters()
+        if hasattr(self, "_refresh_connectivity_filters"):
+            self._refresh_connectivity_filters()
+
+    def _preview_changed(self, *_args: Any) -> None:
+        self._update_preview_epoch_label()
+        self._update_raw_preview()
+
+    def _step_preview(self, delta: int) -> None:
+        if self.current_info is None:
+            return
+        current = self.preview_epoch.value()
+        target = min(max(0, current + int(delta)), max(0, self.current_info["n_epochs"] - 1))
+        if target != current:
+            self.preview_epoch.setValue(target)
+
+    def _update_preview_epoch_label(self) -> None:
+        if self.current_info is None:
+            self.preview_epoch_label.setText("Epoch — / —")
+            return
+        total = int(self.current_info.get("n_epochs", 0))
+        current = min(max(0, self.preview_epoch.value()), max(0, total - 1))
+        self.preview_epoch_label.setText(f"Epoch {current + 1} / {total}")
 
     def _update_selection_label(self) -> None:
         if self.current_info is None:
@@ -625,6 +2608,118 @@ class MainWindow(QtWidgets.QMainWindow):
         epochs = self._parse_epochs(self.epoch_edit.text(), self.current_info["n_epochs"], show_error=False)
         duration = max(0.0, self.time_end.value() - self.time_start.value())
         self.selection_label.setText(f"选择数据量：{len(channels)} 通道 × {len(epochs)} epoch × {duration:g} s；约 {len(epochs) * duration:g} 有效秒")
+
+    def _raw_preview_payload(self) -> dict[str, Any] | None:
+        if self.current_info is None:
+            return None
+        info = self.current_info
+        loaded = info["loaded"]
+        channel_names = self._selected_channel_names()
+        index_by_name = {str(name): index for index, name in enumerate(loaded.ch_names)}
+        channel_indices = [index_by_name[name] for name in channel_names if name in index_by_name]
+        epoch_index = min(max(0, self.preview_epoch.value()), max(0, info["n_epochs"] - 1))
+        raw_data = loaded.data[epoch_index, channel_indices, :] if channel_indices else np.empty((0, loaded.data.shape[-1]), dtype=float)
+        quality = info.get("quality", {})
+        return {
+            "metric": "Raw Waveform",
+            "file_id": Path(info["path"]).stem,
+            "raw_data": raw_data,
+            "channel_names": [loaded.ch_names[index] for index in channel_indices],
+            "preview_epoch_index": epoch_index,
+            "times_s": loaded.tmin + np.arange(loaded.data.shape[-1], dtype=float) / loaded.sfreq,
+            "sfreq": loaded.sfreq,
+            "tmin": loaded.tmin,
+            "tables": {
+                "quality_epoch_channel": quality.get("epoch_channel", pd.DataFrame()),
+                "quality_epoch": quality.get("epoch", pd.DataFrame()),
+                "quality_channel": quality.get("channel", pd.DataFrame()),
+                "quality_file": quality.get("file", pd.DataFrame()),
+            },
+        }
+
+    def _update_raw_preview(self) -> None:
+        payload = self._raw_preview_payload()
+        if payload is None:
+            return
+        key = f"{payload['file_id']} | 原始波形"
+        self.result_payloads[key] = payload
+        if self.result_combo.findText(key) < 0:
+            self.result_combo.addItem(key)
+        self.result_combo.blockSignals(True)
+        self.result_combo.setCurrentText(key)
+        self.result_combo.blockSignals(False)
+        self._show_payload(payload)
+
+    def _show_quality_alert(self) -> None:
+        if self.current_info is None:
+            self.quality_alert_text.clear()
+            return
+        info = self.current_info
+        quality = info.get("quality", {})
+        quality_file = info.get("quality_file", {})
+        lines = [
+            f"文件：{Path(info['path']).name}",
+            f"实际有效时长：{float(info.get('effective_duration_s', 0.0)):g} s（按每个保留 epoch 的有限样本计算）",
+            f"质量阈值来源：{info.get('quality_config_path', '')}",
+        ]
+        dropped = info.get("dropped_candidates", [])
+        if dropped:
+            lines.append(f"上游已删除候选分段 {len(dropped)} 个：" + "；".join(f"#{row['original_candidate_index']}({row['drop_reason']})" for row in dropped[:20]))
+
+        channel_table = info.get("channel_table", pd.DataFrame())
+        channel_meta = {
+            str(row.channel_name): f"物理 {getattr(row, 'physical_channel_number', '') or '?'} / {getattr(row, 'region', '') or '未映射'}"
+            for row in channel_table.itertuples()
+        } if isinstance(channel_table, pd.DataFrame) else {}
+        channel_quality = quality.get("channel", pd.DataFrame())
+        epoch_quality = quality.get("epoch", pd.DataFrame())
+        epoch_channel = quality.get("epoch_channel", pd.DataFrame())
+        bad_channels = channel_quality.loc[
+            (channel_quality.get("n_fail_epochs", pd.Series(dtype=int)) > 0)
+            | (channel_quality.get("n_warn_epochs", pd.Series(dtype=int)) > 0)
+        ] if isinstance(channel_quality, pd.DataFrame) and not channel_quality.empty else pd.DataFrame()
+        bad_epochs = epoch_quality.loc[epoch_quality["quality_status"].astype(str) != "ok"] if isinstance(epoch_quality, pd.DataFrame) and not epoch_quality.empty else pd.DataFrame()
+        if bad_channels.empty and bad_epochs.empty and not dropped:
+            lines.append("未发现当前阈值下的 fail/warn。质量标记不会自动删除数据，请仍结合原始波形和 PSD 判断。")
+        else:
+            lines.append(
+                f"检测汇总：epoch-channel fail={int(quality_file.get('n_fail_epoch_channel_rows', 0))}，"
+                f"warn={int(quality_file.get('n_warn_epoch_channel_rows', 0))}。以下仅为提示，不是自动排除。"
+            )
+            if not bad_channels.empty:
+                lines.append("可疑通道：")
+                for row in bad_channels.itertuples():
+                    channel_name = str(row.channel_name)
+                    flags = set()
+                    if isinstance(epoch_channel, pd.DataFrame) and not epoch_channel.empty:
+                        matches = epoch_channel.loc[epoch_channel["channel_name"].astype(str) == channel_name, "quality_flags"]
+                        for value in matches.astype(str):
+                            flags.update(flag for flag in value.split(";") if flag)
+                    lines.append(
+                        f"  - {channel_name}（{channel_meta.get(channel_name, '物理 ? / 未映射')}）："
+                        f"fail epoch={int(getattr(row, 'n_fail_epochs', 0))}，warn epoch={int(getattr(row, 'n_warn_epochs', 0))}；"
+                        f"原因={','.join(sorted(flags)) or '见质量表'}"
+                    )
+            if not bad_epochs.empty:
+                lines.append("可疑分段（epoch 保存数组索引）：")
+                for row in bad_epochs.itertuples():
+                    index = int(row.epoch_index)
+                    names = []
+                    if isinstance(epoch_channel, pd.DataFrame) and not epoch_channel.empty:
+                        matches = epoch_channel.loc[
+                            (epoch_channel["epoch_index"].astype(int) == index)
+                            & (epoch_channel["quality_status"].astype(str) != "ok")
+                        ]
+                        names = [
+                            f"{name}({flags})"
+                            for name, flags in zip(matches["channel_name"].astype(str), matches["quality_flags"].astype(str), strict=False)
+                        ]
+                    lines.append(
+                        f"  - epoch {index}：状态={row.quality_status}，"
+                        f"异常通道={', '.join(names) or '见质量表'}"
+                    )
+        self.quality_alert_text.setPlainText("\n".join(lines))
+        self.quality_alert_text.verticalScrollBar().setValue(0)
 
     def _selected_channel_names(self) -> list[str]:
         names: list[str] = []
@@ -655,7 +2750,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return parsed
         except Exception as exc:  # noqa: BLE001 - user-facing validation
             if show_error:
-                QtWidgets.QMessageBox.warning(self, "epoch 子集无效", f"{exc}")
+                self._show_message(QtWidgets.QMessageBox.Icon.Warning, "epoch 子集无效", f"{exc}")
             return []
 
     def _indicator_changed(self, *_args: Any) -> None:
@@ -664,11 +2759,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_parameter_tabs(self) -> None:
         selected = self._selected_indicators()
-        self.parameter_tabs.setTabEnabled(0, bool(set(selected) & {"PSD", "Band Power", "FOOOF"}))
-        self.parameter_tabs.setTabEnabled(1, "FOOOF" in selected)
-        self.parameter_tabs.setTabEnabled(2, bool(set(selected) & {"MIC", "MIM", "wpli2_debiased"}))
-        self.parameter_tabs.setTabEnabled(3, bool(set(selected) & {"PSD", "Band Power", "FOOOF"}))
-        self.parameter_tabs.setTabEnabled(4, "Time Delay" in selected)
+        selected_set = set(selected)
+        tab_enabled = (
+            bool(selected_set & {"PSD", "Band Power", "FOOOF"}),
+            "FOOOF" in selected_set,
+            bool(selected_set & {"MIC", "MIM", "wpli", "dpli", "wpli2_debiased", "Time Delay"}),
+            bool(selected_set & {"PSD", "Band Power", "FOOOF"}),
+        )
+        for index, enabled in enumerate(tab_enabled):
+            self.parameter_tabs.setTabEnabled(index, enabled)
+            self.parameter_tabs.setTabVisible(index, enabled)
+        self._update_connectivity_controls()
 
     def _selected_indicators(self) -> list[str]:
         return [name for name, checkbox in self.indicator_checks.items() if checkbox.isChecked()]
@@ -676,9 +2777,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _read_parameter_values(self) -> dict[str, Any]:
         values: dict[str, Any] = {}
         for definition in PARAMETER_DEFINITIONS:
-            widget = self.parameter_widgets[definition.key]
+            widget = self.parameter_widgets.get(definition.key)
+            if widget is None:
+                continue
             if isinstance(widget, QtWidgets.QComboBox):
                 value: Any = widget.currentText()
+            elif isinstance(widget, QtWidgets.QCheckBox):
+                value = widget.isChecked()
             elif isinstance(widget, QtWidgets.QSpinBox):
                 value = widget.value()
             else:
@@ -696,6 +2801,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
         values["bands"] = bands
         values["relative_power"] = {"denominator_low_hz": self.denominator_low.value(), "denominator_high_hz": self.denominator_high.value()}
+        rank_map: dict[str, int] = {}
+        for row in range(self.rank_mapping_table.rowCount()):
+            region_item = self.rank_mapping_table.item(row, 0)
+            rank_item = self.rank_mapping_table.item(row, 1)
+            if region_item is None or rank_item is None:
+                continue
+            try:
+                rank = int(rank_item.text().strip() or 0)
+            except ValueError:
+                continue
+            if rank > 0:
+                rank_map[region_item.text().strip()] = rank
+        values.setdefault("connectivity", {})["fixed_rank_by_region"] = rank_map
         return values
 
     def _snapshot(self) -> dict[str, Any]:
@@ -713,6 +2831,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "selected_channel_names": self._selected_channel_names(),
             "selected_epoch_indices": epochs,
             "selected_region_pairs": pairs,
+            "channel_mapping": mapping_rows(self.current_info.get("channel_table", pd.DataFrame())),
+            "channel_mappings_by_file": {
+                str(info.get("path", "")): mapping_rows(info.get("channel_table", pd.DataFrame()))
+                for info in self.file_infos
+            },
+            "mapping_file": str(self.current_mapping_path or ""),
             "selection": {"time_start_s": self.time_start.value(), "time_end_s": self.time_end.value()},
             "values": self._read_parameter_values(),
             "parameter_schema": parameter_schema(),
@@ -723,7 +2847,7 @@ class MainWindow(QtWidgets.QMainWindow):
             snapshot = self._snapshot()
             if not snapshot["input_files"]:
                 raise ValueError("请先添加 FIF 文件。")
-            if not snapshot["selected_region_pairs"] and set(snapshot["indicators"]) & {"MIC", "MIM", "wpli2_debiased"}:
+            if not snapshot["selected_region_pairs"] and set(snapshot["indicators"]) & {"MIC", "MIM", "wpli", "dpli", "wpli2_debiased"}:
                 raise ValueError("至少选择一组连接脑区对。")
             errors, warnings = validate_snapshot(
                 snapshot,
@@ -737,11 +2861,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if warnings:
                 self._log("运行前提示：" + "；".join(warnings))
         except Exception as exc:  # noqa: BLE001 - validation must not crash window
-            QtWidgets.QMessageBox.warning(self, "参数或数据选择无效", str(exc))
+            self._show_message(QtWidgets.QMessageBox.Icon.Warning, "参数或数据选择无效", str(exc))
             return
         self._running = True
         self._dirty = False
+        self._last_progress_message = ""
         self.run_button.setEnabled(False)
+        self.run_button.setText("Running...")
         self.cancel_button.setEnabled(True)
         self.task_label.setText("状态：后台运行中…")
         self.progress.setValue(0)
@@ -765,7 +2891,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _progress_update(self, message: str, percent: int) -> None:
         self.task_label.setText(f"状态：{message}")
         self.progress.setValue(percent)
-        self._log(message)
+        if message != self._last_progress_message:
+            self._log(f"进度 {percent}%：{message}")
+            self._last_progress_message = message
 
     def _result_ready(self, payload: dict[str, Any]) -> None:
         if payload.get("status") == "failed":
@@ -785,12 +2913,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _run_finished(self, outcome: dict[str, Any]) -> None:
         self._running = False
-        self.run_button.setEnabled(True)
-        self.cancel_button.setEnabled(False)
         manifest = outcome.get("manifest", {})
+        self.run_button.setEnabled(True)
+        self.run_button.setText("Completed" if manifest.get("status") in {"completed", "completed_with_errors"} else "Failed")
+        self.cancel_button.setEnabled(False)
         self.progress.setValue(100 if manifest.get("status") in {"completed", "completed_with_errors"} else self.progress.value())
         self.task_label.setText(f"状态：{manifest.get('status', 'unknown')}；结果目录：{outcome.get('run_dir', '')}")
-        self._log(json.dumps(manifest, ensure_ascii=False, indent=2))
+        self._log(
+            f"任务结束：{manifest.get('status', 'unknown')}；"
+            f"文件={len(manifest.get('files', []))}；"
+            f"错误={len(manifest.get('errors', []))}；"
+            f"警告={len(manifest.get('warnings', []))}。"
+        )
         self.loaded_run = outcome
 
     def _show_selected_result(self, key: str) -> None:
@@ -798,10 +2932,63 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_payload(self.result_payloads[key])
 
     def _show_payload(self, payload: dict[str, Any]) -> None:
-        self.canvas.show_payload(payload)
+        is_band_power = str(payload.get("metric", "")) == "Band Power"
+        is_fooof = str(payload.get("metric", "")) == "FOOOF"
+        is_connectivity = str(payload.get("metric", "")) in {"Connectivity", "Time Delay"}
+        self.general_plot_widget.setVisible(not is_band_power and not is_fooof and not is_connectivity)
+        self.band_power_view.setVisible(is_band_power)
+        self.fooof_view.setVisible(is_fooof)
+        self.connectivity_view.setVisible(is_connectivity)
+        if is_band_power:
+            selected_channels = self._selected_channel_names() if self.current_info is not None else None
+            selected_regions = [name for name, checkbox in self.region_checks.items() if checkbox.isChecked()] if self.current_info is not None else None
+            self.band_power_view.set_payload(payload, selected_channels, selected_regions)
+        elif is_fooof:
+            selected_channels = self._selected_channel_names() if self.current_info is not None else None
+            selected_regions = [name for name, checkbox in self.region_checks.items() if checkbox.isChecked()] if self.current_info is not None else None
+            display_bands = self._read_parameter_values().get("bands", []) if self.current_info is not None else self.base_config.get("bands", {})
+            self.fooof_view.set_payload(payload, selected_channels, selected_regions, display_bands)
+        elif is_connectivity:
+            selected_channels = self._selected_channel_names() if self.current_info is not None else None
+            selected_regions = [name for name, checkbox in self.region_checks.items() if checkbox.isChecked()] if self.current_info is not None else None
+            self.connectivity_view.set_payload(payload, selected_channels, selected_regions)
+        else:
+            self.canvas.show_payload(payload)
         tables = payload.get("tables", {})
         table = next((value for value in tables.values() if isinstance(value, pd.DataFrame) and not value.empty), pd.DataFrame())
         self._show_table(table)
+
+    def _refresh_band_power_filters(self) -> None:
+        if self.current_info is None:
+            return
+        key = self.result_combo.currentText()
+        payload = self.result_payloads.get(key)
+        if payload and str(payload.get("metric", "")) == "Band Power":
+            selected_regions = [name for name, checkbox in self.region_checks.items() if checkbox.isChecked()]
+            self.band_power_view.set_filters(self._selected_channel_names(), selected_regions)
+
+    def _refresh_fooof_filters(self) -> None:
+        if not hasattr(self, "result_combo"):
+            return
+        key = self.result_combo.currentText()
+        payload = self.result_payloads.get(key)
+        if not payload or str(payload.get("metric", "")) != "FOOOF":
+            return
+        selected_channels = self._selected_channel_names() if self.current_info is not None else None
+        selected_regions = [name for name, checkbox in self.region_checks.items() if checkbox.isChecked()] if self.current_info is not None else None
+        display_bands = self._read_parameter_values().get("bands", []) if self.current_info is not None else self.base_config.get("bands", {})
+        self.fooof_view.set_filters(selected_channels, selected_regions, display_bands)
+
+    def _refresh_connectivity_filters(self) -> None:
+        if not hasattr(self, "result_combo"):
+            return
+        key = self.result_combo.currentText()
+        payload = self.result_payloads.get(key)
+        if not payload or str(payload.get("metric", "")) not in {"Connectivity", "Time Delay"}:
+            return
+        selected_channels = self._selected_channel_names() if self.current_info is not None else None
+        selected_regions = [name for name, checkbox in self.region_checks.items() if checkbox.isChecked()] if self.current_info is not None else None
+        self.connectivity_view.set_filters(selected_channels, selected_regions)
 
     def _show_table(self, frame: pd.DataFrame) -> None:
         display = frame.head(1000).copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
@@ -816,7 +3003,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.setToolTip(f"显示前 {len(display)} 行；完整数据已保存。")
 
     def _log(self, message: str) -> None:
-        self.status_text.appendPlainText(str(message))
+        compact = " ".join(str(message).split())
+        if not compact:
+            return
+        if len(compact) > 600:
+            compact = compact[:597] + "..."
+        self.status_text.appendPlainText(compact)
+        if hasattr(self, "result_status_label"):
+            summary = compact if len(compact) <= 180 else compact[:177] + "..."
+            self.result_status_label.setText(summary)
+
+    def _toggle_log(self, expanded: bool) -> None:
+        """Show detailed logs only on demand so plots keep the available height."""
+        self.status_text.setVisible(bool(expanded))
+        self.log_toggle.setText("收起详细日志" if expanded else "展开详细日志")
+        if expanded:
+            self.status_text.verticalScrollBar().setValue(self.status_text.verticalScrollBar().maximum())
+
+    def _show_message(self, icon: QtWidgets.QMessageBox.Icon, title: str, message: str) -> None:
+        """Display concise errors with the full technical message in a scrollable detail area."""
+        text = str(message)
+        box = QtWidgets.QMessageBox(icon, title, "操作未完成，请查看详细信息。", parent=self)
+        box.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        box.setDetailedText(text)
+        box.setSizeGripEnabled(True)
+        box.setMinimumWidth(520)
+        box.exec()
 
     def _set_dirty(self, value: bool) -> None:
         self._dirty = bool(value)
@@ -835,11 +3047,11 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             snapshot = self._snapshot()
         except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "无法保存预设", str(exc))
+            self._show_message(QtWidgets.QMessageBox.Icon.Warning, "无法保存预设", str(exc))
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存分析预设", str(PROJECT_ROOT / "configs" / "gui_preset.json"), "JSON (*.json)")
         if path:
-            Path(path).write_text(json.dumps({key: snapshot[key] for key in ("indicators", "selected_channel_names", "selected_epoch_indices", "selected_region_pairs", "selection", "values", "parameter_schema")}, ensure_ascii=False, indent=2), encoding="utf-8")
+            Path(path).write_text(json.dumps({key: snapshot[key] for key in ("indicators", "selected_channel_names", "selected_epoch_indices", "selected_region_pairs", "channel_mapping", "mapping_file", "selection", "values", "parameter_schema")}, ensure_ascii=False, indent=2), encoding="utf-8")
             self._log(f"已保存预设：{path}")
 
     def _load_preset(self) -> None:
@@ -852,22 +3064,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 checkbox.setChecked(name in preset.get("indicators", []))
             values = preset.get("values", {})
             for definition in PARAMETER_DEFINITIONS:
-                widget = self.parameter_widgets[definition.key]
+                widget = self.parameter_widgets.get(definition.key)
+                if widget is None:
+                    continue
                 value = config_value(values, definition.key, None)
                 if value is None:
                     continue
                 if isinstance(widget, QtWidgets.QComboBox):
                     widget.setCurrentText(str(value))
+                elif isinstance(widget, QtWidgets.QCheckBox):
+                    widget.setChecked(bool(value))
                 elif isinstance(widget, QtWidgets.QSpinBox):
                     widget.setValue(int(value))
                 else:
                     widget.setValue(float(value))
+            if self.current_info is not None and isinstance(preset.get("channel_mapping"), list) and preset.get("channel_mapping"):
+                self._apply_channel_table(apply_mapping(self.current_info["channel_table"], {"channels": preset["channel_mapping"]}), "预设")
             self.epoch_edit.setText("all")
             self._update_parameter_tabs()
             self._set_dirty(True)
             self._log(f"已载入预设：{path}")
         except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "载入预设失败", str(exc))
+            self._show_message(QtWidgets.QMessageBox.Icon.Warning, "载入预设失败", str(exc))
 
     def _load_history(self) -> None:
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "选择包含 run_manifest.json 的运行目录", str(self.output_edit.text()))
@@ -890,11 +3108,17 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.result_combo.addItem(key)
             self.loaded_run = loaded
             self.task_label.setText(f"状态：已载入历史运行 {loaded['manifest'].get('run_id', '')}；不需要原始 FIF 即可查看。")
-            self._log(json.dumps(loaded["manifest"], ensure_ascii=False, indent=2))
+            manifest = loaded["manifest"]
+            self._log(
+                f"历史运行已载入：{manifest.get('status', 'unknown')}；"
+                f"文件={len(manifest.get('files', []))}；"
+                f"错误={len(manifest.get('errors', []))}；"
+                f"警告={len(manifest.get('warnings', []))}。"
+            )
             if self.result_combo.count():
                 self.result_combo.setCurrentIndex(0)
         except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "载入历史失败", str(exc))
+            self._show_message(QtWidgets.QMessageBox.Icon.Warning, "载入历史失败", str(exc))
 
     def _payload_from_saved_record(self, record: dict[str, Any], file_id: str, file_dir: Path) -> dict[str, Any] | None:
         tables: dict[str, pd.DataFrame] = {}
@@ -907,11 +3131,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     tables[name] = pd.read_csv(matches[0])
                 except Exception as exc:  # noqa: BLE001
                     self._log(f"历史表读取失败：{matches[0]} — {exc}")
+        channel_table_path = file_dir / "channel_table.csv"
+        if channel_table_path.is_file():
+            try:
+                tables["channel_table"] = pd.read_csv(channel_table_path)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"历史通道表读取失败：{channel_table_path} — {exc}")
         metric = str(record.get("metric", "Result"))
         aliases = {
             "PSD": {"channel": tables.get("psd_channel_summary", pd.DataFrame()), "region": tables.get("psd_region_summary", pd.DataFrame())},
             "Band Power": {"band_power": tables.get("band_power_epoch_channel", pd.DataFrame()), "band_power_summary": tables.get("band_power_summary", pd.DataFrame())},
-            "FOOOF": tables,
+            "FOOOF": {**tables, "display_bands": record.get("parameters", {}).get("display_bands", {})},
             "Connectivity": tables,
             "Time Delay": tables,
             "Quality": tables,
@@ -919,15 +3149,105 @@ class MainWindow(QtWidgets.QMainWindow):
         return {"metric": metric, "file_id": file_id, "tables": aliases.get(metric, tables), "record": record}
 
     def _export_figure(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出当前图", str(PROJECT_ROOT / "results" / "gui_figure.svg"), "SVG (*.svg);;PNG (*.png);;PDF (*.pdf)")
+        if self.result_combo.currentText().endswith("| Band Power"):
+            self._export_band_figure("comparison")
+            return
+        if self.result_combo.currentText().endswith("| FOOOF"):
+            self._export_fooof("current")
+            return
+        if self.result_combo.currentText().endswith("| Connectivity") or self.result_combo.currentText().endswith("| Time Delay"):
+            self._export_connectivity("spectrum")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出当前图", str(PROJECT_ROOT / "results" / "luna_figure.svg"), "SVG (*.svg);;PNG (*.png);;PDF (*.pdf)")
         if path:
             self.canvas.figure.savefig(path, dpi=200)
             self._log(f"已导出图：{path}")
+
+    def _save_result(self) -> None:
+        """Save the current view using the existing per-metric exporters."""
+        if not self.result_combo.currentText():
+            self._log("当前没有可保存的结果。")
+            return
+        self._export_figure()
+
+    def _export_band_figure(self, kind: str) -> None:
+        names = {"overview": "band_power_overview", "comparison": "band_power_compare", "combined": "band_power_combined"}
+        default = PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / f"luna_{names.get(kind, 'band_power')}.svg"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "导出频带功率图",
+            str(default),
+            "PNG (*.png);;TIFF (*.tif *.tiff);;SVG (*.svg);;PDF (*.pdf)",
+        )
+        if path:
+            self.band_power_view.save_figure(kind, path)
+            csv_path = Path(path).with_suffix(".csv")
+            self.band_power_view.save_csv(csv_path)
+            self._log(f"已导出频带功率图和数据：{Path(path).name}、{csv_path.name}")
+
+    def _export_fooof(self, kind: str) -> None:
+        if self.fooof_view.payload is None:
+            return
+        if kind == "all":
+            directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择 FOOOF 全部结果输出目录", str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME))
+            if directory:
+                figures = self.fooof_view.save_all(directory)
+                tables = self.fooof_view.save_tables(Path(directory) / "fooof")
+                self._log(f"已导出 FOOOF 全部图表 {len(figures)} 个和数据表 {len(tables)} 个。")
+            return
+        if kind == "tables":
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出 FOOOF 数值表前缀", str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / "luna_fooof.csv"), "CSV (*.csv)")
+            if path:
+                tables = self.fooof_view.save_tables(path)
+                self._log(f"已导出 FOOOF 数据表 {len(tables)} 个。")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "导出当前 FOOOF 图",
+            str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / "luna_fooof_current.svg"),
+            "PNG (*.png);;TIFF (*.tif *.tiff);;SVG (*.svg);;PDF (*.pdf)",
+        )
+        if path:
+            self.fooof_view.save_figure("current", path)
+            tables = self.fooof_view.save_tables(Path(path).with_suffix(""))
+            self._log(f"已导出 FOOOF 图和数据表：{Path(path).name}；表={len(tables)}。")
+
+    def _export_connectivity(self, kind: str) -> None:
+        if self.connectivity_view.payload is None:
+            return
+        if kind == "tables":
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "导出连接指标数值表前缀",
+                str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / "luna_connectivity.csv"),
+                "CSV (*.csv)",
+            )
+            if path:
+                tables = self.connectivity_view.save_tables(path)
+                self._log(f"已导出连接数值表 {len(tables)} 个。")
+            return
+        default_name = f"luna_connectivity_{kind}.svg"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "导出连接指标图",
+            str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / default_name),
+            "PNG (*.png);;TIFF (*.tif *.tiff);;SVG (*.svg);;PDF (*.pdf)",
+        )
+        if path:
+            self.connectivity_view.save_figure(kind, path)
+            self._log(f"已导出连接图：{Path(path).name}。")
 
     def _open_output(self) -> None:
         path = Path(self.output_edit.text()).expanduser()
         path.mkdir(parents=True, exist_ok=True)
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.resolve())))
+
+    def _show_about(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            f"About {APP_NAME}",
+            f"<b>{APP_NAME}</b><br>{APP_FULL_NAME}<br><br>{APP_DESCRIPTION}<br><br>Version {APP_VERSION}<br><br>支持多通道 LFP、频谱、谱参数化、频带功率、功能连接和网络动态分析；不包含 spike sorting 或 single-unit analysis。",
+        )
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self._running and self.analysis_worker is not None:
@@ -938,7 +3258,8 @@ class MainWindow(QtWidgets.QMainWindow):
 def launch(input_files: list[str] | None = None, output_dir: str | None = None) -> int:
     """Start the desktop GUI and return the Qt exit code."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("Mouse LFP Analysis")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setStyle("Fusion")
     window = MainWindow(input_files=input_files, output_dir=output_dir)
     window.show()

@@ -4,23 +4,24 @@ import argparse
 import json
 from pathlib import Path
 
+from .app_info import APP_FULL_NAME, APP_NAME
 from .pipeline import run_batch, run_single_file
 from .synthetic import validate_synthetic
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Traceable mouse tetrode LFP analysis")
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} — {APP_FULL_NAME}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     single = subparsers.add_parser("single-file", help="run file-level FIF QC, PSD and band power")
     single.add_argument("--input", required=True, type=Path)
-    single.add_argument("--config", default=Path("configs/default.yaml"), type=Path)
+    single.add_argument("--config", default=Path("configs/luna.yaml"), type=Path)
     single.add_argument("--output", required=True, type=Path)
     single.add_argument("--metadata-dir", default=Path("metadata"), type=Path)
 
     batch = subparsers.add_parser("batch", help="run registered files one by one")
     batch.add_argument("--files", default=Path("metadata/files.csv"), type=Path)
-    batch.add_argument("--config", default=Path("configs/default.yaml"), type=Path)
+    batch.add_argument("--config", default=Path("configs/luna.yaml"), type=Path)
     batch.add_argument("--output", required=True, type=Path)
     batch.add_argument("--metadata-dir", default=Path("metadata"), type=Path)
 
@@ -46,4 +47,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

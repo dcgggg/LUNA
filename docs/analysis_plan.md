@@ -51,9 +51,9 @@
 - 输出目录：`results/real_LID-T80_parameterized/`，包括 `parameterization_model.csv`、`parameterization_peaks.csv`、`parameterization_curves.csv`、`parameterization_failures.csv` 和 PNG/SVG 拟合图。
 - `metadata/channel_map.csv` 已按用户确认的物理编号填入：1–4=M1、5–8=STR、17–20=PF、21–24=SNr；代码按实际通道名匹配。
 - 连接估计只跨同一文件/记录节点/给药时点内的有效 epoch，不拼接不连续 epoch；当前 T80 使用 21 个有效 epoch和 105 s 有效时长。
-- 使用 MNE-Connectivity 0.9.0 的 multitaper `spectral_connectivity_epochs`：MIC/MIM 为真正的多变量脑区集合估计；wPLI 使用全部跨脑区通道对，脑区汇总首版为有效通道对中位数。
-- 当前真实 T80 结果：六组脑区对均生成 MIC、MIM 和 wPLI 频谱；M1/STR/PF 选择维度为3，SNr为2（数据驱动 99% 方差规则）；这些是该文件的质量/降维描述，不是跨动物统计结论。
-- MIC 保留有符号原值，同时用绝对值表示连接强度；MIM 保留未归一化原值；wPLI 保留负的有限样本估计，不开平方、不截断为零。
+- 使用本地 MNE-Connectivity 0.9.0 的 multitaper `spectral_connectivity_epochs`：MIC/MIM 为真正的多变量脑区集合估计；wPLI/dPLI 为全部跨脑区通道对的双变量跨 epoch 估计，dPLI 保留两个有序方向，脑区汇总默认等权 mean（可配置 median）。
+- 当前真实 T80 结果：六组脑区对均可生成 MIC、MIM、wPLI 和 dPLI 频谱；M1/STR/PF 选择维度为3，SNr为2（数据驱动 99% 方差规则）；这些是该文件的质量/降维描述，不是跨动物统计结论。
+- MIC 保留有符号原值，同时用绝对值表示连接强度；MIM 保留未归一化原值；wPLI 保留有限样本估计，不开平方、不截断为零；dPLI 保留 A→B/B→A 原始方向，0.5 作为中性参考。
 - 已完成输入检查、频率/线噪声标记、epoch 稳定性、秩敏感性和合成信号基础验证；等量抽样在单文件上标记为不适用，因为没有多个条件节点可匹配。
 - 时间延迟使用 PyBispectra Method I，并同时计算标准与 bispectral antisymmetrized 结果；所有六组脑区对均保留 16 个跨脑区通道对、7 个配置频段和完整延迟谱。
 - TDE 仅在内部使用 `resample_poly` 从 1000 Hz 抗混叠降到 200 Hz；TDE 延迟窗口为 −1000–1000 ms，分辨率 5 ms，FFT 栅格约 0.499 Hz。原始 LFP、PSD、连接分析不受该降采样影响。
@@ -86,7 +86,7 @@
 
 - `scripts/run_gui.py` 启动 PySide6 窗口；`src/lfp_analysis/gui.py` 只负责控件、后台 QThread、图表和表格；`src/lfp_analysis/gui_engine.py` 负责冻结快照、复用现有算法和安全保存。
 - `src/lfp_analysis/gui_specs.py` 是参数定义和验证的共同来源，包含单位、默认值、范围、适用指标、依赖和中文说明。
-- GUI 支持文件/通道/脑区/epoch/epoch 内时间窗选择，Quality、PSD、Band Power、FOOOF、MIC、MIM、wpli2_debiased、Time Delay 指标选择，Welch/specparam/multitaper/rank/频段/TDE 调整。
+- GUI 支持文件/通道/脑区/epoch/epoch 内时间窗选择，Quality、PSD、Band Power、FOOOF、MIC、MIM、wPLI、dPLI、wpli2_debiased、Time Delay 指标选择，Welch/specparam/multitaper/rank/频段/TDE 调整。
 - GUI 的 `MIC`、`MIM` 显式映射为后端 `mic`、`mim`；单选 MIM 不会顺带执行 PSD 或 FOOOF。FOOOF 自动使用匹配 PSD，Band Power 自动使用匹配 PSD。
 - 每次运行保存独立 `run_id`，包括输入 SHA-256、参数快照、软件版本、选择数据 NPZ、完整 CSV、PNG/SVG 和错误/警告。历史目录可在原始 FIF 不可用时载入表和图。
 - 真实 T80 GUI 后端验证：PSD/频段/FOOOF、三种连接方法和 Time Delay 均完成；GUI 参数修改实际反映为 Hamming、0.5 s、25% 重叠对应的 `nperseg=500`、`noverlap=125`。

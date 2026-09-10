@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 .idea/
+build/
 src/*.egg-info/
 
 # Real data and generated analysis outputs are kept local by default.

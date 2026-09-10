@@ -1,8 +1,32 @@
-# 小鼠多脑区同步 tetrode LFP 分析
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/luna-logo-on-white.svg">
+    <img src="assets/branding/luna-logo.svg" alt="LUNA — Local field potential Unified Network Analysis platform" width="420">
+  </picture>
+</p>
 
-这是一个面向小鼠多脑区同步 tetrode LFP 数据的、可追溯的 Python 分析项目。输入为经过预处理的 FIF epoch 文件；每个输入文件可以代表一只小鼠在一次记录节点的结果。项目先保存文件级结果，等动物、记录日期、给药时点和行为信息补齐后，再进行动物层统计。
+# LUNA
+
+LUNA is a modular GUI-based platform for multichannel local field potential analysis.
+
+LUNA supports:
+
+- Multichannel LFP
+- EEG/ECoG/SEEG-like field potential recordings
+- Spectral analysis
+- FOOOF/specparam
+- Band power
+- Time-frequency analysis
+- Functional connectivity
+- Network dynamics
+
+LUNA focuses on local field potential and neural field signal analysis. Spike sorting and single-unit analysis are not included.
+
+本仓库当前包含小鼠多脑区同步 tetrode LFP 的可追溯分析工作流。输入为经过预处理的 FIF epoch 文件；每个输入文件可以代表一只小鼠在一次记录节点的结果。项目先保存文件级结果，等动物、记录日期、给药时点和行为信息补齐后，再进行动物层统计。
 
 当前版本已经在用户提供的 T80 FIF 样例上完成单文件验证。样例原始数据不存放在 GitHub 仓库中，也不会被程序覆盖。
+
+GUI 启动后，导入文件即可查看原始波形、质量提示和实际有效时长。Channel Mapping 表允许按实际通道名或物理编号编辑脑区，并保存为 `experiment_mapping.json`；M1、STR、PF、SNr 仅是当前样例的可编辑默认模板，不是软件固定的实验定义。
 
 ## 当前已经实现
 
@@ -10,10 +34,12 @@
 - `events`、`selection`、`drop_log` 和 epoch 追溯信息保存。
 - NaN/Inf、平直信号、异常幅度、饱和、重复片段和残余工频质量检查。
 - 实际有效时长计算；不把不连续 epoch 拼接成连续记录。
-- 逐 epoch、逐通道 Welch PSD。
+- 逐 epoch、逐通道 Welch 或 MNE DPSS Multitaper PSD；结果记录方法、实际频率步长和方法参数。
 - 绝对功率、相对功率和可配置频段汇总。
 - specparam 参数化；保留非周期背景、周期峰、拟合曲线、残差和失败原因。
-- 基于多个有效 epoch 的多变量 MIC、MIM 和去偏平方 wPLI。
+- 基于多个有效 epoch 的多变量 MIC、MIM，以及可独立运行的 wPLI、dPLI 和去偏平方 wPLI。
+- wPLI/dPLI 保留全部跨脑区通道对；dPLI 保存两个有序方向，脑区汇总可选 mean 或 median。
+- MIC 保留带符号原始值、绝对强度、多成分轴和后端 patterns；MIM 保留未归一化总相互作用，不被 MIC 成分数截断。
 - 基于 PyBispectra 的双谱时间延迟分析，包含标准和 antisymmetrized 结果。
 - 四脑区通道冗余、奇异值、有效秩、维度敏感性和片段稳定性检查。
 - 单文件入口、批量入口、元数据模板、Notebook、CSV 结果表、PNG/SVG 图和运行日志。
@@ -31,7 +57,8 @@
 ## 项目结构
 
 ```text
-configs/                可编辑分析配置
+configs/                可编辑分析配置（GUI 默认 configs/luna.yaml）
+assets/branding/        LUNA 官方 Logo 及深色背景展示版本
 data/real/              本地真实 FIF；默认不提交
 data/synthetic/         合成验证数据位置
 metadata/               动物、记录、文件、epoch、行为和通道登记模板
@@ -43,6 +70,7 @@ docs/                   分阶段实施记录和分析限制
 results/                运行输出；默认不提交
 pyproject.toml          Python 项目和依赖声明
 requirements-lock.txt   当前 Windows 环境的依赖版本快照
+CHANGELOG.md            版本变化和发布验证记录
 ```
 
 ## Python 环境
@@ -88,6 +116,8 @@ python -m pip install -e ".[all]"
 
 `requirements-lock.txt` 是当前 Windows/Python 3.11 环境的可审计快照，其中不再包含本机绝对路径。跨平台安装时，优先使用 `pyproject.toml` 的依赖范围；锁定文件中的个别包可能带有 Windows 或本机环境特征。
 
+默认配置入口是 [`configs/luna.yaml`](configs/luna.yaml)，它继承 [`configs/default.yaml`](configs/default.yaml) 中已有的分析参数并只补充 LUNA 身份信息；保留旧文件是为了兼容已有脚本和历史运行。
+
 ### PyCharm 设置
 
 在 PyCharm 中选择：
@@ -120,11 +150,19 @@ INPUT_FILE = PROJECT_ROOT / "data" / "real" / "your-file-epo.fif"
 GUI 的日常操作流程是：
 
 1. 添加一个或多个 FIF 文件，核对采样率、形状、有效 epoch 数、有效时长和 SHA-256。
-2. 在“分析范围”中选择脑区、实际通道、epoch 子集、epoch 内时间窗和连接脑区对。
-3. 在“指标”中独立勾选 Quality、PSD、Band Power、FOOOF、MIC、MIM、`wpli2_debiased` 或 Time Delay。
-4. 在参数页调整真正会传入后端的 Welch、specparam、multitaper、秩、频段和时间延迟参数。
-5. 点击“运行勾选指标”；计算在后台线程执行，每个指标完成后立即更新图和表。
-6. 使用“保存预设”保存参数，使用“载入历史”从 `run_manifest.json` 恢复结果，即使原始 FIF 暂时不可用也可以查看已保存图表和表格。
+2. 在 `Channel Mapping` 表中核对或编辑每个实际通道的 `Region` 和 `Label`。物理编号和数组索引只用于追溯，不会被数组位置自动推断。
+3. 点击 `Apply Mapping` 应用当前文件的映射；点击 `Save Mapping` 可保存为 `experiment_mapping.json`，以后用 `Load Mapping` 复用到匹配的通道名或物理编号。
+4. 在“分析范围”中选择映射后的脑区、实际通道、epoch 子集和 epoch 内时间窗。脑区对会根据当前映射动态生成；没有映射的通道不会参与脑区级连接。
+5. 在“功能连接 Connectivity”下先选择脑区对，再独立勾选 MIC、MIM、`wpli`、`dpli` 或 `wpli2_debiased`；wPLI/dPLI 的通道对汇总方式在 Connectivity 参数页单独设置。
+6. 在参数页调整真正会传入后端的 Welch、specparam、multitaper、秩、频段和时间延迟参数。
+7. 点击顶部 `Run Analysis`；计算在后台线程执行，运行状态、取消按钮和进度都位于窗口顶部，不需要滚动到参数区底部。
+8. 使用顶部 `Save Result` 或 `Export Figure` 保存当前结果。使用“保存预设”保存参数，使用“载入历史”从 `run_manifest.json` 恢复结果，即使原始 FIF 暂时不可用也可以查看已保存图表和表格。
+
+默认模板与自定义映射示例：
+
+- LUNA 不把 M1、STR、PF、SNr 作为固定实验定义；它们只是当前样例的可编辑模板。
+- 例如可将前 8 个实际通道的 `Region` 改为 `CTX`，后 8 个改为 `STR_CUSTOM`，应用后连接脑区对和结果矩阵会自动使用这两个新脑区。
+- 保存的 JSON 同时记录脑区到物理通道的关系和逐通道信息，便于复核；空白脑区表示该通道暂不参加脑区级分析。
 
 每次 GUI 运行在输出目录中创建独立 `run_id/`，保存 `parameters.json`、`run_manifest.json`、每个文件的 CSV、完整 PSD/选择数据 NPZ、质量信息及 PNG/SVG 图。输入文件内容变化会产生新的 SHA-256，不能误用旧运行结果。修改显示设置只影响当前图；修改计算参数或数据选择会提示需要重新计算。
 
@@ -147,7 +185,7 @@ GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/
 
 | 包 | 用途 | 官方网站 |
 |---|---|---|
-| MNE-Connectivity | MIC、MIM、wPLI 等连接估计 | [MNE-Connectivity](https://mne.tools/mne-connectivity/stable/) |
+| MNE-Connectivity | MIC、MIM、wPLI、dPLI 等连接估计 | [MNE-Connectivity](https://mne.tools/mne-connectivity/stable/) |
 | PyBispectra | 双谱时间延迟分析 | [PyBispectra documentation](https://pybispectra.readthedocs.io/) |
 | specparam | 功率谱非周期/周期参数化 | [specparam on PyPI](https://pypi.org/project/specparam/) |
 | FOOOF | specparam 的兼容后端 | [FOOOF documentation](https://fooof-tools.github.io/fooof/) |
@@ -217,7 +255,7 @@ GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/
 ```powershell
 .\.venv\Scripts\python.exe -m lfp_analysis.cli single-file `
   --input "C:\path\to\your-epochs.fif" `
-  --config configs\default.yaml `
+  --config configs\luna.yaml `
   --output results\your-file
 ```
 
@@ -230,7 +268,7 @@ GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/
 ```powershell
 .\.venv\Scripts\python.exe -m lfp_analysis.cli batch `
   --files metadata\files.csv `
-  --config configs\default.yaml `
+  --config configs\luna.yaml `
   --output results\batch
 ```
 
@@ -250,6 +288,8 @@ GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/
 - `psd_channel.csv`、`band_power_channel.csv`、PSD/频段功率图。
 - `parameterization_model.csv`、`parameterization_peaks.csv`、`parameterization_curves.csv` 和拟合图。
 - `connectivity_spectrum.csv`、`connectivity_region_summary.csv`、`connectivity_band_summary.csv`。
+- GUI Connectivity 运行还保存 `channel_pair_band_summary.csv`，以及按方法独立命名的 `connectivity_wpli_*`、`connectivity_dpli_*` 频谱/矩阵/组合图；dPLI 图保留 A→B 与 B→A，不将矩阵镜像当成第二次估计。
+- `connectivity_arrays.npz`：完整连接频谱的频率、方法、脑区对、MIC 成分、原始值/展示强度及 rank 坐标。
 - `connectivity_rank_summary.csv`、`connectivity_stability.csv` 和连接质量图。
 - `time_delay_spectrum.csv`、`time_delay_band_summary.csv`、`time_delay_metadata.json` 和延迟图。
 - `figures/`：预览用 PNG 和可编辑 SVG。
@@ -262,7 +302,7 @@ GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/
 - 通道、epoch 和通道对是动物内部重复测量，不能当作独立小鼠样本。
 - MIC 保留有符号原值；图中强度可使用明确标注的绝对值，但不解释为因果方向。
 - MIM 保留原始未归一化值，不强行裁剪到 0–1。
-- 去偏平方 wPLI 不开平方、不把负估计静默截为 0；脑区汇总保留通道对数量和分布。
+- wPLI、dPLI 和去偏平方 wPLI 不把通道对当作独立动物；保留全部通道对及有效数量。dPLI 矩阵不镜像，0.5 是中性参考。
 - 时间延迟的正负号只表示 seed→target 的时间符号约定，不等于解剖方向或因果证明。
 - 默认不再次强滤波、陷波、重参考或强清洗；质量标记不会静默删除数据。
 - 配置中的频段、阈值、降维和延迟范围是可编辑的起步设置，不是已经验证的小鼠生理边界。

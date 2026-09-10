@@ -35,6 +35,46 @@ def test_specparam_result_fields_are_populated_when_available():
     }.issubset(result["curves"].columns)
 
 
+def test_multitaper_psd_recovers_known_frequency_and_records_parameters():
+    rng = np.random.default_rng(2026)
+    sfreq = 200.0
+    n_times = 2000
+    times = np.arange(n_times) / sfreq
+    data = np.stack(
+        [
+            np.sin(2 * np.pi * 20.0 * times)[None, :] + 0.12 * rng.normal(size=(4, n_times)),
+            np.sin(2 * np.pi * 20.0 * times + 0.4)[None, :] + 0.12 * rng.normal(size=(4, n_times)),
+        ],
+        axis=1,
+    )
+    config = {
+        "psd": {
+            "method": "multitaper",
+            "fmin_hz": 2.0,
+            "fmax_hz": 60.0,
+            "multitaper_bandwidth_hz": 4.0,
+            "multitaper_adaptive": False,
+            "multitaper_low_bias": True,
+            "multitaper_normalization": "length",
+            "multitaper_remove_dc": True,
+            "multitaper_n_jobs": 1,
+        }
+    }
+    psd = compute_psd(data, sfreq, ["M1-1", "STR-1"], config)
+    assert not psd.empty
+    assert set(psd["psd_method"]) == {"multitaper"}
+    assert psd["nperseg_used"].isna().all()
+    assert psd["nfft_used"].isna().all()
+    assert psd["multitaper_bandwidth_hz"].eq(4.0).all()
+    assert psd["multitaper_normalization"].eq("length").all()
+    assert psd["frequency_resolution_hz"].dropna().iloc[0] == pytest.approx(sfreq / n_times)
+
+    summary = summarize_psd(psd)["channel"]
+    peak = summary.loc[summary["channel_name"] == "M1-1"].sort_values("psd_value").iloc[-1]
+    assert abs(float(peak["frequency_hz"]) - 20.0) <= 1.0
+    assert peak["psd_method"] == "multitaper"
+
+
 def test_fooof_compatibility_backend_populates_same_outputs():
     pytest.importorskip("fooof")
     data, channels = make_synthetic_epochs(n_epochs=6, n_channels=2, n_times=5000, seed=13)
@@ -85,7 +125,10 @@ def test_specparam_recovers_known_aperiodic_exponent_and_peak_frequency():
     assert base["fit_status"] == "ok"
     assert abs(base["exponent"] - 1.5) < 0.02
     assert abs(peaks.iloc[0]["center_frequency_hz"] - 40.0) < 1.0
+    assert abs(float(peaks.iloc[0]["peak_power_log10"]) - 0.6) < 0.08
+    assert abs(float(peaks.iloc[0]["bandwidth_hz"]) - 8.0) < 1.5
     assert model.iloc[0]["r_squared"] > 0.99
+    assert {"observed_minus_aperiodic_log10", "periodic_model_log10", "gaussian_0_log10"}.issubset(curves.columns)
     assert len(curves) == 149
 
 
@@ -131,6 +174,112 @@ def test_multivariate_connectivity_and_wpli_keep_distinct_output_grains():
     assert set(wpli["aggregation_level"]) == {"cross_region_channel_pair"}
     assert wpli[["seed_channel", "target_channel"]].drop_duplicates().shape[0] == 4
     assert result["spectrum"].loc[result["spectrum"]["method"] == "mic", "value_strength"].ge(0).all()
+
+
+def test_wpli_and_dpli_keep_channel_pairs_and_direction_separate():
+    data, channels = make_synthetic_epochs(n_epochs=6, n_channels=8, n_times=2000, seed=24)
+    channel_table = pd.DataFrame(
+        {
+            "array_index": range(8),
+            "channel_name": channels,
+            "region": ["M1"] * 4 + ["STR"] * 4,
+        }
+    )
+    config = {
+        "quality": {"line_noise_hz": []},
+        "connectivity": {
+            "methods": ["wpli", "dpli"],
+            "mode": "fourier",
+            "fmin_hz": 5.0,
+            "fmax_hz": 30.0,
+            "min_epochs": 5,
+            "region_pair_summary": "mean",
+            "rank_sensitivity_enabled": False,
+            "stability_enabled": False,
+            "exclude_line_noise_hz": [],
+        },
+        "bands": {"alpha": [8.0, 12.0]},
+        "expected_data": {"preprocessed_highpass_hz": 1.0, "preprocessed_lowpass_hz": 200.0},
+    }
+    quality = assess_quality(data, 1000.0, channels, config)
+    result = compute_connectivity(data, 1000.0, channel_table, quality["epoch"], config)
+
+    assert result["status"] == "ok"
+    spectrum = result["spectrum"]
+    wpli = spectrum.loc[spectrum["method"] == "wpli"]
+    dpli = spectrum.loc[spectrum["method"] == "dpli"]
+    assert wpli[["seed_channel", "target_channel"]].drop_duplicates().shape[0] == 16
+    assert dpli[["region_a", "region_b", "seed_channel", "target_channel"]].drop_duplicates().shape[0] == 32
+    assert set(map(tuple, dpli[["region_a", "region_b"]].drop_duplicates().to_numpy())) == {("M1", "STR"), ("STR", "M1")}
+    assert not result["channel_pair_band_summary"].empty
+    assert result["channel_pair_band_summary"].query("method == 'wpli'").shape[0] == 16
+    assert result["channel_pair_band_summary"].query("method == 'dpli'").shape[0] == 32
+    assert result["metadata"]["dpli_neutral_reference"] == 0.5
+
+
+def test_mic_components_are_preserved_and_mim_remains_total_interaction():
+    data, channels = make_synthetic_epochs(n_epochs=8, n_channels=4, n_times=2000, seed=22)
+    channel_table = pd.DataFrame({"array_index": range(4), "channel_name": channels, "region": ["M1", "M1", "STR", "STR"]})
+    config = {
+        "quality": {"line_noise_hz": [], "flat_std_threshold": 1e-15, "max_abs_z_threshold": 20, "saturation_fraction_threshold": 0.01},
+        "connectivity": {
+            "methods": ["mic", "mim"],
+            "mode": "multitaper",
+            "fmin_hz": 5.0,
+            "fmax_hz": 30.0,
+            "mt_bandwidth_hz": 4.0,
+            "mt_adaptive": False,
+            "mt_low_bias": True,
+            "n_components": 2,
+            "n_jobs": 1,
+            "min_epochs": 5,
+            "rank_strategy": "fixed_rank",
+            "fixed_rank_by_region": {"M1": 2, "STR": 2},
+            "rank_sensitivity_enabled": False,
+            "stability_enabled": False,
+            "exclude_line_noise_hz": [],
+        },
+        "bands": {"alpha": [8.0, 12.0]},
+        "expected_data": {"preprocessed_highpass_hz": 1.0, "preprocessed_lowpass_hz": 200.0},
+    }
+    quality = assess_quality(data, 1000.0, channels, config)
+    result = compute_connectivity(data, 1000.0, channel_table, quality["epoch"], config)
+    assert result["status"] == "ok"
+    mic = result["spectrum"].query("method == 'mic'")
+    mim = result["spectrum"].query("method == 'mim'")
+    assert set(mic["component_index"].dropna().astype(int)) == {1, 2}
+    assert mim["component_index"].isna().all()
+    assert mim["n_components_returned"].eq(1).all()
+    assert set(result["region_summary"].query("method == 'mic'")["component_index"].dropna().astype(int)) == {1, 2}
+    assert result["patterns"]["component_index"].nunique() == 2
+
+
+def test_mim_only_does_not_compute_or_label_mic_components():
+    data, channels = make_synthetic_epochs(n_epochs=6, n_channels=4, n_times=2000, seed=23)
+    channel_table = pd.DataFrame({"array_index": range(4), "channel_name": channels, "region": ["M1", "M1", "STR", "STR"]})
+    config = {
+        "connectivity": {
+            "methods": ["mim"],
+            "mode": "fourier",
+            "fmin_hz": 5.0,
+            "fmax_hz": 30.0,
+            "n_components": 3,
+            "min_epochs": 5,
+            "rank_strategy": "fixed_rank",
+            "fixed_rank_by_region": {"M1": 2, "STR": 2},
+            "rank_sensitivity_enabled": False,
+            "stability_enabled": False,
+            "exclude_line_noise_hz": [],
+        },
+        "bands": {"alpha": [8.0, 12.0]},
+        "expected_data": {"preprocessed_highpass_hz": 1.0, "preprocessed_lowpass_hz": 200.0},
+    }
+    quality = assess_quality(data, 1000.0, channels, {"quality": {"line_noise_hz": []}})
+    result = compute_connectivity(data, 1000.0, channel_table, quality["epoch"], config)
+    assert result["status"] == "ok"
+    assert set(result["spectrum"]["method"]) == {"mim"}
+    assert result["patterns"].empty
+    assert result["metadata"]["n_components_requested"] == 3
 
 
 def test_redundancy_rule_reduces_exactly_repeated_channels():

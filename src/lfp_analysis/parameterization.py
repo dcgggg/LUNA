@@ -75,8 +75,11 @@ def fit_single_psd_detailed(
         **context,
         "backend_requested": backend_requested,
         "backend_used": "",
+        "aperiodic_mode": str(parameter_cfg.get("aperiodic_mode", "fixed")),
         "fit_status": "failed",
         "fit_quality_status": "not_available",
+        "peak_status": "fit_failed",
+        "n_peaks": 0,
         "failure_reason": "",
         "r_squared": np.nan,
         "error": np.nan,
@@ -131,6 +134,8 @@ def fit_single_psd_detailed(
                 "backend_used": Model.__name__,
                 "r_squared": r_squared,
                 "error": error,
+                "n_peaks": len(peaks.reshape(-1, 3)),
+                "peak_status": "peaks_detected" if len(peaks.reshape(-1, 3)) else "no_peaks_detected",
             }
         )
         base["offset"] = float(aperiodic[0])
@@ -143,13 +148,20 @@ def fit_single_psd_detailed(
         base["fit_quality_status"] = "pass" if np.isfinite(r_squared) and r_squared >= min_r_squared else "below_configured_min_r_squared"
 
         for peak_index, peak in enumerate(peaks.reshape(-1, 3)):
+            gaussian_sigma_hz = float(peak[2])
             peak_rows.append(
                 {
                     **context,
                     "peak_index": peak_index,
                     "center_frequency_hz": float(peak[0]),
                     "peak_height_log10": float(peak[1]),
-                    "bandwidth_hz": float(peak[2]),
+                    "peak_power_log10": float(peak[1]),
+                    # The backend stores the Gaussian width as sigma.  The
+                    # reported FOOOF/specparam BW is the full two-sided width
+                    # 2*sigma, not FWHM.
+                    "bandwidth_hz": 2.0 * gaussian_sigma_hz,
+                    "gaussian_sigma_hz": gaussian_sigma_hz,
+                    "bandwidth_definition": "full_width_2sigma",
                     "fit_status": base["fit_status"],
                     "fit_quality_status": base["fit_quality_status"],
                     "r_squared": r_squared,
@@ -163,6 +175,19 @@ def fit_single_psd_detailed(
         full_power = np.power(10.0, full_log)
         aperiodic_power = np.power(10.0, aperiodic_log)
         periodic_power = full_power - aperiodic_power
+        observed_minus_aperiodic_log = observed_log - aperiodic_log
+        gaussian_columns: dict[str, np.ndarray] = {}
+        for peak_index, peak in enumerate(peaks.reshape(-1, 3)):
+            center_frequency, peak_power_log10, gaussian_sigma_hz = [float(value) for value in peak]
+            # FOOOF/specparam defines bandwidth as 2 * sigma.  Reconstruct
+            # each log10 Gaussian with the fitted CF/PW/BW parameters rather
+            # than treating BW as sigma or exponentiating PW as raw PSD.
+            sigma_hz = gaussian_sigma_hz
+            if sigma_hz > 0:
+                gaussian_columns[f"gaussian_{peak_index}_log10"] = peak_power_log10 * np.exp(
+                    -0.5 * ((fit_frequencies - center_frequency) / sigma_hz) ** 2
+                )
+        gaussian_sum = np.sum(np.vstack(list(gaussian_columns.values())), axis=0) if gaussian_columns else np.zeros_like(fit_frequencies)
         curve_rows.append(
             pd.DataFrame(
                 {
@@ -176,6 +201,9 @@ def fit_single_psd_detailed(
                     "aperiodic_log10_power": aperiodic_log,
                     "periodic_component_power": periodic_power,
                     "periodic_component_log10_additive": peak_log,
+                    "periodic_model_log10": peak_log,
+                    "observed_minus_aperiodic_log10": observed_minus_aperiodic_log,
+                    "reconstructed_gaussian_sum_log10": gaussian_sum,
                     "residual_log10": observed_log - full_log,
                     "periodic_component_negative": periodic_power < 0,
                     "fit_status": base["fit_status"],
@@ -184,6 +212,9 @@ def fit_single_psd_detailed(
                 }
             )
         )
+        if gaussian_columns:
+            for column, values in gaussian_columns.items():
+                curve_rows[-1][column] = values
         model_rows.append(_empty_model_row(context, base, fit_range, n_bins))
         return base, pd.DataFrame(peak_rows), pd.DataFrame(model_rows), pd.concat(curve_rows, ignore_index=True)
     except Exception as exc:  # noqa: BLE001 - failed fits must be preserved
@@ -212,7 +243,21 @@ def fit_channel_psd_table(psd_summary: pd.DataFrame, config: dict[str, Any]) -> 
             "channel_array_index": array_index,
             "channel_name": channel_name,
         }
-        for column in ("source_unit", "psd_unit"):
+        for column in (
+            "source_unit",
+            "psd_unit",
+            "psd_method",
+            "frequency_resolution_hz",
+            "nperseg_used",
+            "noverlap_used",
+            "nfft_used",
+            "multitaper_bandwidth_hz",
+            "multitaper_adaptive",
+            "multitaper_low_bias",
+            "multitaper_normalization",
+            "multitaper_remove_dc",
+            "multitaper_n_jobs",
+        ):
             if column in group:
                 context[column] = group[column].iloc[0]
         _, peaks, model, curves = fit_single_psd_detailed(

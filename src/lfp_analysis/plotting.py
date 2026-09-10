@@ -238,8 +238,8 @@ def plot_connectivity_spectrum(
     n_columns = 3
     n_rows = max(1, int(np.ceil(len(pairs) / n_columns)))
     fig, axes = plt.subplots(n_rows, n_columns, figsize=(4.2 * n_columns, 2.8 * n_rows), squeeze=False)
-    ylabel = {"mic": "|MIC| (A.U.)", "mim": "MIM (raw, unnormalised)", "wpli2_debiased": "wPLI²_debiased (raw)"}.get(method, f"{method} (raw)")
-    color = {"mic": "#4472C4", "mim": "#ED7D31", "wpli2_debiased": "#70AD47"}.get(method, "#4472C4")
+    ylabel = {"mic": "|MIC| (A.U.)", "mim": "MIM (raw, unnormalised)", "wpli": "wPLI (0–1)", "dpli": "dPLI (0–1; 0.5 neutral)", "wpli2_debiased": "wPLI²_debiased (raw)"}.get(method, f"{method} (raw)")
+    color = {"mic": "#4472C4", "mim": "#ED7D31", "wpli": "#3A7D44", "dpli": "#8C2D04", "wpli2_debiased": "#70AD47"}.get(method, "#4472C4")
     for index, (region_a, region_b) in enumerate(pairs):
         axis = axes.ravel()[index]
         subset = region_summary.loc[(region_summary["method"] == method) & (region_summary["region_a"] == region_a) & (region_summary["region_b"] == region_b)].sort_values("frequency_hz")
@@ -249,6 +249,10 @@ def plot_connectivity_spectrum(
         axis.set_title(f"{region_a}–{region_b}")
         axis.set_xlabel("Frequency (Hz)")
         axis.set_ylabel(ylabel)
+        if method in {"wpli", "dpli"}:
+            axis.set_ylim(0.0, 1.0)
+        if method == "dpli":
+            axis.axhline(0.5, color="#666666", linestyle=":", linewidth=0.6)
         axis.grid(True, color="#dddddd", linewidth=0.4)
     for axis in axes.ravel()[len(pairs) :]:
         axis.axis("off")
@@ -262,9 +266,14 @@ def plot_connectivity_band_matrices(
     output_base: str | Path,
     dpi: int = 150,
 ) -> tuple[Path, Path]:
-    regions = [region for region in ("M1", "STR", "PF", "SNr") if region in set(band_summary.get("region_a", pd.Series(dtype=str))) | set(band_summary.get("region_b", pd.Series(dtype=str)))]
+    observed_regions = list(dict.fromkeys(
+        list(band_summary.get("region_a", pd.Series(dtype=str)).dropna().astype(str))
+        + list(band_summary.get("region_b", pd.Series(dtype=str)).dropna().astype(str))
+    ))
+    default_order = [region for region in ("M1", "STR", "PF", "SNr") if region in observed_regions]
+    regions = default_order + [region for region in observed_regions if region not in default_order]
     bands = list(band_summary.get("band", pd.Series(dtype=str)).dropna().unique())
-    methods = [method for method in ("mic", "mim", "wpli2_debiased") if method in set(band_summary.get("method", pd.Series(dtype=str)))]
+    methods = [method for method in ("mic", "mim", "wpli", "dpli", "wpli2_debiased") if method in set(band_summary.get("method", pd.Series(dtype=str)))]
     if not regions or not bands or not methods:
         fig, axis = plt.subplots(figsize=(7, 4))
         axis.text(0.5, 0.5, "No band-level connectivity estimates", ha="center", va="center")
@@ -284,8 +293,12 @@ def plot_connectivity_band_matrices(
             matrix = pd.DataFrame(np.nan, index=regions, columns=regions)
             for _, row in subset.iterrows():
                 matrix.loc[row["region_a"], row["region_b"]] = row["value_strength"]
-                matrix.loc[row["region_b"], row["region_a"]] = row["value_strength"]
-            image = axis.imshow(matrix.to_numpy(float), vmin=vmin, vmax=vmax, cmap="viridis", interpolation="nearest")
+                if method != "dpli":
+                    matrix.loc[row["region_b"], row["region_a"]] = row["value_strength"]
+            if method == "dpli":
+                image = axis.imshow(matrix.to_numpy(float), vmin=0.0, vmax=1.0, cmap="RdBu_r", interpolation="nearest")
+            else:
+                image = axis.imshow(matrix.to_numpy(float), vmin=vmin, vmax=vmax, cmap="viridis", interpolation="nearest")
             axis.set_title(f"{method}\n{band}", fontsize=8)
             axis.set_xticks(np.arange(len(regions)), regions, rotation=45, ha="right", fontsize=7)
             axis.set_yticks(np.arange(len(regions)), regions, fontsize=7)
@@ -304,8 +317,8 @@ def plot_connectivity_channel_pairs(
     spectrum: pd.DataFrame,
     output_base: str | Path,
     dpi: int = 150,
+    method: str = "wpli2_debiased",
 ) -> tuple[Path, Path]:
-    method = "wpli2_debiased"
     if spectrum.empty or not {"method", "aggregation_level", "frequency_is_excluded_line_noise"}.issubset(spectrum.columns):
         fig, axis = plt.subplots(figsize=(7, 4))
         axis.text(0.5, 0.5, "No channel-pair connectivity estimates", ha="center", va="center")
@@ -321,16 +334,16 @@ def plot_connectivity_channel_pairs(
         group = subset.loc[(subset["region_a"] == region_a) & (subset["region_b"] == region_b)]
         pair_values = group.groupby(["seed_channel", "target_channel"], as_index=False)["value_raw"].mean()
         matrix = pair_values.pivot(index="seed_channel", columns="target_channel", values="value_raw")
-        image = axis.imshow(matrix.to_numpy(float), cmap="viridis", interpolation="nearest")
+        image = axis.imshow(matrix.to_numpy(float), cmap="RdBu_r" if method == "dpli" else "viridis", vmin=0.0 if method == "dpli" else None, vmax=1.0 if method == "dpli" else None, interpolation="nearest")
         axis.set_title(f"{region_a}–{region_b}; frequency mean")
         axis.set_xticks(np.arange(len(matrix.columns)), matrix.columns, rotation=90, fontsize=7)
         axis.set_yticks(np.arange(len(matrix.index)), matrix.index, fontsize=7)
         axis.set_xlabel("Target channel")
         axis.set_ylabel("Seed channel")
-        fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="wPLI²_debiased raw")
+        fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="dPLI (0.5 neutral)" if method == "dpli" else f"{method} raw")
     for axis in axes.ravel()[len(pairs) :]:
         axis.axis("off")
-    fig.suptitle("Cross-region channel-pair wPLI²_debiased; all valid channel pairs retained")
+    fig.suptitle(f"Cross-region channel-pair {method}; all valid channel pairs retained")
     fig.tight_layout()
     return _save(fig, output_base, dpi=dpi)
 
@@ -412,7 +425,12 @@ def plot_time_delay_band_matrix(
         & (band_summary["antisymmetrized"].astype(bool) == bool(antisymmetrized))
     ].copy()
     bands = list(subset.get("frequency_band", pd.Series(dtype=str)).dropna().unique()) if not subset.empty else []
-    regions = [region for region in ("M1", "STR", "PF", "SNr") if region in set(subset.get("region_a", pd.Series(dtype=str))) | set(subset.get("region_b", pd.Series(dtype=str)))]
+    observed_regions = list(dict.fromkeys(
+        list(subset.get("region_a", pd.Series(dtype=str)).dropna().astype(str))
+        + list(subset.get("region_b", pd.Series(dtype=str)).dropna().astype(str))
+    ))
+    default_order = [region for region in ("M1", "STR", "PF", "SNr") if region in observed_regions]
+    regions = default_order + [region for region in observed_regions if region not in default_order]
     if not bands or not regions:
         fig, axis = plt.subplots(figsize=(7, 4))
         axis.text(0.5, 0.5, "No time-delay band estimates", ha="center", va="center")

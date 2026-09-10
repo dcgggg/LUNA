@@ -8,8 +8,17 @@ import pandas as pd
 
 REGION_ORDER = ("M1", "STR", "PF", "SNr")
 MULTIVARIATE_METHODS = ("mic", "mim")
-BIVARIATE_METHODS = ("wpli2_debiased", "imcoh", "coh")
-FAILURE_COLUMNS = ["region_a", "region_b", "method", "failure_reason", "n_epochs", "rank_seed", "rank_target"]
+BIVARIATE_METHODS = ("wpli", "dpli", "wpli2_debiased", "imcoh", "coh")
+FAILURE_COLUMNS = [
+    "region_a",
+    "region_b",
+    "method",
+    "failure_reason",
+    "n_epochs",
+    "rank_seed",
+    "rank_target",
+    "n_components_requested",
+]
 
 
 def _region_sort_key(region: str) -> tuple[int, str]:
@@ -101,6 +110,8 @@ def assess_region_redundancy(
     tolerance = float(conn_cfg.get("rank_relative_tolerance", 1.0e-6))
     variance_threshold = float(conn_cfg.get("rank_variance_threshold", 0.99))
     fixed_rank = conn_cfg.get("fixed_rank_by_region", {}) or {}
+    if str(conn_cfg.get("rank_strategy", "data_driven_energy_99pct")).strip().lower() != "fixed_rank":
+        fixed_rank = {}
     groups = _channel_groups(channel_table)
     corr_rows: list[dict[str, Any]] = []
     singular_rows: list[dict[str, Any]] = []
@@ -207,6 +218,7 @@ def _connectivity_kwargs(sfreq: float, config: dict[str, Any]) -> dict[str, Any]
         "fmax": float(conn_cfg.get("fmax_hz", 100.0)),
         "fdecim": int(conn_cfg.get("fdecim", 1)),
         "faverage": False,
+        "n_jobs": int(conn_cfg.get("n_jobs", 1)),
         "verbose": False,
     }
     if kwargs["mode"] == "multitaper":
@@ -235,18 +247,28 @@ def _estimate_multivariate(
     target_indices: np.ndarray,
     rank_seed: int,
     rank_target: int,
+    methods: list[str],
     config: dict[str, Any],
-) -> list[Any]:
+) -> dict[str, Any]:
+    if not methods:
+        return {}
     estimator = _load_connectivity_api()
-    return _as_list(
+    conn_cfg = config.get("connectivity", {})
+    requested_components = int(conn_cfg.get("n_components", 1))
+    backend_components = requested_components if "mic" in methods else 1
+    returned = _as_list(
         estimator(
             data,
-            method=list(MULTIVARIATE_METHODS),
+            method=methods if len(methods) > 1 else methods[0],
             indices=(np.asarray([seed_indices], dtype=int), np.asarray([target_indices], dtype=int)),
             rank=(np.asarray([rank_seed], dtype=int), np.asarray([rank_target], dtype=int)),
+            n_components=backend_components,
             **_connectivity_kwargs(sfreq, config),
         )
     )
+    if len(returned) != len(methods):
+        raise ValueError(f"MNE-Connectivity returned {len(returned)} multivariate results for {methods}")
+    return dict(zip(methods, returned, strict=True))
 
 
 def _estimate_bivariate(
@@ -274,12 +296,22 @@ def _estimate_bivariate(
 
 
 def _connection_values(connection: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Return connectivity data as [connection, component, frequency].
+
+    MNE-Connectivity uses two dimensions for a single-component result and
+    three dimensions for multivariate MIC.  Normalising here prevents later
+    summaries and plots from silently dropping MIC components.
+    """
     values = np.asarray(connection.get_data(), dtype=float)
     if values.ndim == 1:
-        values = values[None, :]
-    while values.ndim > 2:
-        values = values[..., 0]
+        values = values[None, None, :]
+    elif values.ndim == 2:
+        values = values[:, None, :]
+    elif values.ndim != 3:
+        raise ValueError(f"Unexpected connectivity result dimensions: {values.shape}")
     frequencies = np.asarray(connection.freqs, dtype=float)
+    if values.shape[-1] != frequencies.size:
+        raise ValueError(f"Connectivity frequency axis mismatch: data={values.shape}, freqs={frequencies.shape}")
     return values, frequencies
 
 
@@ -300,7 +332,22 @@ def _method_display_definition(method: str) -> tuple[str, str]:
         return "value_raw", "MIM raw unnormalised value; values >1 are retained"
     if method == "wpli2_debiased":
         return "value_raw", "wpli2_debiased raw value; negative finite estimates retained"
+    if method == "wpli":
+        return "value_raw", "wPLI raw channel-pair estimate; region display is an equal-weight channel-pair summary"
+    if method == "dpli":
+        return "value_raw", "dPLI raw ordered channel-pair estimate; 0.5 is the backend neutral reference"
     return "value_raw", "raw auxiliary bivariate estimate"
+
+
+def _region_pair_aggregation(method: str, config: dict[str, Any]) -> str:
+    """Resolve the explicit bivariate channel-pair aggregation rule."""
+    configured = str(config.get("connectivity", {}).get("region_pair_summary", "mean")).strip().lower()
+    if configured in {"median", "median_over_valid_channel_pairs"}:
+        return "median"
+    # Preserve the meaning of the previous default for old non-GUI configs.
+    if configured == "median_over_valid_channel_pairs_for_wpli_only" and method == "wpli2_debiased":
+        return "median"
+    return "mean"
 
 
 def _base_row(
@@ -319,11 +366,17 @@ def _base_row(
     aggregation_level: str,
     seed_channel: str = "",
     target_channel: str = "",
+    component_index: float | None = None,
+    n_components_requested: int | None = None,
+    n_components_returned: int | None = None,
 ) -> dict[str, Any]:
     definition, note = _method_display_definition(method)
     return {
         "region_a": region_a,
         "region_b": region_b,
+        "seed_region": region_a,
+        "target_region": region_b,
+        "direction_order": f"{region_a}->{region_b}",
         "method": method,
         "aggregation_level": aggregation_level,
         "seed_channel": seed_channel,
@@ -334,6 +387,9 @@ def _base_row(
         "n_target_channels": len(target_group),
         "rank_seed": rank_seed,
         "rank_target": rank_target,
+        "component_index": component_index,
+        "n_components_requested": n_components_requested,
+        "n_components_returned": n_components_returned,
         "frequency_hz": float(frequency),
         "value_raw": float(value) if np.isfinite(value) else np.nan,
         "value_strength": abs(float(value)) if method == "mic" and np.isfinite(value) else (float(value) if np.isfinite(value) else np.nan),
@@ -367,63 +423,89 @@ def _pattern_rows(connection: Any, region_a: str, region_b: str, seed_group: pd.
     if patterns is None:
         return []
     array = np.asarray(patterns, dtype=float)
-    if array.ndim != 4:
+    # MNE-Connectivity 0.9: single component is
+    # (2, n_connections, n_channels, n_freqs), while multiple MIC
+    # components are (2, n_connections, n_components, n_channels, n_freqs).
+    if array.ndim == 4:
+        array = array[:, :, None, :, :]
+    if array.ndim != 5:
         return []
     rows: list[dict[str, Any]] = []
     for side, group in enumerate((seed_group, target_group)):
         if side >= array.shape[0]:
             continue
-        side_array = array[side]
-        if side_array.ndim == 3:
-            side_array = side_array[0]
-        for channel_index, channel_name in enumerate(group["channel_name"]):
-            if channel_index >= side_array.shape[0]:
-                continue
-            for frequency_index, value in enumerate(side_array[channel_index]):
-                rows.append(
-                    {
-                        "region_a": region_a,
-                        "region_b": region_b,
-                        "method": "mic",
-                        "pattern_role": "seed" if side == 0 else "target",
-                        "channel_name": channel_name,
-                        "array_index": int(group.iloc[channel_index]["array_index"]),
-                        "frequency_hz": float(connection.freqs[frequency_index]),
-                        "pattern_value": float(value),
-                        "pattern_note": "official MIC spatial pattern; not a direct biological contribution weight",
-                    }
-                )
+        side_array = array[side, 0]
+        n_components = side_array.shape[0]
+        if side_array.ndim != 3:
+            continue
+        for component_index in range(n_components):
+            component_array = side_array[component_index]
+            for channel_index, channel_name in enumerate(group["channel_name"]):
+                if channel_index >= component_array.shape[0]:
+                    continue
+                for frequency_index, value in enumerate(component_array[channel_index]):
+                    rows.append(
+                        {
+                            "region_a": region_a,
+                            "region_b": region_b,
+                            "method": "mic",
+                            "component_index": component_index + 1,
+                            "n_components_returned": n_components,
+                            "pattern_role": "seed" if side == 0 else "target",
+                            "channel_name": channel_name,
+                            "array_index": int(group.iloc[channel_index]["array_index"]),
+                            "frequency_hz": float(connection.freqs[frequency_index]),
+                            "pattern_value": float(value),
+                            "pattern_note": "official MIC spatial pattern; not a direct biological contribution weight",
+                        }
+                    )
     return rows
 
 
-def _summarize_region_spectrum(spectrum: pd.DataFrame) -> pd.DataFrame:
+def _summarize_region_spectrum(spectrum: pd.DataFrame, config: dict[str, Any] | None = None) -> pd.DataFrame:
     if spectrum.empty:
         return pd.DataFrame()
+    component_column = "component_index" if "component_index" in spectrum.columns else None
+    group_columns = ["method", "region_a", "region_b"]
+    if component_column:
+        group_columns.append(component_column)
+    group_columns.append("frequency_hz")
     rows: list[dict[str, Any]] = []
-    for keys, group in spectrum.groupby(["method", "region_a", "region_b", "frequency_hz"], dropna=False):
-        method, region_a, region_b, frequency = keys
+    for keys, group in spectrum.groupby(group_columns, dropna=False):
+        if component_column:
+            method, region_a, region_b, component_index, frequency = keys
+        else:
+            method, region_a, region_b, frequency = keys
+            component_index = np.nan
         if group["aggregation_level"].iloc[0] == "multivariate_region_pair":
             value = float(group["value_raw"].iloc[0])
             strength = abs(value) if method == "mic" else value
             n_pairs = np.nan
             n_negative = int(np.sum(group["value_raw"] < 0))
         else:
-            value = float(group["value_raw"].median())
+            pair_columns = ["seed_channel", "target_channel"]
+            if all(column in group.columns for column in pair_columns):
+                pair_values = group.groupby(pair_columns, dropna=False)["value_raw"].mean()
+            else:
+                pair_values = group["value_raw"]
+            aggregation = _region_pair_aggregation(str(method), config or {})
+            value = float(pair_values.median() if aggregation == "median" else pair_values.mean())
             strength = value
-            n_pairs = int(group["value_raw"].notna().sum())
-            n_negative = int(np.sum(group["value_raw"] < 0))
+            n_pairs = int(pair_values.notna().sum())
+            n_negative = int(np.sum(pair_values < 0))
         first = group.iloc[0]
         rows.append(
             {
                 "method": method,
                 "region_a": region_a,
                 "region_b": region_b,
+                "component_index": component_index,
                 "frequency_hz": float(frequency),
                 "value_raw": value,
                 "value_strength": strength,
                 "n_channel_pairs": n_pairs,
                 "n_negative_estimates": n_negative,
-                "aggregation_definition": "multivariate result" if group["aggregation_level"].iloc[0] == "multivariate_region_pair" else "median across valid cross-region channel pairs",
+                "aggregation_definition": "multivariate result" if group["aggregation_level"].iloc[0] == "multivariate_region_pair" else f"{_region_pair_aggregation(str(method), config or {})} across valid cross-region channel pairs",
                 "n_epochs": first["n_epochs"],
                 "effective_duration_s": first["effective_duration_s"],
                 "rank_seed": first["rank_seed"],
@@ -431,7 +513,11 @@ def _summarize_region_spectrum(spectrum: pd.DataFrame) -> pd.DataFrame:
                 "frequency_is_excluded_line_noise": first["frequency_is_excluded_line_noise"],
                 "spectral_mode": first["spectral_mode"],
                 "mt_bandwidth_hz": first["mt_bandwidth_hz"],
+                "mt_adaptive": first.get("mt_adaptive", np.nan),
+                "mt_low_bias": first.get("mt_low_bias", np.nan),
                 "n_tapers": first["n_tapers"],
+                "n_components_requested": first.get("n_components_requested", np.nan),
+                "n_components_returned": first.get("n_components_returned", np.nan),
             }
         )
     return pd.DataFrame(rows)
@@ -442,32 +528,54 @@ def _band_summary(spectrum: pd.DataFrame, config: dict[str, Any]) -> pd.DataFram
         return pd.DataFrame()
     bands = config.get("bands", {})
     rows: list[dict[str, Any]] = []
-    for (method, region_a, region_b), group in spectrum.groupby(["method", "region_a", "region_b"], dropna=False):
+    group_columns = ["method", "region_a", "region_b"]
+    if "component_index" in spectrum.columns:
+        group_columns.append("component_index")
+    for keys, group in spectrum.groupby(group_columns, dropna=False):
+        if len(group_columns) == 4:
+            method, region_a, region_b, component_index = keys
+        else:
+            method, region_a, region_b = keys
+            component_index = np.nan
         for band, bounds in bands.items():
             in_band = group.loc[(group["frequency_hz"] >= float(bounds[0])) & (group["frequency_hz"] <= float(bounds[1]))].copy()
             used = in_band.loc[~in_band["frequency_is_excluded_line_noise"]].copy()
             if used.empty:
-                rows.append({"method": method, "region_a": region_a, "region_b": region_b, "band": band, "band_low_hz": bounds[0], "band_high_hz": bounds[1], "status": "no_frequency_bins_in_range"})
+                rows.append(
+                    {
+                        "method": method,
+                        "region_a": region_a,
+                        "region_b": region_b,
+                        "component_index": component_index,
+                        "band": band,
+                        "band_low_hz": bounds[0],
+                        "band_high_hz": bounds[1],
+                        "status": "no_frequency_bins_in_range",
+                    }
+                )
                 continue
-            if method == "wpli2_debiased":
-                per_pair = used.groupby(["seed_channel", "target_channel"], dropna=False)["value_raw"].mean()
-                value = float(per_pair.median())
-                definition = "mean_across_frequency_then_median_across_channel_pairs"
-                n_pairs = int(per_pair.size)
-            elif method == "mic":
+            if method == "mic":
                 value = float(np.mean(np.abs(used["value_raw"])))
                 definition = "mean_absolute_MIC_across_frequency"
                 n_pairs = np.nan
             else:
-                value = float(np.mean(used["value_raw"]))
-                definition = "mean_raw_value_across_frequency"
-                n_pairs = np.nan
+                pair_columns = ["seed_channel", "target_channel"]
+                if all(column in used.columns for column in pair_columns):
+                    per_pair = used.groupby(pair_columns, dropna=False)["value_raw"].mean()
+                else:
+                    per_pair = used["value_raw"]
+                aggregation = _region_pair_aggregation(str(method), config)
+                value = float(per_pair.median() if aggregation == "median" else per_pair.mean())
+                definition = f"mean_across_frequency_then_{aggregation}_across_valid_channel_pairs"
+                n_pairs = int(per_pair.size)
             first = used.iloc[0]
+            coverage_fraction = float(used["frequency_hz"].nunique() / max(1, in_band["frequency_hz"].nunique()))
             rows.append(
                 {
                     "method": method,
                     "region_a": region_a,
                     "region_b": region_b,
+                    "component_index": component_index,
                     "band": band,
                     "band_low_hz": float(bounds[0]),
                     "band_high_hz": float(bounds[1]),
@@ -477,12 +585,86 @@ def _band_summary(spectrum: pd.DataFrame, config: dict[str, Any]) -> pd.DataFram
                     "n_channel_pairs": n_pairs,
                     "n_frequencies_used": int(used["frequency_hz"].nunique()),
                     "n_frequencies_excluded_line_noise": int(in_band["frequency_is_excluded_line_noise"].sum()),
-                    "frequency_coverage_fraction": float(used["frequency_hz"].nunique() / max(1, in_band["frequency_hz"].nunique())),
+                    "frequency_coverage_fraction": coverage_fraction,
                     "n_epochs": first["n_epochs"],
                     "effective_duration_s": first["effective_duration_s"],
                     "rank_seed": first["rank_seed"],
                     "rank_target": first["rank_target"],
-                    "status": "ok",
+                    "n_components_requested": first.get("n_components_requested", np.nan),
+                    "n_components_returned": first.get("n_components_returned", np.nan),
+                    "status": "ok" if coverage_fraction >= 1.0 else "partial_frequency_coverage",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _channel_pair_band_summary(spectrum: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    """Summarise each saved bivariate channel pair within each configured band."""
+    if spectrum.empty or "aggregation_level" not in spectrum.columns:
+        return pd.DataFrame()
+    pair_spectrum = spectrum.loc[spectrum["aggregation_level"].astype(str).eq("cross_region_channel_pair")].copy()
+    if pair_spectrum.empty:
+        return pd.DataFrame()
+    group_columns = ["method", "region_a", "region_b", "seed_channel", "target_channel"]
+    rows: list[dict[str, Any]] = []
+    for keys, group in pair_spectrum.groupby(group_columns, dropna=False):
+        method, region_a, region_b, seed_channel, target_channel = keys
+        for band, bounds in (config.get("bands", {}) or {}).items():
+            in_band = group.loc[
+                (group["frequency_hz"] >= float(bounds[0]))
+                & (group["frequency_hz"] <= float(bounds[1]))
+            ].copy()
+            used = in_band.loc[~in_band["frequency_is_excluded_line_noise"].fillna(False)].copy()
+            first = group.iloc[0]
+            if used.empty:
+                rows.append(
+                    {
+                        "method": method,
+                        "region_a": region_a,
+                        "region_b": region_b,
+                        "seed_region": region_a,
+                        "target_region": region_b,
+                        "direction_order": f"{region_a}->{region_b}",
+                        "seed_channel": seed_channel,
+                        "target_channel": target_channel,
+                        "band": band,
+                        "band_low_hz": float(bounds[0]),
+                        "band_high_hz": float(bounds[1]),
+                        "value_raw_or_summary": np.nan,
+                        "value_strength": np.nan,
+                        "n_frequencies_used": 0,
+                        "n_epochs": first.get("n_epochs", np.nan),
+                        "effective_duration_s": first.get("effective_duration_s", np.nan),
+                        "status": "no_frequency_bins_in_range",
+                    }
+                )
+                continue
+            value = float(used["value_raw"].mean())
+            coverage_fraction = float(used["frequency_hz"].nunique() / max(1, in_band["frequency_hz"].nunique()))
+            rows.append(
+                {
+                    "method": method,
+                    "region_a": region_a,
+                    "region_b": region_b,
+                    "seed_region": region_a,
+                    "target_region": region_b,
+                    "direction_order": f"{region_a}->{region_b}",
+                    "seed_channel": seed_channel,
+                    "target_channel": target_channel,
+                    "band": band,
+                    "band_low_hz": float(bounds[0]),
+                    "band_high_hz": float(bounds[1]),
+                    "value_raw_or_summary": value,
+                    "value_strength": value,
+                    "aggregation_definition": "mean_across_frequency_within_one_channel_pair",
+                    "n_frequencies_used": int(used["frequency_hz"].nunique()),
+                    "n_frequencies_excluded_line_noise": int(in_band["frequency_is_excluded_line_noise"].fillna(False).sum()),
+                    "frequency_coverage_fraction": coverage_fraction,
+                    "n_epochs": first.get("n_epochs", np.nan),
+                    "effective_duration_s": first.get("effective_duration_s", np.nan),
+                    "rank_seed": first.get("rank_seed", np.nan),
+                    "rank_target": first.get("rank_target", np.nan),
+                    "status": "ok" if coverage_fraction >= 1.0 else "partial_frequency_coverage",
                 }
             )
     return pd.DataFrame(rows)
@@ -495,6 +677,7 @@ def _connectivity_input_checks(data: np.ndarray, sfreq: float, quality_epoch: pd
     fmax = float(conn_cfg.get("fmax_hz", 100.0))
     lowpass = _as_float(expected.get("preprocessed_lowpass_hz"), 200.0)
     highpass = _as_float(expected.get("preprocessed_highpass_hz"), 1.0)
+    low_frequency_cycles = fmin * data.shape[-1] / sfreq
     fail_count = int(quality_epoch.get("quality_status", pd.Series(dtype=str)).astype(str).eq("fail").sum())
     warn_count = int(quality_epoch.get("quality_status", pd.Series(dtype=str)).astype(str).eq("warn").sum())
     rows = [
@@ -504,8 +687,12 @@ def _connectivity_input_checks(data: np.ndarray, sfreq: float, quality_epoch: pd
         {"check": "quality_warn_epoch_count", "value": warn_count, "status": "ok" if warn_count == 0 else "warn", "note": "warn epochs are retained unless quality status is fail"},
         {"check": "nonfinite_epoch_count", "value": n_nonfinite_epochs, "status": "ok" if n_nonfinite_epochs == 0 else "fail", "note": "nonfinite epochs are excluded from spectral estimation"},
         {"check": "low_frequency_edge", "value": fmin, "status": "ok" if fmin >= highpass + 1.0 else "warn", "note": f"connectivity fmin={fmin:g} Hz; known/configured high-pass edge={highpass:g} Hz"},
+        {"check": "low_frequency_cycles", "value": low_frequency_cycles, "status": "ok" if low_frequency_cycles >= 5.0 else "warn", "note": "MNE-Connectivity recommends enough cycles within each epoch; values below 5 cycles are marked as potentially unreliable"},
         {"check": "high_frequency_edge", "value": fmax, "status": "ok" if fmax <= lowpass - 5.0 else "warn", "note": f"connectivity fmax={fmax:g} Hz; known/configured low-pass edge={lowpass:g} Hz"},
         {"check": "line_noise_policy", "value": ",".join(str(x) for x in conn_cfg.get("exclude_line_noise_hz", [])), "status": "ok", "note": "line-noise bins are flagged/excluded in band summaries; no extra notch or rereference is applied"},
+        {"check": "spectral_parameters", "value": f"methods={','.join(str(method) for method in conn_cfg.get('methods', []))}; mode={conn_cfg.get('mode', 'multitaper')}; faverage=False; fdecim={int(conn_cfg.get('fdecim', 1))}; n_jobs={int(conn_cfg.get('n_jobs', 1))}", "status": "ok", "note": "full frequency grid retained; input is aligned epoch-wise time-domain data and epochs are not concatenated"},
+        {"check": "multivariate_parameters", "value": f"rank_strategy={conn_cfg.get('rank_strategy', 'data_driven_energy_99pct')}; n_components={int(conn_cfg.get('n_components', 1))}", "status": "ok", "note": "rank is used only for MIC/MIM; MIC component count does not change MIM total interaction"},
+        {"check": "bivariate_parameters", "value": f"region_pair_summary={_region_pair_aggregation('wpli', config)}; dpli_zero_imaginary_csd=0.5", "status": "ok", "note": "wPLI/dPLI are estimated for every selected cross-region channel pair; dPLI retains both ordered directions"},
         {"check": "reference_policy", "value": "acquisition_reference_preserved", "status": "ok", "note": "no bipolar, within-region average, orthogonalisation, or FOOOF-derived cross-spectrum is used"},
     ]
     return pd.DataFrame(rows)
@@ -526,12 +713,38 @@ def _run_rank_sensitivity(data: np.ndarray, sfreq: float, region_info: dict[str,
             rank_seed = max(1, min(len(seed_group), seed_base + offset))
             rank_target = max(1, min(len(target_group), target_base + offset))
             try:
-                results = _estimate_multivariate(data[valid_epoch], sfreq, region_info["region_indices"][region_a], region_info["region_indices"][region_b], rank_seed, rank_target, config)
-                for method, connection in zip(MULTIVARIATE_METHODS, results):
+                requested_methods = [method for method in MULTIVARIATE_METHODS if method in conn_cfg.get("methods", MULTIVARIATE_METHODS)]
+                results = _estimate_multivariate(
+                    data[valid_epoch],
+                    sfreq,
+                    region_info["region_indices"][region_a],
+                    region_info["region_indices"][region_b],
+                    rank_seed,
+                    rank_target,
+                    requested_methods,
+                    config,
+                )
+                for method, connection in results.items():
                     values, frequencies = _connection_values(connection)
-                    metric = np.abs(values[0]) if method == "mic" else values[0]
-                    metric = metric[~_line_noise_mask(frequencies, config)]
-                    rows.append({"region_a": region_a, "region_b": region_b, "method": method, "rank_offset": offset, "rank_seed": rank_seed, "rank_target": rank_target, "mean_strength_2_100hz": float(np.nanmean(metric)), "max_strength_2_100hz": float(np.nanmax(metric)), "n_epochs": int(np.sum(valid_epoch)), "status": "ok"})
+                    keep = ~_line_noise_mask(frequencies, config)
+                    for component_index in range(values.shape[1]):
+                        metric = np.abs(values[0, component_index]) if method == "mic" else values[0, component_index]
+                        metric = metric[keep]
+                        rows.append(
+                            {
+                                "region_a": region_a,
+                                "region_b": region_b,
+                                "method": method,
+                                "component_index": component_index + 1 if method == "mic" else np.nan,
+                                "rank_offset": offset,
+                                "rank_seed": rank_seed,
+                                "rank_target": rank_target,
+                                "mean_strength_2_100hz": float(np.nanmean(metric)),
+                                "max_strength_2_100hz": float(np.nanmax(metric)),
+                                "n_epochs": int(np.sum(valid_epoch)),
+                                "status": "ok",
+                            }
+                        )
             except Exception as exc:  # noqa: BLE001 - retain failed sensitivity checks
                 rows.append({"region_a": region_a, "region_b": region_b, "rank_offset": offset, "rank_seed": rank_seed, "rank_target": rank_target, "status": f"failed: {type(exc).__name__}: {exc}"})
     return pd.DataFrame(rows)
@@ -571,20 +784,143 @@ def _run_segment_stability(data: np.ndarray, sfreq: float, region_info: dict[str
         subset_data = data[indices]
         for region_a, region_b in selected_region_pairs(tuple(region_info["groups"]), config):
             try:
-                multivariate = _estimate_multivariate(subset_data, sfreq, region_info["region_indices"][region_a], region_info["region_indices"][region_b], region_info["rank_map"][region_a], region_info["rank_map"][region_b], config)
-                for method, connection in zip(MULTIVARIATE_METHODS, multivariate):
+                requested_methods = [method for method in MULTIVARIATE_METHODS if method in conn_cfg.get("methods", MULTIVARIATE_METHODS)]
+                multivariate = _estimate_multivariate(
+                    subset_data,
+                    sfreq,
+                    region_info["region_indices"][region_a],
+                    region_info["region_indices"][region_b],
+                    region_info["rank_map"][region_a],
+                    region_info["rank_map"][region_b],
+                    requested_methods,
+                    config,
+                )
+                for method, connection in multivariate.items():
                     values, frequencies = _connection_values(connection)
                     keep = ~_line_noise_mask(frequencies, config)
-                    metric = np.abs(values[0]) if method == "mic" else values[0]
-                    rows.append({"check_type": "segment_stability", "subset_name": subset_name, "region_a": region_a, "region_b": region_b, "method": method, "mean_strength_2_100hz": float(np.nanmean(metric[keep])), "n_epochs": len(indices), "effective_duration_s": float(len(indices) * data.shape[-1] / sfreq), "status": "ok"})
-                bivariate = _estimate_bivariate(subset_data, sfreq, region_info["region_indices"][region_a], region_info["region_indices"][region_b], ["wpli2_debiased"], config)
-                values, frequencies = _connection_values(bivariate[0])
-                keep = ~_line_noise_mask(frequencies, config)
-                pair_means = np.nanmean(values[:, keep], axis=1)
-                rows.append({"check_type": "segment_stability", "subset_name": subset_name, "region_a": region_a, "region_b": region_b, "method": "wpli2_debiased", "mean_strength_2_100hz": float(np.nanmedian(pair_means)), "n_epochs": len(indices), "effective_duration_s": float(len(indices) * data.shape[-1] / sfreq), "status": "ok", "n_channel_pairs": int(values.shape[0])})
+                    for component_index in range(values.shape[1]):
+                        metric = np.abs(values[0, component_index]) if method == "mic" else values[0, component_index]
+                        rows.append(
+                            {
+                                "check_type": "segment_stability",
+                                "subset_name": subset_name,
+                                "region_a": region_a,
+                                "region_b": region_b,
+                                "method": method,
+                                "component_index": component_index + 1 if method == "mic" else np.nan,
+                                "mean_strength_2_100hz": float(np.nanmean(metric[keep])),
+                                "n_epochs": len(indices),
+                                "effective_duration_s": float(len(indices) * data.shape[-1] / sfreq),
+                                "status": "ok",
+                            }
+                        )
+                configured_methods = conn_cfg.get("methods", ["mic", "mim", "wpli2_debiased"])
+                bivariate_methods = [method for method in BIVARIATE_METHODS if method in configured_methods]
+                if bivariate_methods:
+                    bivariate = _estimate_bivariate(
+                        subset_data,
+                        sfreq,
+                        region_info["region_indices"][region_a],
+                        region_info["region_indices"][region_b],
+                        bivariate_methods,
+                        config,
+                    )
+                    for method, connection in zip(bivariate_methods, bivariate, strict=True):
+                        values, frequencies = _connection_values(connection)
+                        keep = ~_line_noise_mask(frequencies, config)
+                        pair_means = np.nanmean(values[:, 0, keep], axis=1)
+                        aggregation = _region_pair_aggregation(method, config)
+                        summary_value = float(np.nanmedian(pair_means) if aggregation == "median" else np.nanmean(pair_means))
+                        rows.append({"check_type": "segment_stability", "subset_name": subset_name, "region_a": region_a, "region_b": region_b, "direction_order": f"{region_a}->{region_b}", "method": method, "mean_strength_2_100hz": summary_value, "aggregation_definition": f"mean_across_frequency_then_{aggregation}_across_channel_pairs", "n_epochs": len(indices), "effective_duration_s": float(len(indices) * data.shape[-1] / sfreq), "status": "ok", "n_channel_pairs": int(values.shape[0])})
+                    if "dpli" in bivariate_methods:
+                        reverse = _estimate_bivariate(
+                            subset_data,
+                            sfreq,
+                            region_info["region_indices"][region_b],
+                            region_info["region_indices"][region_a],
+                            ["dpli"],
+                            config,
+                        )[0]
+                        values, frequencies = _connection_values(reverse)
+                        keep = ~_line_noise_mask(frequencies, config)
+                        pair_means = np.nanmean(values[:, 0, keep], axis=1)
+                        aggregation = _region_pair_aggregation("dpli", config)
+                        summary_value = float(np.nanmedian(pair_means) if aggregation == "median" else np.nanmean(pair_means))
+                        rows.append({"check_type": "segment_stability", "subset_name": subset_name, "region_a": region_b, "region_b": region_a, "direction_order": f"{region_b}->{region_a}", "method": "dpli", "mean_strength_2_100hz": summary_value, "aggregation_definition": f"mean_across_frequency_then_{aggregation}_across_channel_pairs", "n_epochs": len(indices), "effective_duration_s": float(len(indices) * data.shape[-1] / sfreq), "status": "ok", "n_channel_pairs": int(values.shape[0])})
             except Exception as exc:  # noqa: BLE001 - retain failed stability checks
                 rows.append({"check_type": "segment_stability", "subset_name": subset_name, "region_a": region_a, "region_b": region_b, "status": f"failed: {type(exc).__name__}: {exc}"})
     return pd.DataFrame(rows)
+
+
+def _append_bivariate_rows(
+    rows: list[dict[str, Any]],
+    failure_rows: list[dict[str, Any]],
+    data: np.ndarray,
+    sfreq: float,
+    region_a: str,
+    region_b: str,
+    seed_group: pd.DataFrame,
+    target_group: pd.DataFrame,
+    seed_indices: np.ndarray,
+    target_indices: np.ndarray,
+    rank_seed: int,
+    rank_target: int,
+    methods: list[str],
+    n_epochs: int,
+    effective_duration: float,
+    channel_table: pd.DataFrame,
+    config: dict[str, Any],
+) -> None:
+    """Append ordered bivariate channel-pair rows and retain pair failures."""
+    if not methods:
+        return
+    try:
+        results = _estimate_bivariate(data, sfreq, seed_indices, target_indices, methods, config)
+        pair_rows = list(zip(np.repeat(seed_indices, len(target_indices)), np.tile(target_indices, len(seed_indices))))
+        expected_pairs = len(pair_rows)
+        for method, connection in zip(methods, results, strict=True):
+            values, frequencies = _connection_values(connection)
+            if values.shape[0] != expected_pairs:
+                raise ValueError(f"{method} returned {values.shape[0]} channel pairs; expected {expected_pairs}")
+            meta = _spectral_meta(connection, config)
+            line_noise = _line_noise_mask(frequencies, config)
+            for pair_index, (seed_index, target_index) in enumerate(pair_rows):
+                seed_channel = channel_table.loc[channel_table["array_index"] == seed_index, "channel_name"].iloc[0]
+                target_channel = channel_table.loc[channel_table["array_index"] == target_index, "channel_name"].iloc[0]
+                for frequency_index, frequency in enumerate(frequencies):
+                    row = _base_row(
+                        region_a,
+                        region_b,
+                        seed_group,
+                        target_group,
+                        method,
+                        frequency,
+                        values[pair_index, 0, frequency_index],
+                        n_epochs,
+                        effective_duration,
+                        rank_seed,
+                        rank_target,
+                        meta,
+                        "cross_region_channel_pair",
+                        str(seed_channel),
+                        str(target_channel),
+                    )
+                    row["frequency_is_excluded_line_noise"] = bool(line_noise[frequency_index])
+                    row["n_channel_pairs_total"] = expected_pairs
+                    rows.append(row)
+    except Exception as exc:  # noqa: BLE001 - preserve pair-level failure
+        failure_rows.append(
+            {
+                "region_a": region_a,
+                "region_b": region_b,
+                "method": ",".join(methods),
+                "failure_reason": f"{type(exc).__name__}: {exc}",
+                "n_epochs": n_epochs,
+                "rank_seed": rank_seed,
+                "rank_target": rank_target,
+                "n_components_requested": np.nan,
+            }
+        )
 
 
 def compute_connectivity(
@@ -594,15 +930,17 @@ def compute_connectivity(
     quality_epoch: pd.DataFrame,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Estimate MIC, MIM and wPLI² across valid epochs without concatenation."""
+    """Estimate selected multivariate and bivariate connectivity without concatenation."""
     conn_cfg = config.get("connectivity", {})
-    methods = [str(method) for method in conn_cfg.get("methods", ["mic", "mim", "wpli2_debiased"])]
+    methods = [str(method).strip().lower() for method in conn_cfg.get("methods", ["mic", "mim", "wpli2_debiased"])]
+    requested_components = int(conn_cfg.get("n_components", 1))
     unsupported = sorted(set(methods) - set(MULTIVARIATE_METHODS) - set(BIVARIATE_METHODS))
     empty: dict[str, Any] = {
         "status": "not_run",
         "spectrum": pd.DataFrame(),
         "region_summary": pd.DataFrame(),
         "band_summary": pd.DataFrame(),
+        "channel_pair_band_summary": pd.DataFrame(),
         "patterns": pd.DataFrame(),
         "redundancy_correlation": pd.DataFrame(),
         "redundancy_singular_values": pd.DataFrame(),
@@ -627,6 +965,9 @@ def compute_connectivity(
     min_epochs = int(conn_cfg.get("min_epochs", 5))
     empty["epoch_profile"] = _epoch_signal_profile(array_data, valid_epoch)
     empty["input_checks"] = _connectivity_input_checks(array_data, sfreq, quality_epoch, valid_epoch, config, n_nonfinite_epochs)
+    if n_valid < 2:
+        empty["status"] = f"not_run_insufficient_valid_epochs_for_cross_epoch_estimate: {n_valid} < 2"
+        return empty
     if n_valid < min_epochs:
         empty["status"] = f"not_run_insufficient_valid_epochs: {n_valid} < {min_epochs}"
         return empty
@@ -642,43 +983,131 @@ def compute_connectivity(
         target_indices = region_info["region_indices"][region_b]
         rank_seed = region_info["rank_map"][region_a]
         rank_target = region_info["rank_map"][region_b]
-        if any(method in methods for method in MULTIVARIATE_METHODS):
+        multivariate_methods = [method for method in MULTIVARIATE_METHODS if method in methods]
+        if requested_components < 1 and "mic" in multivariate_methods:
+            failure_rows.append(
+                {
+                    "region_a": region_a,
+                    "region_b": region_b,
+                    "method": "mic",
+                    "failure_reason": "n_components must be at least 1",
+                    "n_epochs": n_valid,
+                    "rank_seed": rank_seed,
+                    "rank_target": rank_target,
+                    "n_components_requested": requested_components,
+                }
+            )
+            multivariate_methods.remove("mic")
+        if "mic" in multivariate_methods and requested_components > min(rank_seed, rank_target):
+            failure_rows.append(
+                {
+                    "region_a": region_a,
+                    "region_b": region_b,
+                    "method": "mic",
+                    "failure_reason": f"n_components={requested_components} exceeds min(actual rank {rank_seed}, {rank_target})",
+                    "n_epochs": n_valid,
+                    "rank_seed": rank_seed,
+                    "rank_target": rank_target,
+                    "n_components_requested": requested_components,
+                }
+            )
+            multivariate_methods.remove("mic")
+        if multivariate_methods:
             try:
-                multivariate = _estimate_multivariate(array_data[valid_epoch], sfreq, seed_indices, target_indices, rank_seed, rank_target, config)
-                for method, connection in zip(MULTIVARIATE_METHODS, multivariate):
-                    if method not in methods:
-                        continue
+                multivariate = _estimate_multivariate(
+                    array_data[valid_epoch],
+                    sfreq,
+                    seed_indices,
+                    target_indices,
+                    rank_seed,
+                    rank_target,
+                    multivariate_methods,
+                    config,
+                )
+                for method, connection in multivariate.items():
                     values, frequencies = _connection_values(connection)
                     meta = _spectral_meta(connection, config)
                     line_noise = _line_noise_mask(frequencies, config)
-                    for frequency_index, frequency in enumerate(frequencies):
-                        row = _base_row(region_a, region_b, seed_group, target_group, method, frequency, values[0, frequency_index], n_valid, effective_duration, rank_seed, rank_target, meta, "multivariate_region_pair")
-                        row["frequency_is_excluded_line_noise"] = bool(line_noise[frequency_index])
-                        rows.append(row)
+                    for component_index in range(values.shape[1]):
+                        component_label = component_index + 1 if method == "mic" else None
+                        for frequency_index, frequency in enumerate(frequencies):
+                            row = _base_row(
+                                region_a,
+                                region_b,
+                                seed_group,
+                                target_group,
+                                method,
+                                frequency,
+                                values[0, component_index, frequency_index],
+                                n_valid,
+                                effective_duration,
+                                rank_seed,
+                                rank_target,
+                                meta,
+                                "multivariate_region_pair",
+                                component_index=component_label,
+                                n_components_requested=requested_components,
+                                n_components_returned=values.shape[1],
+                            )
+                            row["frequency_is_excluded_line_noise"] = bool(line_noise[frequency_index])
+                            rows.append(row)
                     if method == "mic":
                         pattern_rows.extend(_pattern_rows(connection, region_a, region_b, seed_group, target_group))
             except Exception as exc:  # noqa: BLE001 - preserve pair-level failure
-                failure_rows.append({"region_a": region_a, "region_b": region_b, "method": "mic_mim", "failure_reason": f"{type(exc).__name__}: {exc}", "n_epochs": n_valid, "rank_seed": rank_seed, "rank_target": rank_target})
+                failure_rows.append(
+                    {
+                        "region_a": region_a,
+                        "region_b": region_b,
+                        "method": ",".join(multivariate_methods),
+                        "failure_reason": f"{type(exc).__name__}: {exc}",
+                        "n_epochs": n_valid,
+                        "rank_seed": rank_seed,
+                        "rank_target": rank_target,
+                        "n_components_requested": requested_components,
+                    }
+                )
         bivariate_methods = [method for method in BIVARIATE_METHODS if method in methods]
-        if bivariate_methods:
-            try:
-                bivariate = _estimate_bivariate(array_data[valid_epoch], sfreq, seed_indices, target_indices, bivariate_methods, config)
-                pair_count = len(seed_indices) * len(target_indices)
-                for method, connection in zip(bivariate_methods, bivariate):
-                    values, frequencies = _connection_values(connection)
-                    meta = _spectral_meta(connection, config)
-                    line_noise = _line_noise_mask(frequencies, config)
-                    pair_rows = list(zip(np.repeat(seed_indices, len(target_indices)), np.tile(target_indices, len(seed_indices))))
-                    for pair_index, (seed_index, target_index) in enumerate(pair_rows):
-                        seed_channel = channel_table.loc[channel_table["array_index"] == seed_index, "channel_name"].iloc[0]
-                        target_channel = channel_table.loc[channel_table["array_index"] == target_index, "channel_name"].iloc[0]
-                        for frequency_index, frequency in enumerate(frequencies):
-                            row = _base_row(region_a, region_b, seed_group, target_group, method, frequency, values[pair_index, frequency_index], n_valid, effective_duration, rank_seed, rank_target, meta, "cross_region_channel_pair", str(seed_channel), str(target_channel))
-                            row["frequency_is_excluded_line_noise"] = bool(line_noise[frequency_index])
-                            row["n_channel_pairs_total"] = pair_count
-                            rows.append(row)
-            except Exception as exc:  # noqa: BLE001 - preserve pair-level failure
-                failure_rows.append({"region_a": region_a, "region_b": region_b, "method": ",".join(bivariate_methods), "failure_reason": f"{type(exc).__name__}: {exc}", "n_epochs": n_valid, "rank_seed": rank_seed, "rank_target": rank_target})
+        _append_bivariate_rows(
+            rows,
+            failure_rows,
+            array_data[valid_epoch],
+            sfreq,
+            region_a,
+            region_b,
+            seed_group,
+            target_group,
+            seed_indices,
+            target_indices,
+            rank_seed,
+            rank_target,
+            bivariate_methods,
+            n_valid,
+            effective_duration,
+            channel_table,
+            config,
+        )
+        # dPLI is directional: retain both ordered estimates rather than
+        # mirroring the canonical region pair in the downstream matrix.
+        if "dpli" in bivariate_methods:
+            _append_bivariate_rows(
+                rows,
+                failure_rows,
+                array_data[valid_epoch],
+                sfreq,
+                region_b,
+                region_a,
+                target_group,
+                seed_group,
+                target_indices,
+                seed_indices,
+                rank_target,
+                rank_seed,
+                ["dpli"],
+                n_valid,
+                effective_duration,
+                channel_table,
+                config,
+            )
     spectrum = pd.DataFrame(rows)
     if spectrum.empty:
         empty.update({"status": "failed_empty_result", "redundancy_correlation": region_info["correlation"], "redundancy_singular_values": region_info["singular_values"], "rank_summary": region_info["summary"], "failures": pd.DataFrame(failure_rows, columns=FAILURE_COLUMNS)})
@@ -687,8 +1116,9 @@ def compute_connectivity(
         {
             "status": "ok" if not failure_rows else "ok_with_pair_failures",
             "spectrum": spectrum,
-            "region_summary": _summarize_region_spectrum(spectrum),
+            "region_summary": _summarize_region_spectrum(spectrum, config),
             "band_summary": _band_summary(spectrum, config),
+            "channel_pair_band_summary": _channel_pair_band_summary(spectrum, config),
             "patterns": pd.DataFrame(pattern_rows),
             "redundancy_correlation": region_info["correlation"],
             "redundancy_singular_values": region_info["singular_values"],
@@ -700,6 +1130,12 @@ def compute_connectivity(
                 "n_valid_epochs": n_valid,
                 "effective_valid_duration_s": effective_duration,
                 "methods_requested": methods,
+                "n_components_requested": requested_components,
+                "n_jobs": int(conn_cfg.get("n_jobs", 1)),
+                "selected_region_pairs": [list(pair) for pair in selected_region_pairs(tuple(region_info["groups"]), config)],
+                "channel_sets_by_region": {region: group["channel_name"].astype(str).tolist() for region, group in region_info["groups"].items()},
+                "selected_rank_by_region": {region: int(value) for region, value in region_info["rank_map"].items()},
+                "rank_selection_note": "auto rank is a reproducible numerical/data-coverage rule, not an optimal physiological dimension",
                 "spectral_mode": str(conn_cfg.get("mode", "multitaper")),
                 "mt_bandwidth_hz": _as_float(conn_cfg.get("mt_bandwidth_hz")),
                 "mt_adaptive": bool(conn_cfg.get("mt_adaptive", False)),
@@ -710,7 +1146,10 @@ def compute_connectivity(
                 "frequency_grid_definition": "MNE-Connectivity multitaper frequency grid; full grid retained in connectivity_spectrum.csv",
                 "line_noise_policy": "flagged and excluded only from configured band summaries; no extra notch or rereference",
                 "multivariate_interpretation": "MIC absolute value is a strength display; MIM is raw unnormalised and may exceed 1; neither is causal direction",
-                "wpli_interpretation": "wpli2_debiased remains squared and finite negative estimates are retained",
+                "wpli_interpretation": "wPLI is bounded [0, 1]; wpli2_debiased remains squared and finite negative estimates are retained",
+                "dpli_interpretation": "dPLI is computed for both ordered channel directions; backend uses heaviside(imag(CSD), 0.5), so exactly zero imaginary CSD contributes 0.5",
+                "dpli_neutral_reference": 0.5,
+                "region_pair_aggregation": str(conn_cfg.get("region_pair_summary", "mean")),
                 "identity_status": "file-level result only until animal/session/dose node metadata are registered",
             },
         }

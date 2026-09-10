@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INPUT_FILE = PROJECT_ROOT / "data" / "real" / "LID-T80_all_channels-epo.fif"
 
 # These paths normally stay unchanged.
-CONFIG_FILE = PROJECT_ROOT / "configs" / "default.yaml"
+CONFIG_FILE = PROJECT_ROOT / "configs" / "luna.yaml"
 METADATA_DIR = PROJECT_ROOT / "metadata"
 OUTPUT_DIR = PROJECT_ROOT / "results" / "pycharm_LID-T80"
 # ============================================================================

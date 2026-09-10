@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from .app_info import APP_VERSION
 from .config import load_config
 from .connectivity import compute_connectivity
 from .io import (
@@ -150,6 +151,7 @@ def run_single_file(
         _write_frame(connectivity["spectrum"], output / "connectivity_spectrum.csv")
         _write_frame(connectivity["region_summary"], output / "connectivity_region_summary.csv")
         _write_frame(connectivity["band_summary"], output / "connectivity_band_summary.csv")
+        _write_frame(connectivity["channel_pair_band_summary"], output / "connectivity_channel_pair_band_summary.csv")
         _write_frame(connectivity["patterns"], output / "connectivity_patterns.csv")
         _write_frame(connectivity["redundancy_correlation"], output / "connectivity_redundancy_correlation.csv")
         _write_frame(connectivity["redundancy_singular_values"], output / "connectivity_redundancy_singular_values.csv")
@@ -167,7 +169,7 @@ def run_single_file(
             figures / "connectivity_redundancy",
             dpi=int(config.get("plotting", {}).get("dpi", 150)),
         )
-        for method in ("mic", "mim", "wpli2_debiased"):
+        for method in ("mic", "mim", "wpli", "dpli", "wpli2_debiased"):
             if not connectivity["region_summary"].empty and method in set(connectivity["region_summary"].get("method", pd.Series(dtype=str))):
                 plot_connectivity_spectrum(
                     connectivity["region_summary"],
@@ -180,11 +182,14 @@ def run_single_file(
             figures / "connectivity_band_matrices",
             dpi=int(config.get("plotting", {}).get("dpi", 150)),
         )
-        plot_connectivity_channel_pairs(
-            connectivity["spectrum"],
-            figures / "connectivity_wpli2_debiased_channel_pairs",
-            dpi=int(config.get("plotting", {}).get("dpi", 150)),
-        )
+        for method in ("wpli", "dpli", "wpli2_debiased", "imcoh", "coh"):
+            if method in set(connectivity["spectrum"].get("method", pd.Series(dtype=str))):
+                plot_connectivity_channel_pairs(
+                    connectivity["spectrum"],
+                    figures / f"connectivity_{method}_channel_pairs",
+                    dpi=int(config.get("plotting", {}).get("dpi", 150)),
+                    method=method,
+                )
         if not connectivity["rank_sensitivity"].empty and "region_a" in connectivity["rank_sensitivity"]:
             plot_connectivity_rank_sensitivity(
                 connectivity["rank_sensitivity"],
@@ -235,7 +240,7 @@ def run_single_file(
     has_animal_id = animal_id is not None and not pd.isna(animal_id) and str(animal_id).strip().lower() not in {"", "nan", "none"}
     identity_status = "registered" if has_animal_id else "file_only_identity_unresolved"
     manifest = {
-        "analysis_version": "0.1.0",
+        "analysis_version": APP_VERSION,
         "input_path": str(input_path),
         "input_sha256": sha256_file(input_path),
         "input_size_bytes": input_path.stat().st_size,
