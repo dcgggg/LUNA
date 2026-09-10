@@ -1,9 +1,17 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/branding/luna-logo-on-white.svg">
-    <img src="assets/branding/luna-logo.svg" alt="LUNA — Local field potential Unified Network Analysis platform" width="420">
+    <img src="assets/branding/luna-logo.svg" alt="LUNA — Local field potential Unified Network Analysis platform" width="760">
   </picture>
 </p>
+
+<p align="center">
+  <a href="https://github.com/dcgggg/LUNA">GitHub 项目</a> ·
+  <a href="assets/branding/luna-logo.svg">SVG 矢量图</a> ·
+  <a href="assets/branding/luna-logo-600dpi.tiff">600 dpi TIFF</a>
+</p>
+
+弯月呼应 LUNA；参考北斗七星布局的七颗星及连线象征多脑区网络，水波中的七处星光倒影呼应连续的局部场电位信号。七星是视觉寓意，不限定可分析的脑区数量。
 
 # LUNA
 
@@ -335,3 +343,4 @@ GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/
 ## License
 
 当前仓库尚未声明开源许可证。如需公开复用，建议在 GitHub 仓库中根据作者和数据权限补充许可证；原始实验数据不应随代码仓库公开上传。
+
