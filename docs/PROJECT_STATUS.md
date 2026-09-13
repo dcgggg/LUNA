@@ -6,7 +6,7 @@
 
 | 项目 | 当前状态 | 证据/限制 |
 |---|---|---|
-| 软件版本 | `0.2.1` | 版本来源为 `src/lfp_analysis/__init__.py`，`pyproject.toml` 使用动态版本；本次按补丁版本准备预发布 |
+| 软件版本 | `0.2.2` | 版本来源为 `src/lfp_analysis/__init__.py`，`pyproject.toml` 使用动态版本；本次按补丁版本准备预发布 |
 | GUI 框架 | PySide6 + Matplotlib | `scripts/run_gui.py` → `lfp_analysis.gui.launch()` → `MainWindow` |
 | CLI | 可用 | `lfp-analysis.exe` 和 `python -m lfp_analysis.cli --help` 已核实；当前环境没有 `luna.exe` 别名 |
 | 测试 | 52 项通过 | 仅有第三方 FOOOF 弃用警告 |

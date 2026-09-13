@@ -2,6 +2,24 @@
 
 All notable changes to LUNA are documented here.
 
+## [0.2.2] — 2026-09-13 (prerelease)
+
+### Changed
+
+- Integrated the latest LUNA README introduction and official seven-star Indigo/Lavender branding assets from the canonical `dcgggg/LUNA` repository.
+- Added the high-resolution `luna-logo-600dpi.tiff` release asset alongside the SVG web resources.
+- Published the complete current local implementation, tests, development records, packaged resources, and GUI/connectivity refinements under the canonical repository location.
+
+### Validation
+
+- Re-ran the local test suite, Ruff, Python compilation, dependency checks, package version import, and wheel build for version `0.2.2`.
+- The release source excludes raw FIF files, virtual environments, caches, generated results, and local screenshots.
+
+### Known limitations
+
+- The supplied sample does not resolve animal/session identity, so animal-level inference and treatment/behavior conclusions remain disabled.
+- Native desktop mouse/DPI inspection is environment-dependent; offscreen Qt checks do not replace manual verification on every Windows display configuration.
+
 ## [0.2.1] — 2026-09-13 (prerelease)
 
 ### Changed
