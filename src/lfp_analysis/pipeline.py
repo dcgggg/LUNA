@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -7,8 +8,9 @@ from typing import Any
 import pandas as pd
 
 from .app_info import APP_VERSION
-from .config import load_config
+from .config import audit_config, load_config
 from .connectivity import compute_connectivity
+from .identity import normalize_path, resolve_registry_match, stable_file_uid
 from .io import (
     channel_info_table,
     epoch_trace_table,
@@ -48,12 +50,9 @@ def _write_frame(frame: pd.DataFrame, path: Path) -> None:
 
 def _file_registry_row(tables: dict[str, pd.DataFrame], input_path: Path) -> dict[str, Any] | None:
     files = tables.get("files", pd.DataFrame())
-    if files.empty or "file_path" not in files:
-        return None
-    candidates = files.loc[files["file_path"].astype(str).map(lambda value: Path(value).expanduser().resolve() == input_path)]
-    if candidates.empty:
-        candidates = files.loc[files["file_path"].astype(str).map(lambda value: Path(value).name == input_path.name)]
-    return candidates.iloc[0].to_dict() if not candidates.empty else None
+    match = resolve_registry_match(files, input_path)
+    row = match.get("registry_row")
+    return row if isinstance(row, dict) else None
 
 
 def run_single_file(
@@ -69,7 +68,10 @@ def run_single_file(
     tables = load_metadata_tables(metadata_dir)
     metadata_issues = validate_metadata_tables(tables)
     _write_frame(metadata_issues, output / "metadata_validation.csv")
-    registry_row = _file_registry_row(tables, input_path)
+    identity_match = resolve_registry_match(tables.get("files", pd.DataFrame()), input_path, metadata_dir)
+    registry_row = identity_match.get("registry_row") if isinstance(identity_match.get("registry_row"), dict) else None
+    loaded_sha256 = sha256_file(input_path)
+    file_uid = stable_file_uid(input_path, loaded_sha256)
     file_id = str(registry_row.get("file_id")) if registry_row and registry_row.get("file_id") else input_path.stem
 
     loaded = read_fif(input_path)
@@ -114,6 +116,7 @@ def run_single_file(
         max_epochs=int(config.get("plotting", {}).get("max_waveform_epochs", 6)),
         seconds=float(config.get("plotting", {}).get("waveform_seconds", 1.0)),
         title_prefix=f"{file_id}; input FIF is read-only",
+        regions=channel_table.set_index("channel_name").reindex(loaded.ch_names)["region"].fillna("未映射").astype(str).tolist() if "channel_name" in channel_table.columns and "region" in channel_table.columns else None,
     )
     plot_quality_matrix(quality["epoch_channel"], figures / "quality_epoch_channel", dpi=int(config.get("plotting", {}).get("dpi", 150)))
     plot_psd(psd_summary["channel"], figures / "psd_channel", dpi=int(config.get("plotting", {}).get("dpi", 150)))
@@ -147,7 +150,14 @@ def run_single_file(
 
     connectivity_status = "disabled_by_config"
     if bool(config.get("connectivity", {}).get("enabled", False)):
-        connectivity = compute_connectivity(loaded.data, loaded.sfreq, channel_table, quality["epoch"], config)
+        connectivity = compute_connectivity(
+            loaded.data,
+            loaded.sfreq,
+            channel_table,
+            quality["epoch"],
+            config,
+            analysis_task_id=f"{file_uid}/connectivity",
+        )
         _write_frame(connectivity["spectrum"], output / "connectivity_spectrum.csv")
         _write_frame(connectivity["region_summary"], output / "connectivity_region_summary.csv")
         _write_frame(connectivity["band_summary"], output / "connectivity_band_summary.csv")
@@ -161,6 +171,13 @@ def run_single_file(
         _write_frame(connectivity["epoch_profile"], output / "connectivity_epoch_profile.csv")
         _write_frame(connectivity["input_checks"], output / "connectivity_input_checks.csv")
         _write_frame(connectivity["failures"], output / "connectivity_failures.csv")
+        _write_frame(connectivity["frequency_diagnostics"], output / "connectivity_frequency_diagnostics.csv")
+        _write_frame(connectivity["roughness"], output / "connectivity_roughness.csv")
+        _write_frame(connectivity["band_cv"], output / "connectivity_band_cv.csv")
+        _write_frame(connectivity["binned_spectrum"], output / "connectivity_binned_spectrum.csv")
+        _write_frame(connectivity["display_spectrum"], output / "connectivity_display_spectrum.csv")
+        _write_frame(connectivity["display_roughness"], output / "connectivity_display_roughness.csv")
+        _write_frame(connectivity["estimation_calls"], output / "connectivity_estimation_calls.csv")
         write_json(connectivity["metadata"], output / "connectivity_metadata.json")
         plot_connectivity_redundancy(
             connectivity["redundancy_correlation"],
@@ -237,16 +254,29 @@ def run_single_file(
     expected = config.get("expected_data", {})
     file_quality = quality["file"].iloc[0].to_dict()
     animal_id = registry_row.get("animal_id") if registry_row else None
+    session_id = registry_row.get("session_id") if registry_row else None
     has_animal_id = animal_id is not None and not pd.isna(animal_id) and str(animal_id).strip().lower() not in {"", "nan", "none"}
-    identity_status = "registered" if has_animal_id else "file_only_identity_unresolved"
+    has_session_id = session_id is not None and not pd.isna(session_id) and str(session_id).strip().lower() not in {"", "nan", "none"}
+    identity_status = "registered" if has_animal_id and has_session_id else "file_only_identity_unresolved"
     manifest = {
+        "schema_version": 2,
         "analysis_version": APP_VERSION,
+        "status": "completed",
         "input_path": str(input_path),
-        "input_sha256": sha256_file(input_path),
+        "input_sha256": loaded_sha256,
         "input_size_bytes": input_path.stat().st_size,
         "file_id": file_id,
+        "file_uid": file_uid,
+        "file_stem": input_path.stem,
+        "display_name": input_path.name,
         "identity_status": identity_status,
+        "registry_file_id": registry_row.get("file_id", "") if registry_row else "",
+        "registry_match_status": identity_match.get("status", "unregistered"),
+        "registry_match_candidates": identity_match.get("candidate_file_ids", []),
         "registry_row": registry_row,
+        "metadata_validation_error_count": int((metadata_issues.get("severity", pd.Series(dtype=str)) == "error").sum()),
+        "metadata_validation_warning_count": int((metadata_issues.get("severity", pd.Series(dtype=str)) == "warning").sum()),
+        "configuration_audit": audit_config(config),
         "n_epochs": int(loaded.data.shape[0]),
         "n_channels": int(loaded.data.shape[1]),
         "n_times": int(loaded.data.shape[2]),
@@ -274,7 +304,7 @@ def run_single_file(
         "animal_level_statistics_run": False,
         "limitations": [
             "Actual_record_start/end are not inferred from event values.",
-            "No animal-level inference is run when identity metadata is absent.",
+            "No animal-level inference is run when identity metadata is absent or ambiguous.",
             "Quality flags are not silent exclusions.",
         ],
     }
@@ -284,37 +314,97 @@ def run_single_file(
 
 
 def run_batch(files_csv: str | Path, config_path: str | Path, output_dir: str | Path, metadata_dir: str | Path = "metadata") -> pd.DataFrame:
-    files = pd.read_csv(files_csv, dtype=str)
+    files = pd.read_csv(files_csv, dtype=str).fillna("")
     rows: list[dict[str, Any]] = []
-    output_root = Path(output_dir)
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    def text(value: Any) -> str:
+        return "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value).strip()
+
+    tables = load_metadata_tables(metadata_dir)
+    metadata_issues = validate_metadata_tables(tables)
+    metadata_errors = int((metadata_issues.get("severity", pd.Series(dtype=str)) == "error").sum())
+    metadata_error_reason = "metadata_validation_error" if metadata_errors else ""
+    active: list[dict[str, Any]] = []
+    path_rows: dict[str, list[int]] = {}
+    target_rows: dict[str, list[int]] = {}
+
     for index, row in files.iterrows():
-        file_path = str(row.get("file_path", "")).strip()
-        result = {
+        file_path = text(row.get("file_path", ""))
+        explicit_file_id = text(row.get("file_id", ""))
+        result: dict[str, Any] = {
             "row_index": int(index),
-            "file_id": row.get("file_id", ""),
+            "file_id": explicit_file_id,
+            "file_uid": "",
             "file_path": file_path,
             "status": "skipped",
             "reason": "",
             "output_dir": "",
         }
-        if str(row.get("include_file_level", "")).lower() in {"false", "0", "no"}:
+        if text(row.get("include_file_level", "")).lower() in {"false", "0", "no"}:
             result["reason"] = "include_file_level=false"
             rows.append(result)
             continue
-        path = Path(file_path).expanduser()
+        if metadata_error_reason:
+            result["reason"] = metadata_error_reason
+            rows.append(result)
+            continue
+        if not file_path:
+            result["reason"] = "missing_file_path"
+            rows.append(result)
+            continue
+        path = normalize_path(file_path, Path(files_csv).expanduser().resolve().parent)
         if not path.is_file():
             result["reason"] = "file_not_found"
             rows.append(result)
             continue
-        file_id = str(row.get("file_id") or path.stem)
-        target = output_root / file_id
+        file_id = explicit_file_id or path.stem
+        safe_file_id = "".join(char if char.isalnum() or char in "._-" else "_" for char in file_id).strip("._") or "file"
+        target = output_root / safe_file_id
+        path_key = os.path.normcase(str(path))
+        target_key = os.path.normcase(str(target))
+        file_sha = sha256_file(path)
+        result.update({"file_id": file_id, "file_uid": stable_file_uid(path, file_sha), "output_dir": str(target)})
+        active.append({"row_index": int(index), "result": result, "path": path, "target": target, "path_key": path_key, "target_key": target_key})
+        path_rows.setdefault(path_key, []).append(int(index))
+        target_rows.setdefault(target_key, []).append(int(index))
+        rows.append(result)
+
+    row_by_index = {int(item["row_index"]): item for item in active}
+    conflict_indices: set[int] = set()
+    for duplicate_indices in path_rows.values():
+        if len(duplicate_indices) > 1:
+            conflict_indices.update(duplicate_indices)
+            for row_index in duplicate_indices:
+                row_by_index[row_index]["result"]["reason"] = "duplicate_input_path"
+    for duplicate_indices in target_rows.values():
+        if len(duplicate_indices) > 1:
+            conflict_indices.update(duplicate_indices)
+            for row_index in duplicate_indices:
+                row_by_index[row_index]["result"]["reason"] = "duplicate_output_target"
+    for item in active:
+        row_index = int(item["row_index"])
+        result = item["result"]
+        if row_index in conflict_indices:
+            continue
+        target = item["target"]
+        if target.exists() and any(target.iterdir()):
+            result["reason"] = "output_target_exists_nonempty"
+            conflict_indices.add(row_index)
+
+    for item in active:
+        row_index = int(item["row_index"])
+        result = item["result"]
+        if row_index in conflict_indices:
+            result["status"] = "skipped"
+            continue
         try:
-            run_single_file(path, config_path, target, metadata_dir=metadata_dir)
-            result.update({"status": "completed", "output_dir": str(target.resolve())})
+            run_single_file(item["path"], config_path, item["target"], metadata_dir=metadata_dir)
+            result.update({"status": "completed", "output_dir": str(item["target"].resolve()), "reason": ""})
         except Exception as exc:  # noqa: BLE001 - batch manifest must retain per-file failures
             result["status"] = "failed"
             result["reason"] = f"{type(exc).__name__}: {exc}"
-        rows.append(result)
     manifest = pd.DataFrame(rows)
     _write_frame(manifest, output_root / "batch_manifest.csv")
     return manifest

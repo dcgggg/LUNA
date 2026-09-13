@@ -45,6 +45,9 @@ luna = "lfp_analysis.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+lfp_analysis = ["resources/branding/*.svg", "resources/configs/*.yaml"]
+
 [tool.setuptools.dynamic]
 version = {attr = "lfp_analysis.__version__"}
 

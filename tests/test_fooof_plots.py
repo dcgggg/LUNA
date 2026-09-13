@@ -3,8 +3,36 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from lfp_analysis.fooof_plots import ordered_channels, prepare_fooof
+from lfp_analysis.fooof_plots import (
+    ordered_channels,
+    plot_periodic_curves,
+    prepare_fooof,
+)
 
+
+def test_periodic_curve_layout_keeps_small_region_sets_wide() -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+
+    base = _tables()
+    for count in (1, 2, 5, 6):
+        region_names = [f"R{index}" for index in range(count)]
+        model_rows = []
+        curve_rows = []
+        for index, region in enumerate(region_names):
+            model = base["model"].iloc[0].to_dict()
+            model.update({"channel_array_index": index, "channel_name": f"channel-{index}", "region": region})
+            model_rows.append(model)
+            for frequency in (2.0, 6.0, 8.0):
+                curve_rows.append({"channel_array_index": index, "channel_name": f"channel-{index}", "region": region, "frequency_hz": frequency, "observed_log10_power": -8.0, "aperiodic_log10_power": -8.2, "periodic_component_log10_additive": 0.2, "residual_log10": 0.0})
+        models = pd.DataFrame(model_rows)
+        curves = pd.DataFrame(curve_rows)
+        prepared = prepare_fooof({**base, "model": models, "curves": curves}, [], peak_mode="representative")
+        figure = Figure(figsize=(8, 4))
+        axes = plot_periodic_curves(figure, "region", prepared, "全部", [], "observed", True, False)
+        assert len(axes) == (1 if count == 1 else count if count <= 5 else 6)
 
 def _tables() -> dict[str, pd.DataFrame]:
     models = pd.DataFrame(

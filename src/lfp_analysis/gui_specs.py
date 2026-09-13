@@ -6,6 +6,7 @@ parameters.  Display-only settings intentionally do not live here.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from typing import Any
@@ -117,33 +118,49 @@ def set_config_value(config: dict[str, Any], key: str, value: Any) -> None:
 
 def normalize_gui_values(values: dict[str, Any], sfreq: float, n_times: int) -> dict[str, Any]:
     """Convert GUI values to the backend configuration representation."""
-    normalized = dict(values)
+    normalized = copy.deepcopy(values)
     psd = normalized.setdefault("psd", {})
     psd["method"] = str(psd.get("method", "welch")).strip().lower()
-    window_seconds = float(psd.get("window_seconds", 1.0))
-    nperseg = max(1, round(window_seconds * sfreq))
-    overlap = float(psd.get("overlap_percent", 50.0))
-    psd["nperseg"] = nperseg
-    psd["noverlap"] = round(nperseg * overlap / 100.0)
-    psd["nfft"] = None if int(psd.get("nfft", 0) or 0) == 0 else int(psd["nfft"])
-    if psd.get("detrend") == "none":
-        psd["detrend"] = False
-    psd["multitaper_bandwidth_hz"] = float(psd.get("multitaper_bandwidth_hz", 4.0))
-    psd["multitaper_adaptive"] = _as_bool(psd.get("multitaper_adaptive", False), False)
-    psd["multitaper_low_bias"] = _as_bool(psd.get("multitaper_low_bias", True), True)
-    psd["multitaper_normalization"] = str(psd.get("multitaper_normalization", "length"))
-    psd["multitaper_remove_dc"] = _as_bool(psd.get("multitaper_remove_dc", True), True)
-    mt_jobs = int(psd.get("multitaper_n_jobs", 1) or 0)
-    psd["multitaper_n_jobs"] = None if mt_jobs == 0 else mt_jobs
-    normalized.setdefault("parameterization", {})["fit_range_hz"] = [
-        float(normalized["parameterization"].get("fit_low_hz", 2.0)),
-        float(normalized["parameterization"].get("fit_high_hz", 150.0)),
+    welch_keys = {"window", "window_seconds", "overlap_percent", "nperseg", "noverlap", "nfft", "detrend", "average"}
+    multitaper_keys = {
+        "multitaper_bandwidth_hz",
+        "multitaper_adaptive",
+        "multitaper_low_bias",
+        "multitaper_normalization",
+        "multitaper_remove_dc",
+        "multitaper_n_jobs",
+    }
+    if psd["method"] == "welch":
+        for key in multitaper_keys:
+            psd.pop(key, None)
+        window_seconds = float(psd.get("window_seconds", 1.0))
+        nperseg = max(1, round(window_seconds * sfreq))
+        overlap = float(psd.get("overlap_percent", 50.0))
+        psd["nperseg"] = nperseg
+        psd["noverlap"] = round(nperseg * overlap / 100.0)
+        psd["nfft"] = None if int(psd.get("nfft", 0) or 0) == 0 else int(psd["nfft"])
+        if psd.get("detrend") == "none":
+            psd["detrend"] = False
+    else:
+        for key in welch_keys:
+            psd.pop(key, None)
+        psd["multitaper_bandwidth_hz"] = float(psd.get("multitaper_bandwidth_hz", 4.0))
+        psd["multitaper_adaptive"] = _as_bool(psd.get("multitaper_adaptive", False), False)
+        psd["multitaper_low_bias"] = _as_bool(psd.get("multitaper_low_bias", True), True)
+        psd["multitaper_normalization"] = str(psd.get("multitaper_normalization", "length"))
+        psd["multitaper_remove_dc"] = _as_bool(psd.get("multitaper_remove_dc", True), True)
+        mt_jobs = int(psd.get("multitaper_n_jobs", 1) or 0)
+        psd["multitaper_n_jobs"] = None if mt_jobs == 0 else mt_jobs
+    parameterization = normalized.setdefault("parameterization", {})
+    parameterization["fit_range_hz"] = [
+        float(parameterization.get("fit_low_hz", 2.0)),
+        float(parameterization.get("fit_high_hz", 150.0)),
     ]
-    normalized["parameterization"]["peak_width_limits_hz"] = [
-        float(normalized["parameterization"].get("peak_width_low_hz", 1.0)),
-        float(normalized["parameterization"].get("peak_width_high_hz", 12.0)),
+    parameterization["peak_width_limits_hz"] = [
+        float(parameterization.get("peak_width_low_hz", 1.0)),
+        float(parameterization.get("peak_width_high_hz", 12.0)),
     ]
-    normalized["parameterization"]["enabled"] = True
+    parameterization["enabled"] = True
     connectivity = normalized.setdefault("connectivity", {})
     connectivity["mode"] = str(connectivity.get("mode", "multitaper")).strip().lower()
     connectivity["mt_bandwidth_hz"] = float(connectivity.get("mt_bandwidth_hz", 4.0))

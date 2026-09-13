@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 from lfp_analysis.quality import assess_quality
 from lfp_analysis.spectral import compute_band_power, compute_psd, summarize_psd
@@ -38,3 +39,29 @@ def test_nonfinite_epoch_is_flagged_and_psd_is_not_silently_filled():
     psd = compute_psd(data, 1000.0, channels, config)
     assert (psd["status"] == "skipped_nonfinite").any()
 
+
+def test_band_power_does_not_integrate_across_excluded_frequency_gap():
+    frequencies = np.arange(1.0, 101.0)
+    psd = pd.DataFrame(
+        {
+            "epoch_index": 0,
+            "channel_array_index": 0,
+            "channel_name": "channel-1",
+            "frequency_hz": frequencies,
+            "psd_value": 1.0,
+            "status": "ok",
+        }
+    )
+    config = {
+        "bands": {"broad": [1.0, 100.0]},
+        "relative_power": {"denominator_hz": [1.0, 100.0], "exclude_line_noise_hz": [50.0]},
+    }
+
+    result = compute_band_power(psd, config)
+
+    row = result.iloc[0]
+    assert row["band_frequency_segments"] == 2
+    assert row["denominator_frequency_segments"] == 2
+    assert row["band_max_gap_hz"] == 2.0
+    assert row["absolute_power"] == 97.0
+    assert row["integration_rule"] == "trapezoid_on_contiguous_frequency_segments_no_cross_gap"

@@ -1,5 +1,13 @@
 # 桌面 GUI 使用说明与验收记录
 
+## Connectivity line-noise display
+
+The connectivity viewer keeps line-noise annotation separate from plot
+exclusion. `显示工频标记` is off by default and only adds a visual annotation;
+`绘图排除工频频点` is also off by default and inserts display-only gaps when
+explicitly enabled. Saved raw spectrum values and configured band summaries
+are not changed by either control.
+
 ## 启动
 
 在项目 `.venv` 解释器中运行：
@@ -54,7 +62,7 @@ PyCharm 操作：打开 `scripts/run_gui.py`，确认项目解释器为 `.venv\S
 
 ### FOOOF/specparam 结果视图
 
-选择 `FOOOF` 结果后，右侧进入独立的 FOOOF/specparam 视图，不再只显示一张拟合 PSD 曲线。默认打开当前筛选通道、M1 周期曲线和第一个配置频带；这只是显示默认值，不会改变已完成的拟合。
+选择 `FOOOF` 结果后，右侧进入独立的 FOOOF/specparam 视图，不再只显示一张拟合 PSD 曲线。默认比较完整拟合范围、使用频段代表峰（PW 最大）并显示去背景后的观测谱；这只是显示默认值，不会改变已完成的拟合。
 
 页面包含以下标签页：
 
@@ -68,7 +76,7 @@ PyCharm 操作：打开 `scripts/run_gui.py`，确认项目解释器为 `.venv\S
 
 定义说明：`offset`、`exponent`、`knee` 和 CF/PW/BW 均来自本次运行的 specparam/FOOOF 后端；PW 是高于非周期背景的 log10 功率差，不是原始 PSD 峰高或频带积分功率；经典 FOOOF 的 BW 按后端定义为 `2σ`，不是 FWHM。项目会把后端内部的 Gaussian σ 转成 `bandwidth_hz=2σ`；加载旧版结果时会标记并转换旧的 σ 字段。周期模型曲线是 `完整对数模型 − 非周期对数模型`；去背景观测谱是 `log10(输入 PSD) − 非周期模型`，两者不混称为纯周期信号。
 
-改变脑区、通道、频带、峰模式、曲线模式、质量筛选、坐标统一和字体设置只刷新已有表和曲线，不重新拟合。只有左侧 FOOOF 参数改变并再次点击运行后，旧结果才会被新拟合替换。
+改变脑区、通道、频带、峰模式、曲线模式、质量筛选、坐标统一、字体或颜色模板只刷新已有表和曲线，不重新拟合。颜色模板提供至少六种可扩展选择；同一通道由通道名和脑区标识稳定生成颜色，因此筛选、排序和重新载入不会随机换色。只有左侧 FOOOF 参数改变并再次点击运行后，旧结果才会被新拟合替换。
 
 `导出当前图`按当前标签页导出；`导出全部图`导出总览、非周期、周期曲线、周期热图、峰参数、峰分布和单通道详情的 PNG/SVG；`导出数值表`及图导出时会生成模型表、全部峰表、当前峰筛选表、曲线表和显示设置表。曲线 CSV 保留去背景观测谱、周期模型、残差和独立高斯峰列。
 
@@ -86,9 +94,9 @@ PyCharm 操作：打开 `scripts/run_gui.py`，确认项目解释器为 `.venv\S
 
 对 wPLI/dPLI，连接矩阵是脑区层面的描述性汇总；每组完整四通道脑区对包含 16 个跨区通道对。`region_pair_summary` 可选 mean 或 median，先在通道对内汇总频率，再汇总有效通道对。通道对频谱和 `channel_pair_band_summary.csv` 始终保留。wPLI 为 0–1；dPLI 为 0–1，0.5 是中性参考。dPLI 的 `seed→target` 只表示计算顺序，不代表因果方向。
 
-`spectrum.csv`/`region_summary.csv` 的 MIC 维度为脑区对×成分×频率（单成分时成分列为 1），MIM/wPLI/dPLI 的脑区摘要为脑区对×频率；原始 wPLI/dPLI 通道对频谱另带 `aggregation_level=cross_region_channel_pair`。`band_summary.csv` 和 `channel_pair_band_summary.csv` 都从完整频谱按配置频段重新汇总。`connectivity_arrays.npz` 保存同一 run 的完整频谱数值坐标，`patterns.csv` 仅在后端提供 MIC patterns 时写入；patterns 是后端空间模式，不是源定位、通道生物学贡献率或因果方向。
+`spectrum.csv`/`region_summary.csv` 的 MIC 维度为脑区对×成分×频率（单成分时成分列为 1），MIM/wPLI/dPLI 的脑区摘要为脑区对×频率；原始 wPLI/dPLI 通道对频谱另带 `aggregation_level=cross_region_channel_pair`。`band_summary.csv` 和 `channel_pair_band_summary.csv` 都从完整频谱按配置频段重新汇总。`frequency_diagnostics.csv` 逐方法、逐频率记录有限值、NaN/Inf、工频标记和首次发现阶段；`roughness.csv` 记录原始未屏蔽频谱的相邻差分、总变差和变异系数；`band_cv.csv` 记录各配置频段内的原始值变异系数；可选的 `binned_spectrum.csv`、`display_spectrum.csv` 和 `display_roughness.csv` 是独立派生表。`connectivity_arrays.npz` 保存同一 run 的完整频谱数值坐标，`patterns.csv` 仅在后端提供 MIC patterns 时写入；patterns 是后端空间模式，不是源定位、通道生物学贡献率或因果方向。
 
-改变指标、脑区对、频段勾选、MIC 成分和坐标尺度只重绘/重新汇总，不重新计算连接。改变输入 epoch/通道、频率范围、Multitaper、rank、wPLI/dPLI 汇总方式或 MIC 成分数后，需要重新运行；旧结果不会被静默当成新参数结果。对数轴只使用正值，MIM 不强行变成非负或 0–1 指标。TDE 视图显示 delay curve 和 band-level brain-region comparison，不使用 MIC/MIM 矩阵。
+改变指标、脑区对、频段勾选、MIC 成分、频谱视图和坐标尺度只重绘/重新汇总，不重新计算连接。改变输入 epoch/通道、频率范围、Multitaper、rank、wPLI/dPLI 汇总方式或 MIC 成分数后，需要重新运行；旧结果不会被静默当成新参数结果。`全频谱＋标记频段` 保留完整横轴并显式标记选定频段；`仅显示选定频段` 才限制横轴范围。默认连接工频策略来自 `connectivity.line_noise`，只以配置的 50 Hz 为源并按需生成谐波，不自动添加 60 Hz；旧版 `exclude_line_noise_hz` 仍兼容。对数轴只使用正值，MIM 不强行变成非负或 0–1 指标。TDE 视图显示 delay curve 和 band-level brain-region comparison，不使用 MIC/MIM 矩阵。
 
 ## 指标与保存内容
 

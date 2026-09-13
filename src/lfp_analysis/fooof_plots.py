@@ -18,7 +18,8 @@ from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 from matplotlib.font_manager import FontProperties
 
-from .band_power_plots import REGION_COLORS, REGION_ORDER, _plot_font
+from .band_power_plots import REGION_ORDER, _plot_font
+from .colors import DEFAULT_COLOR_TEMPLATE, channel_color
 
 
 def _tr(language: str, zh: str, en: str) -> str:
@@ -142,6 +143,14 @@ def _normalize_curves(curves: pd.DataFrame) -> pd.DataFrame:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
     if "periodic_model_log10" not in frame.columns and "periodic_component_log10_additive" in frame.columns:
         frame["periodic_model_log10"] = frame["periodic_component_log10_additive"]
+    if "observed_power" not in frame.columns and "observed_log10_power" in frame.columns:
+        frame["observed_power"] = np.power(10.0, frame["observed_log10_power"])
+    if "aperiodic_power" not in frame.columns and "aperiodic_log10_power" in frame.columns:
+        frame["aperiodic_power"] = np.power(10.0, frame["aperiodic_log10_power"])
+    if "full_model_log10_power" not in frame.columns and {"aperiodic_log10_power", "periodic_model_log10"}.issubset(frame.columns):
+        frame["full_model_log10_power"] = frame["aperiodic_log10_power"] + frame["periodic_model_log10"]
+    if "full_model_power" not in frame.columns and "full_model_log10_power" in frame.columns:
+        frame["full_model_power"] = np.power(10.0, frame["full_model_log10_power"])
     if "observed_minus_aperiodic_log10" not in frame.columns and {"observed_log10_power", "aperiodic_log10_power"}.issubset(frame.columns):
         frame["observed_minus_aperiodic_log10"] = frame["observed_log10_power"] - frame["aperiodic_log10_power"]
     return frame
@@ -206,7 +215,8 @@ def ordered_channels(models: pd.DataFrame, curves: pd.DataFrame | None = None) -
         return []
     columns = ["channel_name", "channel_array_index", "physical_channel_number", "region", "channel_label"]
     rows = frame[[column for column in columns if column in frame.columns]].drop_duplicates(subset=["channel_name"]).to_dict("records")
-    rank = {name: index for index, name in enumerate(REGION_ORDER)}
+    region_names = list(dict.fromkeys(_text(row.get("region"), "未映射") for row in rows))
+    rank = {name: index for index, name in enumerate(REGION_ORDER)} if set(region_names).issubset(set(REGION_ORDER)) else {name: index for index, name in enumerate(region_names)}
     rows.sort(key=lambda row: (rank.get(_text(row.get("region"), "未映射"), len(REGION_ORDER)), _physical_sort_key(row.get("physical_channel_number")), _text(row.get("channel_name"))))
     return rows
 
@@ -271,6 +281,8 @@ def prepare_fooof(
     models = _with_metadata(tables.get("model", pd.DataFrame()), metadata)
     peaks = _normalize_peak_bandwidth(_with_metadata(tables.get("peaks", pd.DataFrame()), metadata))
     curves = _normalize_curves(_with_metadata(tables.get("curves", pd.DataFrame()), metadata))
+    if peaks.empty and not len(peaks.columns):
+        peaks = pd.DataFrame(columns=["channel_name", "channel_array_index", "physical_channel_number", "region", "peak_index", "center_frequency_hz", "peak_power_log10", "bandwidth_hz"])
     if models.empty:
         models = pd.DataFrame(columns=["channel_name", "channel_array_index", "physical_channel_number", "region", "channel_label", "fit_status", "fit_quality_status"])
     for frame in (models, peaks):
@@ -333,15 +345,15 @@ def _channel_x(axis: Axes, channels: list[dict[str, Any]]) -> dict[str, int]:
     return x_index
 
 
-def _scatter_parameter(axis: Axes, models: pd.DataFrame, channels: list[dict[str, Any]], column: str, title: str, ylabel: str, selected_channel: str | None, show_legend: bool, font: FontProperties, font_size: int, language: str = "zh") -> None:
+def _scatter_parameter(axis: Axes, models: pd.DataFrame, channels: list[dict[str, Any]], column: str, title: str, ylabel: str, selected_channel: str | None, show_legend: bool, font: FontProperties, font_size: int, language: str = "zh", color_template: str = DEFAULT_COLOR_TEMPLATE) -> None:
     x_index = _channel_x(axis, channels)
     if not models.empty and column in models.columns:
         for region, group in models.groupby("region", sort=False):
             valid = group[column].notna()
             if valid.any():
                 xs = [x_index.get(str(name), np.nan) for name in group.loc[valid, "channel_name"]]
-                color = REGION_COLORS.get(_region_text(region, language), REGION_COLORS["未映射"])
-                axis.scatter(xs, group.loc[valid, column], color=color, s=34, label=_region_text(region, language), zorder=3)
+                colors_for_points = [channel_color(name, region, color_template) for name in group.loc[valid, "channel_name"]]
+                axis.scatter(xs, group.loc[valid, column], color=colors_for_points, s=34, label=_region_text(region, language), zorder=3)
         if selected_channel in x_index:
             selected = models.loc[models["channel_name"].astype(str) == str(selected_channel), column]
             selected = selected.dropna()
@@ -355,7 +367,7 @@ def _scatter_parameter(axis: Axes, models: pd.DataFrame, channels: list[dict[str
     axis.set_title(title, fontproperties=font)
     axis.set_ylabel(ylabel, fontproperties=font)
     if show_legend and not models.empty:
-        axis.legend(frameon=False, prop=font, fontsize=font_size - 1, ncol=2)
+        axis.legend(frameon=False, prop=font, fontsize=font_size - 1, ncol=1, loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
     _style_axis(axis, font, font_size)
 
 
@@ -370,6 +382,7 @@ def plot_fooof_overview(
     show_legend: bool,
     font_size: int = 9,
     language: str = "zh",
+    color_template: str = DEFAULT_COLOR_TEMPLATE,
 ) -> dict[str, Any]:
     font = _plot_font(language)
     models = prepared["models"]
@@ -379,8 +392,8 @@ def plot_fooof_overview(
     selected_band = prepared.get("selected_band")
     band_text = _tr(language, "全部拟合范围", "Full fit range") if selected_band is None else f"{selected_band['name']} [{selected_band['low_hz']:g}–{selected_band['high_hz']:g} Hz]"
     axes_flat = np.asarray(axes, dtype=object).ravel()
-    _scatter_parameter(axes_flat[0], models, channels, "exponent", _tr(language, "A 非周期 exponent", "A Aperiodic exponent"), "Exponent", selected_channel, show_legend, font, font_size, language)
-    _scatter_parameter(axes_flat[1], models, channels, "offset", _tr(language, "B 非周期 offset", "B Aperiodic offset"), "Offset (log10 PSD)", selected_channel, False, font, font_size, language)
+    _scatter_parameter(axes_flat[0], models, channels, "exponent", _tr(language, "A 非周期 exponent", "A Aperiodic exponent"), "Exponent", selected_channel, show_legend, font, font_size, language, color_template)
+    _scatter_parameter(axes_flat[1], models, channels, "offset", _tr(language, "B 非周期 offset", "B Aperiodic offset"), "Offset (log10 PSD)", selected_channel, False, font, font_size, language, color_template)
     curve_axis = axes_flat[2]
     region_channels = [row for row in channels if selected_region in {"全部", "All"} or _text(row.get("region"), "未映射") == selected_region]
     x_frequency = curves.loc[curves["channel_name"].astype(str).isin([str(row["channel_name"]) for row in region_channels])]
@@ -388,7 +401,7 @@ def plot_fooof_overview(
         group = x_frequency.loc[x_frequency["channel_name"].astype(str) == str(channel["channel_name"])].sort_values("frequency_hz")
         if group.empty:
             continue
-        color = REGION_COLORS.get(_region_text(channel.get("region"), language), REGION_COLORS["未映射"])
+        color = channel_color(channel.get("channel_name"), channel.get("region"), color_template)
         linestyle = ("-", "--", ":", "-.")[region_channels.index(channel) % 4]
         if curve_mode in {"observed", "overlay"}:
             curve_axis.plot(group["frequency_hz"], group["observed_minus_aperiodic_log10"], color=color, alpha=0.38 if curve_mode == "overlay" else 0.75, linewidth=0.8, linestyle=linestyle, label=f"{channel['channel_label']} {_tr(language, '观测', 'observed')}" if curve_mode == "observed" else "_nolegend_")
@@ -399,13 +412,13 @@ def plot_fooof_overview(
     curve_axis.set_xlabel("Frequency (Hz)", fontproperties=font)
     curve_axis.set_ylabel("Log10 additive above aperiodic", fontproperties=font)
     if show_legend and curve_axis.get_legend_handles_labels()[1]:
-        curve_axis.legend(frameon=False, prop=font, fontsize=font_size - 1, ncol=2)
+        curve_axis.legend(frameon=False, prop=font, fontsize=font_size - 1, ncol=1, loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
     if curve_mode == "overlay":
         curve_axis.text(0.02, 0.98, _tr(language, "淡线=去背景观测谱；实线=拟合周期成分", "faint=observed minus aperiodic; solid=fitted periodic model"), transform=curve_axis.transAxes, va="top", fontproperties=font, fontsize=max(7, font_size - 1))
     _style_axis(curve_axis, font, font_size)
     metric_specs = (("center_frequency_hz", _tr(language, "D 峰中心频率 CF", "D Peak center frequency CF"), "CF (Hz)"), ("peak_power_log10", _tr(language, "E 峰功率 PW", "E Peak power PW"), "PW (log10 above background)"), ("bandwidth_hz", _tr(language, "F 峰带宽 BW", "F Peak bandwidth BW"), "BW (Hz)"))
     x_index = _channel_x(axes_flat[3], channels)
-    for axis, (column, title, ylabel) in zip(axes_flat[3:], metric_specs, strict=False):
+    for metric_index, (axis, (column, title, ylabel)) in enumerate(zip(axes_flat[3:], metric_specs, strict=False)):
         plotted = False
         if not peaks.empty and column in peaks.columns:
             for region, group in peaks.groupby("region", sort=False):
@@ -416,12 +429,13 @@ def plot_fooof_overview(
                 xs = [x_index.get(str(name), np.nan) for name in group.loc[valid, "channel_name"]]
                 if prepared.get("peak_mode") == "all":
                     xs = [value + ((int(index) % 3) - 1) * 0.08 for value, index in zip(xs, group.loc[valid, "peak_index"], strict=False)]
-                axis.scatter(xs, group.loc[valid, column], color=REGION_COLORS.get(_region_text(region, language), REGION_COLORS["未映射"]), s=30, alpha=0.82, label=_region_text(region, language), zorder=3)
+                colors_for_points = [channel_color(name, region, color_template) for name in group.loc[valid, "channel_name"]]
+                axis.scatter(xs, group.loc[valid, column], color=colors_for_points, s=30, alpha=0.82, label=_region_text(region, language), zorder=3)
         axis.set_title(f"{title} | {band_text}", fontproperties=font, fontsize=font_size)
         axis.set_ylabel(ylabel, fontproperties=font)
         _channel_x(axis, channels)
-        if show_legend and axis.collections:
-            axis.legend(frameon=False, prop=font, fontsize=font_size - 1, ncol=2)
+        if show_legend and axis.collections and metric_index == 0:
+            axis.legend(frameon=False, prop=font, fontsize=font_size - 1, ncol=1, loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
         if not plotted:
             axis.text(
                 0.5,
@@ -435,26 +449,26 @@ def plot_fooof_overview(
             )
         _style_axis(axis, font, font_size)
     figure.suptitle(_tr(language, "FOOOF/specparam 通道比较总览", "FOOOF/specparam channel comparison overview"), fontproperties=font, fontsize=font_size + 2)
-    figure.tight_layout(rect=(0, 0, 1, 0.97))
+    figure.subplots_adjust(left=0.07, right=0.88, bottom=0.18, top=0.86, wspace=0.48, hspace=0.78)
     return {"channels": channels, "peaks": peaks, "band_text": band_text}
 
 
-def plot_aperiodic_details(figure: Figure, axes: np.ndarray, prepared: dict[str, Any], selected_channel: str | None, show_legend: bool, font_size: int = 9, language: str = "zh") -> None:
+def plot_aperiodic_details(figure: Figure, axes: np.ndarray, prepared: dict[str, Any], selected_channel: str | None, show_legend: bool, font_size: int = 9, language: str = "zh", color_template: str = DEFAULT_COLOR_TEMPLATE) -> None:
     font = _plot_font(language)
     channels = ordered_channels(prepared["models"], prepared["curves"])
-    _scatter_parameter(axes[0], prepared["models"], channels, "exponent", _tr(language, "非周期 exponent", "Aperiodic exponent"), "Exponent", selected_channel, show_legend, font, font_size, language)
-    _scatter_parameter(axes[1], prepared["models"], channels, "offset", _tr(language, "非周期 offset", "Aperiodic offset"), "Offset (log10 PSD)", selected_channel, False, font, font_size, language)
+    _scatter_parameter(axes[0], prepared["models"], channels, "exponent", _tr(language, "非周期 exponent", "Aperiodic exponent"), "Exponent", selected_channel, show_legend, font, font_size, language, color_template)
+    _scatter_parameter(axes[1], prepared["models"], channels, "offset", _tr(language, "非周期 offset", "Aperiodic offset"), "Offset (log10 PSD)", selected_channel, False, font, font_size, language, color_template)
     figure.suptitle(_tr(language, "非周期参数比较；通道为重复测量单位", "Aperiodic parameter comparison; channels are repeated measurements"), fontproperties=font, fontsize=font_size + 2)
-    figure.tight_layout(rect=(0, 0, 1, 0.95))
+    figure.subplots_adjust(left=0.08, right=0.82, bottom=0.20, top=0.84, wspace=0.48)
 
 
-def _plot_curve_group(axis: Axes, curves: pd.DataFrame, channel_rows: list[dict[str, Any]], curve_mode: str, unified_axis: bool, show_legend: bool, font: FontProperties, font_size: int, language: str = "zh") -> None:
+def _plot_curve_group(axis: Axes, curves: pd.DataFrame, channel_rows: list[dict[str, Any]], curve_mode: str, unified_axis: bool, show_legend: bool, font: FontProperties, font_size: int, language: str = "zh", color_template: str = DEFAULT_COLOR_TEMPLATE) -> None:
     all_values: list[np.ndarray] = []
     for index, channel in enumerate(channel_rows):
         group = curves.loc[curves["channel_name"].astype(str) == str(channel["channel_name"])].sort_values("frequency_hz")
         if group.empty:
             continue
-        color = REGION_COLORS.get(_region_text(channel.get("region"), language), REGION_COLORS["未映射"])
+        color = channel_color(channel.get("channel_name"), channel.get("region"), color_template)
         linestyle = ("-", "--", ":", "-.")[index % 4]
         if curve_mode in {"observed", "overlay"}:
             values = group["observed_minus_aperiodic_log10"].to_numpy(float)
@@ -468,7 +482,7 @@ def _plot_curve_group(axis: Axes, curves: pd.DataFrame, channel_rows: list[dict[
     axis.set_xlabel("Frequency (Hz)", fontproperties=font)
     axis.set_ylabel(_tr(language, "非周期背景以上的 log10 加性量", "Log10 additive above aperiodic"), fontproperties=font)
     if show_legend and axis.get_legend_handles_labels()[1]:
-        axis.legend(frameon=False, prop=font, fontsize=font_size - 1, ncol=2)
+        axis.legend(frameon=False, prop=font, fontsize=font_size - 1, ncol=1, loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
     if curve_mode == "overlay":
         axis.text(0.02, 0.98, _tr(language, "淡线=去背景观测谱；实线=拟合周期成分", "faint=observed minus aperiodic; solid=fitted periodic model"), transform=axis.transAxes, va="top", fontproperties=font, fontsize=max(7, font_size - 1))
     if unified_axis and all_values:
@@ -479,7 +493,7 @@ def _plot_curve_group(axis: Axes, curves: pd.DataFrame, channel_rows: list[dict[
     _style_axis(axis, font, font_size)
 
 
-def plot_periodic_curves(figure: Figure, selected_layout: str, prepared: dict[str, Any], selected_region: str, selected_channels: list[str], curve_mode: str, unified_axis: bool, show_legend: bool, font_size: int = 9, language: str = "zh") -> list[Axes]:
+def plot_periodic_curves(figure: Figure, selected_layout: str, prepared: dict[str, Any], selected_region: str, selected_channels: list[str], curve_mode: str, unified_axis: bool, show_legend: bool, font_size: int = 9, language: str = "zh", color_template: str = DEFAULT_COLOR_TEMPLATE) -> list[Axes]:
     font = _plot_font(language)
     channels = ordered_channels(prepared["models"], prepared["curves"])
     if selected_layout == "region":
@@ -489,12 +503,25 @@ def plot_periodic_curves(figure: Figure, selected_layout: str, prepared: dict[st
             region = _text(row.get("region"), "未映射")
             if region not in regions:
                 regions.append(region)
-        n_columns = 2
-        n_rows = max(1, int(np.ceil(len(regions) / n_columns)))
+        # Keep small sets wide and readable: 1x1 for one region, 1xN for
+        # two-to-five regions, then wrap at five columns.  The GUI can place
+        # this figure in a horizontal scroll area when N is large.
+        n_regions = len(regions)
+        if n_regions == 0:
+            axis = figure.add_subplot(111)
+            axis.text(0.5, 0.5, _tr(language, "当前筛选下没有可显示的脑区曲线", "No region curves available for the current selection"), ha="center", va="center", transform=axis.transAxes, fontproperties=font)
+            axis.set_axis_off()
+            figure.suptitle(_tr(language, "周期成分曲线比较", "Periodic component curve comparison"), fontproperties=font, fontsize=font_size + 2)
+            return [axis]
+        if n_regions <= 5:
+            n_columns, n_rows = max(1, n_regions), 1
+        else:
+            n_columns, n_rows = 5, int(np.ceil(n_regions / 5))
+        figure.set_size_inches(max(5.0 * n_columns, 10.0), max(3.6 * n_rows, 4.3), forward=False)
         axes = np.asarray(figure.subplots(n_rows, n_columns), dtype=object).ravel()
         for axis, region in zip(axes, regions, strict=False):
             rows = [row for row in channels if _text(row.get("region"), "未映射") == region]
-            _plot_curve_group(axis, prepared["curves"], rows, curve_mode, unified_axis, show_legend, font, font_size, language)
+            _plot_curve_group(axis, prepared["curves"], rows, curve_mode, unified_axis, show_legend, font, font_size, language, color_template)
             axis.set_title(region, fontproperties=font)
         for axis in axes[len(regions) :]:
             axis.set_visible(False)
@@ -503,10 +530,10 @@ def plot_periodic_curves(figure: Figure, selected_layout: str, prepared: dict[st
         figure.clear()
         axes = np.asarray([figure.add_subplot(111)], dtype=object)
         rows = [row for row in channels if row["channel_name"] in set(selected_channels)]
-        _plot_curve_group(axes[0], prepared["curves"], rows, curve_mode, unified_axis, show_legend, font, font_size, language)
+        _plot_curve_group(axes[0], prepared["curves"], rows, curve_mode, unified_axis, show_legend, font, font_size, language, color_template)
         axes[0].set_title(f"{_tr(language, '选定通道周期曲线', 'Selected-channel periodic curves')} | {curve_mode}", fontproperties=font)
-    figure.tight_layout(rect=(0, 0, 1, 0.95))
-    return list(axes)
+    figure.subplots_adjust(left=0.08, right=0.86, bottom=0.16, top=0.84, wspace=0.30, hspace=0.42)
+    return [axis for axis in axes if axis.get_visible()]
 
 
 def plot_periodic_heatmap(figure: Figure, prepared: dict[str, Any], font_size: int = 9, language: str = "zh") -> None:
@@ -537,10 +564,10 @@ def plot_periodic_heatmap(figure: Figure, prepared: dict[str, Any], font_size: i
     _style_axis(axis, font, font_size)
     for tick in colorbar.ax.get_yticklabels():
         tick.set_fontproperties(font)
-    figure.tight_layout()
+    figure.subplots_adjust(left=0.07, right=0.86, bottom=0.20, top=0.82, wspace=0.48)
 
 
-def plot_peak_parameters(figure: Figure, prepared: dict[str, Any], selected_channel: str | None, show_legend: bool, font_size: int = 9, language: str = "zh") -> None:
+def plot_peak_parameters(figure: Figure, prepared: dict[str, Any], selected_channel: str | None, show_legend: bool, font_size: int = 9, language: str = "zh", color_template: str = DEFAULT_COLOR_TEMPLATE) -> None:
     font = _plot_font(language)
     figure.clear()
     axes = np.asarray(figure.subplots(1, 3), dtype=object).ravel()
@@ -558,7 +585,8 @@ def plot_peak_parameters(figure: Figure, prepared: dict[str, Any], selected_chan
                 if valid.any():
                     plotted = True
                     xs = [x_index.get(str(name), np.nan) for name in group.loc[valid, "channel_name"]]
-                    axis.scatter(xs, group.loc[valid, column], color=REGION_COLORS.get(_region_text(region, language), REGION_COLORS["未映射"]), s=34, label=_region_text(region, language), zorder=3)
+                    colors_for_points = [channel_color(name, region, color_template) for name in group.loc[valid, "channel_name"]]
+                    axis.scatter(xs, group.loc[valid, column], color=colors_for_points, s=34, label=_region_text(region, language), zorder=3)
         if selected_channel in x_index:
             selected = peaks.loc[peaks["channel_name"].astype(str) == str(selected_channel), column].dropna() if not peaks.empty else pd.Series(dtype=float)
             if not selected.empty:
@@ -571,7 +599,7 @@ def plot_peak_parameters(figure: Figure, prepared: dict[str, Any], selected_chan
         if not plotted:
             axis.text(0.5, 0.5, _tr(language, "该频段未检出峰\nCF / PW / BW 保留缺失", "No peak detected in this band\nCF / PW / BW remain missing"), ha="center", va="center", transform=axis.transAxes, fontproperties=font, fontsize=font_size)
         _style_axis(axis, font, font_size)
-    figure.tight_layout()
+    figure.subplots_adjust(left=0.08, right=0.84, bottom=0.22, top=0.82, wspace=0.48)
 
 
 def plot_peak_distribution(figure: Figure, prepared: dict[str, Any], font_size: int = 9, language: str = "zh") -> list[dict[str, Any]]:
@@ -676,7 +704,7 @@ def plot_single_channel_detail(figure: Figure, prepared: dict[str, Any], channel
         _style_axis(axis, font, font_size)
     axes[3].set_title(_tr(language, "拟合质量与非周期参数", "Fit quality and aperiodic parameters"), fontproperties=font)
     figure.suptitle(f"{_tr(language, '单通道拟合详情', 'Single-channel fit detail')} | {channel_name}", fontproperties=font, fontsize=font_size + 2)
-    figure.tight_layout(rect=(0, 0, 1, 0.95))
+    figure.subplots_adjust(left=0.08, right=0.84, bottom=0.13, top=0.88, wspace=0.30, hspace=0.38)
     return peaks
 
 

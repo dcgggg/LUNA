@@ -17,6 +17,9 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.font_manager import FontProperties, findfont
 from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+from .colors import DEFAULT_COLOR_TEMPLATE, channel_colors, region_color
 
 REGION_ORDER = ("M1", "STR", "PF", "SNr")
 REGION_COLORS = {
@@ -156,7 +159,13 @@ def ordered_channels(summary: pd.DataFrame) -> list[dict[str, Any]]:
     if summary.empty:
         return []
     rows = summary[["channel_name", "physical_channel_number", "region", "channel_label"]].drop_duplicates().to_dict("records")
-    region_rank = {name: index for index, name in enumerate(REGION_ORDER)}
+    region_names = list(dict.fromkeys(_as_text(row.get("region"), "未映射") for row in rows))
+    # Keep the established template order for the four-region LUNA default,
+    # but never force custom mappings into that order or invent region names.
+    if set(region_names).issubset(set(REGION_ORDER)):
+        region_rank = {name: index for index, name in enumerate(REGION_ORDER)}
+    else:
+        region_rank = {name: index for index, name in enumerate(region_names)}
     rows.sort(
         key=lambda row: (
             region_rank.get(_as_text(row.get("region"), "未映射"), len(REGION_ORDER)),
@@ -251,6 +260,7 @@ def plot_overview(
     title: str,
     denominator_hz: tuple[float, float] | None = None,
     language: str = "zh",
+    color_template: str = DEFAULT_COLOR_TEMPLATE,
 ) -> dict[str, Any]:
     plt_get_viridis(language)
     font = _plot_font(language)
@@ -266,6 +276,8 @@ def plot_overview(
         return {"channels": [], "bands": [], "log_valid": False}
     channels = ordered_channels(summary)
     bands = ordered_bands(summary)
+    # Classification colours are intentionally not used for the continuous
+    # heatmap; the heatmap keeps viridis and reserves grey for missing values.
     channel_names = [row["channel_name"] for row in channels]
     band_names = [row["band"] for row in bands]
     matrix = np.full((len(channels), len(bands)), np.nan, dtype=float)
@@ -281,7 +293,12 @@ def plot_overview(
         plotted = np.ma.masked_where(~log_mask, matrix)
     image = axis.imshow(plotted, aspect="auto", cmap=cmap, norm=norm if use_log and norm else None)
     label = power_label(power_kind, denominator_hz, language)
-    colorbar = figure.colorbar(image, ax=axis, pad=0.02, fraction=0.045)
+    # Give the colorbar an explicit Axes.  This avoids Figure.colorbar's
+    # implicit current-Axes restoration path, which is fragile if a GUI view
+    # is refreshed immediately after an earlier deferred canvas draw.
+    divider = make_axes_locatable(axis)
+    colorbar_axis = divider.append_axes("right", size="4.5%", pad=0.08)
+    colorbar = figure.colorbar(image, cax=colorbar_axis)
     colorbar.set_label(label, fontproperties=_font_size(font, 8.0), labelpad=5)
     colorbar.ax.tick_params(labelsize=7, pad=1)
     for tick in colorbar.ax.get_yticklabels():
@@ -343,6 +360,7 @@ def plot_comparison(
     title: str,
     denominator_hz: tuple[float, float] | None = None,
     language: str = "zh",
+    color_template: str = DEFAULT_COLOR_TEMPLATE,
 ) -> dict[str, Any]:
     plt_get_viridis(language)
     font = _plot_font(language)
@@ -357,6 +375,7 @@ def plot_comparison(
         return {"selection_value": np.nan}
     channels = ordered_channels(summary)
     bands = ordered_bands(summary)
+    channel_color_map = channel_colors(channels, color_template)
     if mode == "channel":
         if selected_band not in {row["band"] for row in bands}:
             selected_band = bands[0]["band"]
@@ -368,8 +387,8 @@ def plot_comparison(
             if group.empty:
                 continue
             xs = [x_index[name] for name in group["channel_name"]]
-            face = REGION_COLORS.get(_as_text(region, "未映射"), REGION_COLORS["未映射"])
-            axis.scatter(xs, group["display_value"], s=46, color=face, label=_as_text(region, "未映射"), zorder=3)
+            point_colors = [channel_color_map.get(str(name), region_color(region, color_template)) for name in group["channel_name"]]
+            axis.scatter(xs, group["display_value"], s=46, color=point_colors, label=_as_text(region, "未映射"), zorder=3)
         if show_epoch_distribution and not epoch.empty:
             values = epoch.loc[epoch["band"] == selected_band].copy()
             value_column = "relative_power" if power_kind == "relative" else "absolute_power"
@@ -383,7 +402,7 @@ def plot_comparison(
                     finite = finite[finite > 0]
                 if finite.size:
                     jitter = np.linspace(-0.12, 0.12, finite.size)
-                    axis.scatter(x_index[channel_name] + jitter, finite, s=14, alpha=0.22, color="#555555", zorder=1)
+                    axis.scatter(x_index[channel_name] + jitter, finite, s=14, alpha=0.22, color=channel_color_map.get(str(channel_name), "#777777"), zorder=1)
         axis.set_xticks(np.arange(len(x_values)), [next(row["channel_label"] for row in channels if row["channel_name"] == name) for name in x_values], rotation=45, ha="right")
         axis.set_xlabel("Channels" if language == "en" else "实际通道", fontproperties=font)
         if selected_channel in x_index:
@@ -421,7 +440,8 @@ def plot_comparison(
                     finite = finite[finite > 0]
                 if finite.size:
                     jitter = np.linspace(-0.12, 0.12, finite.size)
-                    axis.scatter(x_index[band_name] + jitter, finite, s=14, alpha=0.22, color="#555555", zorder=1)
+                    point_color = channel_color_map.get(str(selected_channel), "#777777")
+                    axis.scatter(x_index[band_name] + jitter, finite, s=14, alpha=0.22, color=point_color, zorder=1)
         axis.set_xticks(np.arange(len(x_values)), [next(row["band"] for row in bands if row["band"] == name) for name in x_values], rotation=35, ha="right")
         axis.set_xlabel("Frequency bands (Hz)" if language == "en" else "频带（Hz）", fontproperties=font)
         if selected_band in x_index:

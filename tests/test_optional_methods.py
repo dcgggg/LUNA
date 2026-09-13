@@ -36,6 +36,8 @@ def test_specparam_result_fields_are_populated_when_available():
 
 
 def test_multitaper_psd_recovers_known_frequency_and_records_parameters():
+    from mne.time_frequency import psd_array_multitaper
+
     rng = np.random.default_rng(2026)
     sfreq = 200.0
     n_times = 2000
@@ -67,6 +69,27 @@ def test_multitaper_psd_recovers_known_frequency_and_records_parameters():
     assert psd["nfft_used"].isna().all()
     assert psd["multitaper_bandwidth_hz"].eq(4.0).all()
     assert psd["multitaper_normalization"].eq("length").all()
+    assert psd["multitaper_batch_call_count"].eq(1).all()
+    assert psd["multitaper_batch_input_shape"].eq("8×2000").all()
+    reference_power, reference_freqs = psd_array_multitaper(
+        data.reshape(-1, n_times),
+        sfreq=sfreq,
+        fmin=2.0,
+        fmax=60.0,
+        bandwidth=4.0,
+        adaptive=False,
+        low_bias=True,
+        normalization="length",
+        remove_dc=True,
+        output="power",
+        n_jobs=1,
+        verbose=False,
+    )
+    observed = psd.sort_values(["epoch_index", "channel_array_index", "frequency_hz"])
+    assert np.allclose(observed["frequency_hz"].drop_duplicates(), reference_freqs)
+    for (epoch_index, channel_index), group in observed.groupby(["epoch_index", "channel_array_index"], sort=True):
+        expected = reference_power[int(epoch_index) * 2 + int(channel_index)]
+        np.testing.assert_allclose(group["psd_value"].to_numpy(), expected, rtol=1e-12, atol=1e-15)
     assert psd["frequency_resolution_hz"].dropna().iloc[0] == pytest.approx(sfreq / n_times)
 
     summary = summarize_psd(psd)["channel"]
@@ -174,6 +197,15 @@ def test_multivariate_connectivity_and_wpli_keep_distinct_output_grains():
     assert set(wpli["aggregation_level"]) == {"cross_region_channel_pair"}
     assert wpli[["seed_channel", "target_channel"]].drop_duplicates().shape[0] == 4
     assert result["spectrum"].loc[result["spectrum"]["method"] == "mic", "value_strength"].ge(0).all()
+    calls = result["estimation_calls"]
+    assert not calls.empty
+    assert {"analysis_task_id", "input_shape", "epoch_duration_s", "n_tapers", "elapsed_s", "cache_hit"}.issubset(calls.columns)
+    assert set(calls["call_purpose"]) == {"main"}
+    assert calls["input_shape"].eq("6×4×5000").all()
+    assert calls["cache_hit"].eq(False).all()
+    assert set(calls["estimator_scope"]) == {"multivariate", "bivariate"}
+    assert calls["seed_channel_count"].eq(2).all()
+    assert calls["target_channel_count"].eq(2).all()
 
 
 def test_wpli_and_dpli_keep_channel_pairs_and_direction_separate():

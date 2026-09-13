@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 from scipy.signal import resample_poly
 
-from .connectivity import region_channel_pairs
+from .connectivity import region_channel_pairs, selected_region_pairs
+from .quality import align_epoch_quality
 
 TDE_METHOD_NAMES = {
     1: "phase_periodicity_phase_only",
@@ -72,9 +73,14 @@ def _as_int_list(value: Any, default: list[int]) -> list[int]:
     return [int(item) for item in value]
 
 
-def _valid_epoch_mask(data: np.ndarray, quality_epoch: pd.DataFrame) -> tuple[np.ndarray, int]:
-    status = quality_epoch.get("quality_status", pd.Series("pass", index=range(len(data))))
-    quality_valid = status.astype(str).ne("fail").to_numpy()
+def _valid_epoch_mask(
+    data: np.ndarray,
+    quality_epoch: pd.DataFrame,
+    epoch_ids: list[int] | np.ndarray | None = None,
+) -> tuple[np.ndarray, int]:
+    aligned_quality = align_epoch_quality(quality_epoch, len(data), epoch_ids)
+    status = aligned_quality["quality_status"].astype(str).str.lower()
+    quality_valid = status.isin({"pass", "ok", "warn"}).to_numpy()
     finite_valid = np.all(np.isfinite(data), axis=(1, 2))
     return quality_valid & finite_valid, int(np.sum(~finite_valid))
 
@@ -269,6 +275,8 @@ def _append_result_rows(
 def _region_summary(spectrum: pd.DataFrame) -> pd.DataFrame:
     if spectrum.empty:
         return pd.DataFrame()
+    spectrum = spectrum.copy()
+    spectrum["_channel_pair"] = spectrum["seed_channel"].astype(str) + "||" + spectrum["target_channel"].astype(str)
     keys = ["region_a", "region_b", "method", "method_name", "antisymmetrized", "frequency_band", "band_low_hz", "band_high_hz", "delay_ms"]
     summary = (
         spectrum.groupby(keys, dropna=False)
@@ -276,7 +284,7 @@ def _region_summary(spectrum: pd.DataFrame) -> pd.DataFrame:
             estimate_strength=("estimate_strength", "median"),
             estimate_strength_mean=("estimate_strength", "mean"),
             estimate_strength_sd=("estimate_strength", "std"),
-            n_channel_pairs=("seed_channel", "nunique"),
+            n_channel_pairs=("_channel_pair", "nunique"),
             n_epochs=("n_epochs", "first"),
             effective_duration_s=("effective_duration_s", "first"),
             analysis_sfreq_hz=("analysis_sfreq_hz", "first"),
@@ -361,6 +369,17 @@ def compute_time_delay(
     if groups.empty:
         result["status"] = "not_run_channel_region_mapping_incomplete"
         return result
+    region_names = tuple(dict.fromkeys(groups["region_a"].tolist() + groups["region_b"].tolist()))
+    pair_config = {"connectivity": {"selected_region_pairs": tde_cfg.get("selected_region_pairs")}}
+    requested_pairs = selected_region_pairs(region_names, pair_config)
+    if tde_cfg.get("selected_region_pairs") is not None:
+        requested_keys = {frozenset(pair) for pair in requested_pairs}
+        groups = groups.loc[
+            groups.apply(lambda row: frozenset((str(row["region_a"]), str(row["region_b"]))) in requested_keys, axis=1)
+        ].copy()
+        if groups.empty:
+            result["status"] = "not_run_no_selected_region_pairs"
+            return result
     valid_epoch, n_nonfinite = _valid_epoch_mask(np.asarray(data), quality_epoch)
     n_valid = int(valid_epoch.sum())
     min_epochs = int(tde_cfg.get("min_epochs", 5))
@@ -370,6 +389,7 @@ def compute_time_delay(
             {"check": "valid_epoch_count", "value": n_valid, "status": "ok" if n_valid >= min_epochs else "fail", "note": "quality fail and nonfinite epochs are excluded; no epochs are concatenated"},
             {"check": "nonfinite_epoch_count", "value": n_nonfinite, "status": "ok" if n_nonfinite == 0 else "warn", "note": "nonfinite epochs are retained in quality trace and excluded from TDE"},
             {"check": "effective_valid_duration_s", "value": duration, "status": "ok", "note": "sum of valid epoch durations; not a continuous recording duration"},
+            {"check": "selected_region_pair_count", "value": len(requested_pairs), "status": "ok", "note": "only selected cross-region pairs are estimated; seed/target labels preserve the TDE convention"},
             {"check": "reference_policy", "value": "acquisition_reference_preserved", "status": "ok", "note": "no rereference, bipolar derivation, or orthogonalisation"},
         ],
         columns=["check", "value", "status", "note"],
@@ -381,8 +401,11 @@ def compute_time_delay(
         prepared, analysis_sfreq, resampling = _prepare_data(np.asarray(data)[valid_epoch], float(sfreq), config)
         bands = _frequency_bands(config, analysis_sfreq)
         n_points, resolution_ms, delay_window = _delay_points(prepared.shape[-1], analysis_sfreq, config)
-        method_values = _as_int_list(tde_cfg.get("methods"), [1])
-        antisym_values = [bool(value) for value in tde_cfg.get("antisymmetrized", [False, True])]
+        method_values = _as_int_list(tde_cfg.get("methods"), [int(tde_cfg.get("primary_method", 1))])
+        configured_antisym = tde_cfg.get("antisymmetrized")
+        if configured_antisym is None:
+            configured_antisym = [bool(tde_cfg.get("primary_antisymmetrized", True))]
+        antisym_values = [bool(value) for value in configured_antisym]
         if any(method not in TDE_METHOD_NAMES for method in method_values):
             raise ValueError(f"TDE methods must be integers 1-4, got {method_values}")
         if not antisym_values:
@@ -481,6 +504,11 @@ def compute_time_delay(
                     "methods": method_values,
                     "antisymmetrized": antisym_values,
                     "frequency_bands": [{"name": name, "low_hz": low, "high_hz": high} for name, low, high in bands],
+                    "selected_region_pairs": [list(pair) for pair in requested_pairs],
+                    "n_channel_pairs_per_region_pair": {
+                        f"{region_a}-{region_b}": len(group)
+                        for (region_a, region_b), group in groups.groupby(["region_a", "region_b"], sort=False)
+                    },
                     "sign_convention": "positive delay means seed region/channel leads target region/channel; negative means target leads seed",
                     "interpretation_limit": "delay sign is not anatomical or causal proof; common reference and signal mixing are not eliminated by antisymmetrisation",
                     "n_nonfinite_epochs_excluded": n_nonfinite,

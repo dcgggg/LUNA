@@ -1,0 +1,9 @@
+# LUNA user-facing configuration entry point.
+# The scientific defaults remain in default.yaml for backwards compatibility;
+# this file makes the software identity explicit without duplicating parameters.
+extends: default.yaml
+
+project:
+  name: LUNA
+  full_name: Local field potential Unified Network Analysis platform
+  description: A modular GUI-based platform for multichannel local field potential analysis.

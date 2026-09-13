@@ -38,7 +38,7 @@ def validate_metadata_tables(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
     for table, required in REQUIRED_COLUMNS.items():
         frame = tables.get(table, pd.DataFrame())
-        if frame.empty and table in {"animals", "records", "files", "behavior"}:
+        if frame.empty:
             issue(table, "info", "empty_template", "table is empty; this is allowed before metadata registration")
             continue
         for column in required:

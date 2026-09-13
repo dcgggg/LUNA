@@ -42,6 +42,47 @@ def _epoch_hash(epoch: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(epoch).tobytes()).hexdigest()
 
 
+def align_epoch_quality(
+    quality_epoch: pd.DataFrame | None,
+    n_epochs: int,
+    epoch_ids: list[int] | np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Align epoch-level QC rows to the data order without silent reordering.
+
+    ``analysis_epoch_index`` is preferred for selected data. ``epoch_index`` is
+    used for full-file data or when explicit ``epoch_ids`` are supplied. A
+    legacy table without an identifier is accepted only when its row count is
+    exactly equal to the data count and is marked as row-order alignment. Any
+    missing quality row or status is conservative and therefore not valid.
+    """
+    frame = quality_epoch.copy() if isinstance(quality_epoch, pd.DataFrame) else pd.DataFrame()
+    expected = list(range(int(n_epochs))) if epoch_ids is None else [int(value) for value in epoch_ids]
+    if len(expected) != int(n_epochs) or len(set(expected)) != len(expected):
+        raise ValueError("epoch_ids_must_be_unique_and_match_data_length")
+
+    key = "analysis_epoch_index" if "analysis_epoch_index" in frame.columns else ("epoch_index" if "epoch_index" in frame.columns else None)
+    if key is None:
+        if len(frame) != int(n_epochs):
+            frame = pd.DataFrame(index=range(int(n_epochs)))
+            frame["quality_alignment_status"] = "missing_epoch_identifier_and_row"
+        else:
+            frame = frame.reset_index(drop=True)
+            frame["quality_alignment_status"] = "legacy_row_order"
+        frame["analysis_epoch_index"] = np.arange(int(n_epochs), dtype=int)
+    else:
+        identifiers = pd.to_numeric(frame[key], errors="coerce")
+        if identifiers.isna().any() or identifiers.duplicated().any():
+            raise ValueError(f"{key}_must_be_unique_and_finite")
+        indexed = frame.assign(_epoch_key=identifiers.astype(int)).set_index("_epoch_key", drop=False)
+        frame = indexed.reindex(expected).reset_index(drop=True)
+        frame["analysis_epoch_index"] = np.arange(int(n_epochs), dtype=int)
+        frame["quality_alignment_status"] = np.where(frame[key].notna(), "id_aligned", "missing_epoch_row")
+    if "quality_status" not in frame.columns:
+        frame["quality_status"] = "missing_quality_status"
+    frame["quality_status"] = frame["quality_status"].where(frame["quality_status"].notna(), "missing_quality_status")
+    return frame
+
+
 def assess_quality(data: np.ndarray, sfreq: float, ch_names: list[str], config: dict[str, Any]) -> dict[str, pd.DataFrame]:
     """Return flags and metrics without changing or excluding signal data."""
     data = np.asarray(data, dtype=float)
@@ -51,10 +92,11 @@ def assess_quality(data: np.ndarray, sfreq: float, ch_names: list[str], config: 
     flat_threshold = float(quality_cfg.get("flat_std_threshold", 1e-15))
     max_z_threshold = float(quality_cfg.get("max_abs_z_threshold", 20.0))
     saturation_threshold = float(quality_cfg.get("saturation_fraction_threshold", 0.01))
+    duplicate_detection = str(quality_cfg.get("duplicate_epoch_detection", True)).strip().lower() in {"1", "true", "yes", "on"}
     line_candidates = [float(value) for value in quality_cfg.get("line_noise_hz", [])]
     line_ratio_threshold = float(quality_cfg.get("line_noise_peak_ratio_threshold", 8.0))
     epoch_hashes = [_epoch_hash(epoch) for epoch in data]
-    duplicate_hashes = {value for value in epoch_hashes if epoch_hashes.count(value) > 1}
+    duplicate_hashes = {value for value in epoch_hashes if epoch_hashes.count(value) > 1} if duplicate_detection else set()
 
     rows: list[dict[str, Any]] = []
     for epoch_index, epoch in enumerate(data):
@@ -146,7 +188,10 @@ def assess_quality(data: np.ndarray, sfreq: float, ch_names: list[str], config: 
                 "effective_valid_duration_s": float(epoch_df["valid_duration_s"].sum()),
                 "n_fail_epoch_channel_rows": int(np.sum(channel_df["quality_status"] == "fail")),
                 "n_warn_epoch_channel_rows": int(np.sum(channel_df["quality_status"] == "warn")),
-                "n_duplicate_epoch_rows": int(len(epoch_hashes) - len(set(epoch_hashes))),
+                "n_duplicate_epoch_rows": int(len(epoch_hashes) - len(set(epoch_hashes))) if duplicate_detection else 0,
+                "duplicate_epoch_detection": duplicate_detection,
+                "check_frequency_band_hz": quality_cfg.get("check_frequency_band_hz", [1.0, 200.0]),
+                "frequency_band_check_status": "not_evaluated_by_time_domain_qc; verify against PSD frequency range",
             }
         ]
     )

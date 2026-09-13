@@ -135,35 +135,64 @@ def prepare_connectivity(
         channel_spectrum = channel_spectrum.loc[channel_spectrum["aggregation_level"].astype(str).eq("cross_region_channel_pair")].copy()
     bands = _method_table(tables.get("band_summary", pd.DataFrame()), method, component_value)
     channel_pair_bands = _method_table(tables.get("channel_pair_band_summary", pd.DataFrame()), method, component_value)
-    for frame in (spectrum, channel_spectrum, bands, channel_pair_bands):
+    display_spectrum = _method_table(tables.get("display_spectrum", pd.DataFrame()), method, component_value)
+    selected_tables = {
+        "spectrum": spectrum,
+        "channel_spectrum": channel_spectrum,
+        "bands": bands,
+        "channel_pair_bands": channel_pair_bands,
+        "display_spectrum": display_spectrum,
+    }
+    for table_name, frame in selected_tables.items():
         if frame.empty:
             continue
-        oriented = [_oriented_pair(a, b) for a, b in zip(frame["region_a"], frame["region_b"], strict=False)]
+        if not {"region_a", "region_b"}.issubset(frame.columns):
+            selected_tables[table_name] = frame.iloc[0:0].copy()
+            continue
+        # Keep one oriented pair per input row.  Building this before the
+        # selection is safe because the same positional mask is then applied
+        # to both the frame and this array; no index-based re-alignment can
+        # attach a label from an excluded row to a retained value.
+        oriented = [
+            _oriented_pair(row.region_a, row.region_b)
+            for row in frame[["region_a", "region_b"]].itertuples(index=False)
+        ]
         if exact_direction and method == "dpli" and selected_pairs is not None:
             exact = {_oriented_pair(item[0], item[1]) for item in selected_pairs if not isinstance(item, str) and len(item) == 2}
-            mask = [pair in exact for pair in oriented]
+            keep = np.asarray([pair in exact for pair in oriented], dtype=bool)
         else:
-            keys = [_pair_key(a, b, region_display_order) for a, b in oriented]
-            mask = [allowed is None or key in allowed for key in keys]
-        frame.drop(frame.index[[not keep for keep in mask]], inplace=True)
-        frame["pair_label"] = [pair_label(*pair) for pair in oriented]
-        frame["display_pair_label"] = [
-            f"{pair[0]}→{pair[1]}" if method == "dpli" else pair_label(*_pair_key(*pair, region_display_order)) for pair in oriented
+            keep = np.asarray(
+                [allowed is None or _pair_key(pair[0], pair[1], region_display_order) in allowed for pair in oriented],
+                dtype=bool,
+            )
+        filtered = frame.loc[keep].copy()
+        filtered_oriented = [oriented[index] for index in np.flatnonzero(keep)]
+        filtered["pair_label"] = [pair_label(*pair) for pair in filtered_oriented]
+        filtered["display_pair_label"] = [
+            f"{pair[0]}→{pair[1]}" if method == "dpli" else pair_label(*_pair_key(*pair, region_display_order)) for pair in filtered_oriented
         ]
         if method == "mic":
-            frame["display_value"] = np.abs(pd.to_numeric(frame.get("value_raw", np.nan), errors="coerce"))
-        elif "value_raw_or_summary" in frame.columns:
-            frame["display_value"] = pd.to_numeric(frame["value_raw_or_summary"], errors="coerce")
+            filtered["display_value"] = np.abs(pd.to_numeric(filtered.get("value_raw", np.nan), errors="coerce"))
+        elif "value_raw_or_summary" in filtered.columns:
+            filtered["display_value"] = pd.to_numeric(filtered["value_raw_or_summary"], errors="coerce")
         else:
-            frame["display_value"] = pd.to_numeric(frame.get("value_raw", np.nan), errors="coerce")
+            filtered["display_value"] = pd.to_numeric(filtered.get("value_raw", np.nan), errors="coerce")
+        selected_tables[table_name] = filtered
+    spectrum = selected_tables["spectrum"]
+    channel_spectrum = selected_tables["channel_spectrum"]
+    bands = selected_tables["bands"]
+    channel_pair_bands = selected_tables["channel_pair_bands"]
+    display_spectrum = selected_tables["display_spectrum"]
     return {
         "spectrum": spectrum,
         "channel_spectrum": channel_spectrum,
         "bands": bands,
         "channel_pair_bands": channel_pair_bands,
+        "display_spectrum": display_spectrum,
         "method": method,
         "component_index": component_value,
         "region_order": region_display_order,
+        "selected_pairs_empty": bool(selected_pairs is not None and len(selected_pairs) == 0),
     }
 
 
@@ -206,7 +235,21 @@ def plot_spectrum(
     scale: str = "linear",
     title_prefix: str = "",
     font_size: int = 9,
+    view_mode: str = "full_highlight",
+    display_smoothing: bool = False,
+    show_line_noise_markers: bool = False,
+    exclude_line_noise: bool = False,
 ) -> None:
+    """Draw an existing connectivity spectrum without changing its values.
+
+    ``frequency_is_masked_for_plot`` and the historical
+    ``frequency_is_excluded_line_noise`` columns are annotations in saved
+    tables.  They are intentionally not applied to the plotted y-values by
+    default: a plot annotation must not silently turn a finite estimator
+    result into a visual gap.  ``exclude_line_noise`` is an explicit,
+    display-only choice that inserts NaNs at annotated bins.  The independent
+    ``show_line_noise_markers`` switch only adds shaded annotations.
+    """
     axis.clear()
     axis.set_axis_on()
     frame = prepared.get("spectrum", pd.DataFrame())
@@ -214,18 +257,49 @@ def plot_spectrum(
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         _axis_empty(axis, f"没有可显示的 {method_label(method)} 结果")
         return
+    raw_frame = frame
+    smooth_frame = prepared.get("display_spectrum", pd.DataFrame())
+    use_smoothing = bool(display_smoothing and isinstance(smooth_frame, pd.DataFrame) and not smooth_frame.empty and "display_value_smoothed" in smooth_frame)
     label_column = "display_pair_label" if method == "dpli" else "pair_label"
     for label, group in frame.groupby(label_column, sort=False):
         group = group.sort_values("frequency_hz")
         x = pd.to_numeric(group["frequency_hz"], errors="coerce").to_numpy(float)
         y = pd.to_numeric(group["display_value"], errors="coerce").to_numpy(float)
-        if "frequency_is_excluded_line_noise" in group:
-            y[np.asarray(group["frequency_is_excluded_line_noise"].fillna(False), dtype=bool)] = np.nan
+        mask_column = "frequency_is_masked_for_plot" if "frequency_is_masked_for_plot" in group else "frequency_is_excluded_line_noise"
+        line_noise_mask = (
+            np.asarray(group[mask_column].fillna(False), dtype=bool)
+            if mask_column in group
+            else np.zeros(len(group), dtype=bool)
+        )
+        if exclude_line_noise:
+            y[line_noise_mask] = np.nan
         linestyle = "--" if method == "dpli" and str(label).split("→", 1)[0] != str(label).split("→", 1)[-1] and "→" in str(label) else "-"
-        axis.plot(x, y, linewidth=1.15, linestyle=linestyle, color=PAIR_COLORS.get(str(group["pair_label"].iloc[0]), "#555555"), label=str(label))
+        color = PAIR_COLORS.get(str(group["pair_label"].iloc[0]), "#555555")
+        if use_smoothing:
+            axis.plot(x, y, linewidth=0.75, linestyle=linestyle, color=color, alpha=0.28, label="_nolegend_")
+            smooth_group = smooth_frame.loc[smooth_frame[label_column].astype(str).eq(str(label))].sort_values("frequency_hz")
+            smooth_x = pd.to_numeric(smooth_group["frequency_hz"], errors="coerce").to_numpy(float)
+            smooth_y = pd.to_numeric(smooth_group["display_value_smoothed"], errors="coerce").to_numpy(float)
+            smooth_mask_column = "frequency_is_masked_for_plot" if "frequency_is_masked_for_plot" in smooth_group else "frequency_is_excluded_line_noise"
+            if exclude_line_noise and smooth_mask_column in smooth_group:
+                smooth_y[np.asarray(smooth_group[smooth_mask_column].fillna(False), dtype=bool)] = np.nan
+            axis.plot(smooth_x, smooth_y, linewidth=1.35, linestyle=linestyle, color=color, label=f"{label}（display smooth）")
+        else:
+            axis.plot(x, y, linewidth=1.15, linestyle=linestyle, color=color, label=str(label))
     bands = _normalize_bands(selected_band)
     for index, band in enumerate(bands):
         axis.axvspan(float(band["low_hz"]), float(band["high_hz"]), color="#999999", alpha=0.12, label="显示频段" if index == 0 else "_nolegend_")
+    if show_line_noise_markers:
+        mask_values = pd.to_numeric(raw_frame.get("frequency_hz", pd.Series(dtype=float)), errors="coerce").to_numpy(float)
+        mask_column = "frequency_is_masked_for_plot" if "frequency_is_masked_for_plot" in raw_frame else "frequency_is_excluded_line_noise"
+        mask_values_flag = raw_frame.get(mask_column, pd.Series(False, index=raw_frame.index)).fillna(False).to_numpy(bool)
+        masked_frequencies = np.sort(np.unique(mask_values[mask_values_flag & np.isfinite(mask_values)]))
+        if len(masked_frequencies):
+            steps = np.diff(masked_frequencies)
+            split = np.flatnonzero(steps > (np.median(np.diff(np.sort(np.unique(mask_values)))) * 1.5 if len(np.unique(mask_values)) > 1 else np.inf))
+            for index, values in enumerate(np.split(masked_frequencies, split + 1)):
+                if len(values):
+                    axis.axvspan(float(values[0]), float(values[-1]), color="#777777", alpha=0.10, label="工频标记" if index == 0 else "_nolegend_")
     if str(scale).lower() == "log":
         axis.set_yscale("log")
         ylabel = f"{method_label(method)}（log scale）"
@@ -243,8 +317,17 @@ def plot_spectrum(
         axis.set_ylim(0.0, 1.0)
     if method == "dpli":
         axis.axhline(0.5, color="#555555", linewidth=0.75, linestyle=":", label="dPLI 中性 0.5")
+    mode = str(view_mode).lower()
+    if mode == "selected_band" and bands:
+        low = min(float(band["low_hz"]) for band in bands)
+        high = max(float(band["high_hz"]) for band in bands)
+        axis.set_xlim(low, high)
+        view_title = "仅显示选定频段"
+    else:
+        view_title = "全频谱（标记选定频段）"
     axis.set_xlabel("频率（Hz）")
-    axis.set_title(f"{title_prefix}{method_label(method)} 频谱{_bands_text(selected_band)}", fontsize=font_size + 1)
+    smoothing_note = "；仅显示平滑曲线（原始值另存）" if use_smoothing else ""
+    axis.set_title(f"{title_prefix}{method_label(method)} 频谱｜{view_title}{_bands_text(selected_band)}{smoothing_note}", fontsize=font_size + 1)
     axis.grid(True, color="#dddddd", linewidth=0.45, alpha=0.8)
     axis.legend(fontsize=max(7, font_size - 1), frameon=False, ncol=2)
     axis.tick_params(labelsize=font_size)
@@ -303,6 +386,17 @@ def _matrix_style(method: str, finite: np.ndarray) -> tuple[Any, str]:
     return Normalize(vmin=low, vmax=high), "raw scale"
 
 
+def _matrix_colorbar_label(method: str) -> str:
+    """Return the value semantics shown beside every matrix colorbar."""
+    if method == "dpli":
+        return "dPLI（0.5 中性）"
+    if method == "wpli":
+        return "wPLI"
+    if method == "mic":
+        return "|MIC|"
+    return "MIM/raw"
+
+
 def plot_matrix(
     axis: Any,
     figure: Any,
@@ -359,11 +453,16 @@ def plot_band_matrices(
     title_prefix: str = "",
     font_size: int = 9,
 ) -> dict[str, Any]:
-    """Draw all selected brain-region matrices in a two-column grid.
+    """Draw selected brain-region matrices with one cax per matrix.
 
-    A single normalization and colorbar are shared by every panel.  The
-    returned per-axis lookup keeps matrix clicks linked to the spectrum view.
+    A single normalization is shared by comparable panels, while every
+    matrix owns an independent colorbar axis.  This keeps the color mapping
+    comparable without allowing a shared colorbar to collide with the grid.
     """
+    if hasattr(figure, "set_layout_engine"):
+        # The nested GridSpec owns all spacing, including every cax.  Disable
+        # any rcParams/autolayout engine so export and Qt rendering agree.
+        figure.set_layout_engine(None)
     figure.clear()
     method = str(prepared.get("method", "mic"))
     bands = [band for band in (selected_bands or []) if isinstance(band, dict)]
@@ -377,16 +476,31 @@ def plot_band_matrices(
         matrices.append((band, matrix, lookup))
     finite_values = [matrix[np.isfinite(matrix)] for _, matrix, _ in matrices if np.isfinite(matrix).any()]
     n_rows = max(1, int(np.ceil(len(matrices) / 2)))
-    axes = figure.subplots(n_rows, 2, squeeze=False).ravel()
+    outer = figure.add_gridspec(
+        n_rows,
+        2,
+        left=0.10,
+        right=0.94,
+        bottom=0.12,
+        top=0.84,
+        wspace=0.52,
+        hspace=0.58,
+    )
+    axes: list[Any] = []
+    colorbar_axes: list[Any] = []
     if finite_values:
         finite = np.concatenate(finite_values)
         norm, scale_note = _matrix_style(method, finite)
         cmap_name = "RdBu_r" if method == "dpli" else "viridis"
         cmap = matplotlib.colormaps.get_cmap(cmap_name).with_extremes(bad="#d9d9d9")
-        image = None
         axis_lookup: dict[int, dict[str, Any]] = {}
         for index, (band, matrix, lookup) in enumerate(matrices):
-            axis = axes[index]
+            row_index, column_index = divmod(index, 2)
+            panel = outer[row_index, column_index].subgridspec(1, 2, width_ratios=[1.0, 0.13], wspace=0.24)
+            axis = figure.add_subplot(panel[0, 0])
+            cax = figure.add_subplot(panel[0, 1])
+            axes.append(axis)
+            colorbar_axes.append(cax)
             image = axis.imshow(matrix, cmap=cmap, norm=norm, interpolation="nearest", aspect="auto")
             regions = list(prepared.get("region_order") or REGION_ORDER)
             axis.set_xticks(range(len(regions)), regions, fontsize=font_size)
@@ -405,23 +519,25 @@ def plot_band_matrices(
                     axis.text(j, i, text, ha="center", va="center", fontsize=max(7, font_size - 1), color=color)
             axis.grid(False)
             axis_lookup[id(axis)] = {"pair_lookup": lookup, "band": band}
-        for axis in axes[len(matrices) :]:
-            axis.set_visible(False)
-        colorbar = figure.colorbar(image, ax=list(axes[: len(matrices)]), fraction=0.025, pad=0.04)
-        colorbar.ax.tick_params(labelsize=max(7, font_size - 1))
-        colorbar.set_label("dPLI（0.5 中性）" if method == "dpli" else ("wPLI" if method == "wpli" else ("|MIC|" if method == "mic" else "MIM/raw")), fontsize=font_size)
+            colorbar = figure.colorbar(image, cax=cax)
+            colorbar.ax.tick_params(labelsize=max(7, font_size - 1), pad=2)
+            colorbar.set_label(_matrix_colorbar_label(method), fontsize=font_size, labelpad=4)
     else:
         axis_lookup = {}
-        for axis in axes:
-            axis.set_visible(False)
-        _axis_empty(axes[0], f"当前频段没有可显示的 {method_label(method)} 结果")
+        panel = outer[0, 0].subgridspec(1, 2, width_ratios=[1.0, 0.13], wspace=0.24)
+        axis = figure.add_subplot(panel[0, 0])
+        cax = figure.add_subplot(panel[0, 1])
+        axes.append(axis)
+        colorbar_axes.append(cax)
+        cax.set_visible(False)
+        _axis_empty(axis, f"当前频段没有可显示的 {method_label(method)} 结果")
     figure.suptitle(f"{title_prefix}{method_label(method)} 多频段脑区矩阵", fontsize=font_size + 1)
-    figure.subplots_adjust(left=0.10, right=0.86, bottom=0.08, top=0.88, wspace=0.28, hspace=0.38)
     return {
         "level": "region_multi",
         "axis_lookup": axis_lookup,
         "matrices": {str(band.get("name", "")): matrix for band, matrix, _ in matrices},
         "scale_note": scale_note if finite_values else "",
+        "colorbar_axes": colorbar_axes,
     }
 
 
@@ -515,7 +631,11 @@ def plot_channel_pair_matrices(
     swap: bool = False,
     font_size: int = 9,
 ) -> dict[str, Any]:
-    """Draw channel-pair matrices for all selected bands with one colorbar."""
+    """Draw channel-pair matrices with one independently placed cax each."""
+    if hasattr(figure, "set_layout_engine"):
+        # Keep the channel-pair export on the same explicit layout strategy as
+        # the multi-band region matrices.
+        figure.set_layout_engine(None)
     figure.clear()
     method = str(prepared.get("method", "wpli"))
     bands = [band for band in (selected_bands or []) if isinstance(band, dict)]
@@ -533,15 +653,30 @@ def plot_channel_pair_matrices(
         matrices.append((band, values, rows, columns, lookup))
     finite_values = [values[np.isfinite(values)] for _, values, _, _, _ in matrices if values.size and np.isfinite(values).any()]
     n_rows = max(1, int(np.ceil(len(matrices) / 2)))
-    axes = figure.subplots(n_rows, 2, squeeze=False).ravel()
+    outer = figure.add_gridspec(
+        n_rows,
+        2,
+        left=0.12,
+        right=0.94,
+        bottom=0.14,
+        top=0.84,
+        wspace=0.56,
+        hspace=0.66,
+    )
+    axes: list[Any] = []
+    colorbar_axes: list[Any] = []
     axis_lookup: dict[int, dict[str, Any]] = {}
     if finite_values:
         norm, _scale_note = _matrix_style(method, np.concatenate(finite_values))
         cmap_name = "RdBu_r" if method == "dpli" else "viridis"
         cmap = matplotlib.colormaps.get_cmap(cmap_name).with_extremes(bad="#d9d9d9")
-        image = None
         for index, (band, values, rows, columns, lookup) in enumerate(matrices):
-            axis = axes[index]
+            row_index, column_index = divmod(index, 2)
+            panel = outer[row_index, column_index].subgridspec(1, 2, width_ratios=[1.0, 0.13], wspace=0.24)
+            axis = figure.add_subplot(panel[0, 0])
+            cax = figure.add_subplot(panel[0, 1])
+            axes.append(axis)
+            colorbar_axes.append(cax)
             image = axis.imshow(values, cmap=cmap, norm=norm, interpolation="nearest", aspect="auto")
             axis.set_xticks(range(len(columns)), columns, rotation=45, ha="right", fontsize=font_size)
             axis.set_yticks(range(len(rows)), rows, fontsize=font_size)
@@ -555,18 +690,25 @@ def plot_channel_pair_matrices(
                         axis.text(j, i, f"{values[i, j]:.3g}", ha="center", va="center", fontsize=max(7, font_size - 1), color=color)
             axis.grid(False)
             axis_lookup[id(axis)] = {"channel_pair_lookup": lookup, "band": band}
-        for axis in axes[len(matrices) :]:
-            axis.set_visible(False)
-        colorbar = figure.colorbar(image, ax=list(axes[: len(matrices)]), fraction=0.025, pad=0.04)
-        colorbar.ax.tick_params(labelsize=max(7, font_size - 1))
-        colorbar.set_label("dPLI（0.5 中性）" if method == "dpli" else ("wPLI" if method == "wpli" else method_label(method)), fontsize=font_size)
+            colorbar = figure.colorbar(image, cax=cax)
+            colorbar.ax.tick_params(labelsize=max(7, font_size - 1), pad=2)
+            colorbar.set_label(_matrix_colorbar_label(method), fontsize=font_size, labelpad=4)
     else:
-        for axis in axes:
-            axis.set_visible(False)
-        _axis_empty(axes[0], "当前频段没有可显示的通道对结果")
+        panel = outer[0, 0].subgridspec(1, 2, width_ratios=[1.0, 0.13], wspace=0.24)
+        axis = figure.add_subplot(panel[0, 0])
+        cax = figure.add_subplot(panel[0, 1])
+        axes.append(axis)
+        colorbar_axes.append(cax)
+        cax.set_visible(False)
+        _axis_empty(axis, "当前频段没有可显示的通道对结果")
     figure.suptitle(f"{method_label(method)} {region_pair[0]}–{region_pair[1]} 多频段通道对矩阵", fontsize=font_size + 1)
-    figure.subplots_adjust(left=0.12, right=0.86, bottom=0.12, top=0.88, wspace=0.30, hspace=0.42)
-    return {"level": "channel_pair_multi", "axis_lookup": axis_lookup, "region_pair": region_pair, "swap": swap}
+    return {
+        "level": "channel_pair_multi",
+        "axis_lookup": axis_lookup,
+        "region_pair": region_pair,
+        "swap": swap,
+        "colorbar_axes": colorbar_axes,
+    }
 
 
 def available_methods(tables: dict[str, Any]) -> list[str]:

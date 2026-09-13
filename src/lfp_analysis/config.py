@@ -45,3 +45,37 @@ def as_float(value: Any, default: float | None = None) -> float | None:
     if value in (None, ""):
         return default
     return float(value)
+
+
+def audit_config(config: dict[str, Any]) -> list[dict[str, str]]:
+    """Report configuration fields whose scope is limited or compatibility-only."""
+    quality = config.get("quality", {}) or {}
+    parameterization = config.get("parameterization", {}) or {}
+    plotting = config.get("plotting", {}) or {}
+    return [
+        {
+            "path": "quality.check_frequency_band_hz",
+            "status": "audit_only",
+            "detail": f"recorded as metadata {quality.get('check_frequency_band_hz', [1.0, 200.0])}; time-domain QC does not estimate PSD",
+        },
+        {
+            "path": "parameterization.min_peak_prominence",
+            "status": "unused_by_installed_backend_api",
+            "detail": f"requested value {parameterization.get('min_peak_prominence', '')} is retained for compatibility and is not passed to FOOOF/specparam",
+        },
+        {
+            "path": "time_delay.primary_method",
+            "status": "default_only",
+            "detail": "used only when time_delay.methods is omitted",
+        },
+        {
+            "path": "time_delay.primary_antisymmetrized",
+            "status": "default_only",
+            "detail": "used only when time_delay.antisymmetrized is omitted",
+        },
+        {
+            "path": "plotting.preview_format/editable_format",
+            "status": "compatibility_policy",
+            "detail": f"exporters always write PNG and SVG; configured values are {plotting.get('preview_format', 'png')}/{plotting.get('editable_format', 'svg')}",
+        },
+    ]

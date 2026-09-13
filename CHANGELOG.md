@@ -2,6 +2,30 @@
 
 All notable changes to LUNA are documented here.
 
+## [0.2.1] — 2026-09-13 (prerelease)
+
+### Changed
+
+- Refined the GUI configuration and result-view layout, including method-specific PSD controls, independent scrolling for plots, compact result-table previews, and responsive channel/region controls.
+- Added packaged LUNA resources, stable color/style helpers, identity handling, and expanded saved-run metadata needed for reproducible reloads.
+- Extended connectivity result handling and plotting diagnostics while preserving the existing MIC, MIM, wPLI, dPLI, and time-delay result semantics.
+- Clarified the README and development records for the verified Windows/Python environment, real FIF checks, and the limits of file-level analysis when animal identity is unresolved.
+
+### Fixed
+
+- Fixed connectivity spectrum display gaps caused by plotting-time line-noise masking being coupled to the optional background marker. Marker display and explicit plot exclusion are now independent, and the default display preserves finite returned values.
+- Fixed GUI refresh, mapping, plotting, export, and quality-alignment regressions covered by the expanded test suite.
+
+### Validation
+
+- The full local test suite, Ruff checks, Python compilation, and dependency checks were run against the current workspace.
+- The fixed read-only T80 FIF sample was reloaded and used for file-level validation; raw experimental data and generated results are not included in the release source tree.
+
+### Known limitations
+
+- The supplied sample does not resolve animal/session identity, so animal-level inference and treatment/behavior conclusions remain disabled.
+- Native desktop mouse/DPI inspection is environment-dependent; offscreen Qt checks do not replace manual verification on every Windows display configuration.
+
 ## [0.2.0] — 2026-09-10 (prerelease)
 
 ### Added

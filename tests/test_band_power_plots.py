@@ -70,3 +70,24 @@ def test_band_power_plots_keep_two_requested_plot_structures() -> None:
     assert len(overview.axes) == 2  # heatmap plus one colorbar
     assert len(comparison.axes) == 1
     assert np.isfinite(info["matrix"]).all()
+
+
+def test_band_power_overview_can_be_rebuilt_and_drawn_repeatedly() -> None:
+    """Rapid result delivery must not retain removed Axes or colorbars."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    prepared = prepare_band_power({"band_power": _band_table()})
+    figure = Figure(figsize=(6, 4), tight_layout=False)
+    canvas = FigureCanvasAgg(figure)
+    for _ in range(12):
+        figure.clear()
+        axis = figure.add_subplot(111)
+        plot_overview(axis, figure, prepared, "absolute", "linear", "M1-1", "delta", False, "test")
+        figure.subplots_adjust(left=0.14, right=0.92, bottom=0.22, top=0.88)
+        canvas.draw()
+        assert len(figure.axes) == 2
+        assert all(artist.get_figure(root=True) is figure for artist in figure.axes)

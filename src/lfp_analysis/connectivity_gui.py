@@ -27,6 +27,8 @@ from .connectivity_plots import (
     plot_spectrum,
     prepare_connectivity,
 )
+from .connectivity_processing import smooth_for_display
+from .gui_layout import PlotScrollArea
 
 
 class _FlowLayout(QtWidgets.QLayout):
@@ -118,6 +120,48 @@ class _BandCheckGroup(QtWidgets.QWidget):
         return [band for checkbox, band in self._checks if checkbox.isChecked()]
 
 
+class _PairCheckGroup(QtWidgets.QWidget):
+    """Wrapping region-pair checkboxes with stable data-order semantics.
+
+    The viewer may receive a user-defined number of regions.  A flow layout
+    keeps the usual small set of pairs compact while the surrounding scroll
+    area prevents a large mapping from taking over the result area.
+    """
+
+    changed = QtCore.Signal()
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._layout = _FlowLayout()
+        self.setLayout(self._layout)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        self._checks: list[tuple[QtWidgets.QCheckBox, tuple[str, str]]] = []
+
+    def clear(self) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self._checks.clear()
+        self.updateGeometry()
+
+    def add_item(self, pair: tuple[str, str], checked: bool = True) -> None:
+        text = pair_label(*pair)
+        checkbox = QtWidgets.QCheckBox(text)
+        checkbox.setMinimumWidth(checkbox.fontMetrics().horizontalAdvance(text) + 30)
+        checkbox.setToolTip(f"{text}；左侧为 seed，右侧为 target（有向指标保留方向）")
+        checkbox.setChecked(checked)
+        checkbox.stateChanged.connect(self.changed)
+        self._layout.addWidget(checkbox)
+        self._checks.append((checkbox, pair))
+
+    def count(self) -> int:
+        return len(self._checks)
+
+    def checked_data(self) -> list[tuple[str, str]]:
+        return [pair for checkbox, pair in self._checks if checkbox.isChecked()]
+
+
 class ConnectivityView(QtWidgets.QWidget):
     """Display saved connectivity results without triggering another computation."""
 
@@ -134,6 +178,9 @@ class ConnectivityView(QtWidgets.QWidget):
         self.prepared: dict[str, Any] = {}
         self._matrix_info: dict[str, Any] = {}
         self._updating = False
+        self._refreshing = False
+        self._refresh_pending = False
+        self._last_refresh_error = ""
         self._focus_pair: tuple[str, str] | None = None
         self._focus_channel_pair: tuple[str, str] | None = None
         self._is_tde = False
@@ -146,14 +193,42 @@ class ConnectivityView(QtWidgets.QWidget):
         controls.setVerticalSpacing(6)
         self.metric_combo = QtWidgets.QComboBox()
         self.metric_combo.setToolTip("当前结果中的连接指标；切换只刷新展示，不重新计算。")
-        self.pair_list = QtWidgets.QListWidget()
-        self.pair_list.setMaximumHeight(76)
+        self.pair_group = _PairCheckGroup()
+        self.pair_list = self.pair_group  # compatibility alias for existing callers
+        self.pair_scroll = QtWidgets.QScrollArea()
+        self.pair_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.pair_scroll.setWidgetResizable(True)
+        self.pair_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.pair_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.pair_scroll.setWidget(self.pair_group)
+        self.pair_scroll.setMaximumHeight(104)
+        self.pair_scroll.setToolTip("脑区对按行排列；窗口变窄时自动换行，脑区较多时可纵向滚动。")
         self.band_list = _BandCheckGroup()
         self.band_list.setToolTip("勾选需要同时显示的频段；矩阵将按两列网格展示。")
         self.component_combo = QtWidgets.QComboBox()
         self.scale_combo = QtWidgets.QComboBox()
         self.scale_combo.addItem("线性", "linear")
         self.scale_combo.addItem("对数（仅正值）", "log")
+        self.spectrum_view_combo = QtWidgets.QComboBox()
+        self.spectrum_view_combo.addItem("全频谱＋标记频段", "full_highlight")
+        self.spectrum_view_combo.addItem("仅显示选定频段", "selected_band")
+        self.spectrum_view_combo.setToolTip("仅切换显示范围，不重新计算连接频谱。")
+        self.display_smoothing_check = QtWidgets.QCheckBox("仅显示平滑曲线")
+        self.display_smoothing_check.setToolTip("使用独立的 display-only 曲线；原始频谱和频段统计不变。")
+        self.line_noise_markers_check = QtWidgets.QCheckBox("显示工频标记")
+        self.line_noise_markers_check.setChecked(False)
+        self.line_noise_markers_check.setToolTip("仅在图中标出结果表已记录的工频区间；不改变连接数值。")
+        self.line_noise_exclusion_check = QtWidgets.QCheckBox("绘图排除工频频点")
+        self.line_noise_exclusion_check.setChecked(False)
+        self.line_noise_exclusion_check.setToolTip("仅对当前绘图插入断点；不修改原始频谱、频段汇总或导出数值。")
+        self.line_noise_display_label = QtWidgets.QLabel("工频显示")
+        self.line_noise_display_widget = QtWidgets.QWidget()
+        line_noise_layout = QtWidgets.QHBoxLayout(self.line_noise_display_widget)
+        line_noise_layout.setContentsMargins(0, 0, 0, 0)
+        line_noise_layout.setSpacing(10)
+        line_noise_layout.addWidget(self.line_noise_markers_check)
+        line_noise_layout.addWidget(self.line_noise_exclusion_check)
+        line_noise_layout.addStretch(1)
         self.matrix_level_combo = QtWidgets.QComboBox()
         self.matrix_level_combo.addItem("脑区汇总矩阵", "region")
         self.matrix_level_combo.addItem("当前脑区对的通道对矩阵", "channel_pair")
@@ -163,6 +238,7 @@ class ConnectivityView(QtWidgets.QWidget):
         self.font_spin.setValue(9)
         self.component_label = QtWidgets.QLabel("MIC 成分")
         self.band_label = QtWidgets.QLabel("Frequency bands display")
+        self.spectrum_view_label = QtWidgets.QLabel("频谱视图")
         fields = (
             ("Indicator", self.metric_combo),
             ("坐标尺度", self.scale_combo),
@@ -180,10 +256,15 @@ class ConnectivityView(QtWidgets.QWidget):
             controls.addWidget(label_widget, row, column)
             controls.addWidget(widget, row, column + 1)
         controls.addWidget(self.swap_matrix_check, 1, 2, 1, 2)
-        controls.addWidget(self.band_label, 2, 0)
-        controls.addWidget(self.band_list, 2, 1, 1, 7)
-        controls.addWidget(QtWidgets.QLabel("脑区对（可多选）"), 3, 0)
-        controls.addWidget(self.pair_list, 3, 1, 1, 7)
+        controls.addWidget(self.spectrum_view_label, 1, 4)
+        controls.addWidget(self.spectrum_view_combo, 1, 5)
+        controls.addWidget(self.display_smoothing_check, 1, 6, 1, 2)
+        controls.addWidget(self.line_noise_display_label, 2, 0)
+        controls.addWidget(self.line_noise_display_widget, 2, 1, 1, 7)
+        controls.addWidget(self.band_label, 3, 0)
+        controls.addWidget(self.band_list, 3, 1, 1, 7)
+        controls.addWidget(QtWidgets.QLabel("脑区对（可多选）"), 4, 0)
+        controls.addWidget(self.pair_scroll, 4, 1, 1, 7)
         root.addLayout(controls)
 
         # Keep a small compatibility alias for callers that used the former
@@ -202,6 +283,7 @@ class ConnectivityView(QtWidgets.QWidget):
 
         self.status_label = QtWidgets.QLabel("连接结果尚未载入")
         self.status_label.setWordWrap(True)
+        self.status_label.setMaximumHeight(44)
         root.addWidget(self.status_label)
         plot_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.spectrum_figure, self.spectrum_canvas = self._new_canvas()
@@ -210,34 +292,39 @@ class ConnectivityView(QtWidgets.QWidget):
         spectrum_layout = QtWidgets.QVBoxLayout(spectrum_panel)
         spectrum_layout.setContentsMargins(0, 0, 0, 0)
         spectrum_toolbar = NavigationToolbar2QT(self.spectrum_canvas, self)
-        spectrum_toolbar.setMaximumHeight(34)
+        spectrum_toolbar.setFixedHeight(34)
         spectrum_layout.addWidget(spectrum_toolbar)
         spectrum_layout.addWidget(self.spectrum_canvas)
+        self.spectrum_canvas.setMinimumHeight(390)
+        spectrum_panel.setMinimumHeight(435)
         matrix_panel = QtWidgets.QWidget()
         matrix_layout = QtWidgets.QVBoxLayout(matrix_panel)
         matrix_layout.setContentsMargins(0, 0, 0, 0)
         matrix_toolbar = NavigationToolbar2QT(self.matrix_canvas, self)
-        matrix_toolbar.setMaximumHeight(34)
+        matrix_toolbar.setFixedHeight(34)
         matrix_layout.addWidget(matrix_toolbar)
         matrix_layout.addWidget(self.matrix_canvas)
-        self.matrix_scroll = QtWidgets.QScrollArea()
-        self.matrix_scroll.setWidgetResizable(True)
-        self.matrix_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        self.matrix_scroll.setWidget(matrix_panel)
+        self.matrix_canvas.setMinimumHeight(420)
+        matrix_panel.setMinimumHeight(465)
         plot_splitter.addWidget(spectrum_panel)
-        plot_splitter.addWidget(self.matrix_scroll)
+        plot_splitter.addWidget(matrix_panel)
         plot_splitter.setChildrenCollapsible(False)
         plot_splitter.setHandleWidth(6)
         plot_splitter.setStretchFactor(0, 1)
         plot_splitter.setStretchFactor(1, 1)
         plot_splitter.setSizes([460, 380])
-        root.addWidget(plot_splitter, stretch=1)
+        plot_splitter.setMinimumHeight(910)
+        plot_content = QtWidgets.QWidget()
+        plot_content_layout = QtWidgets.QVBoxLayout(plot_content)
+        plot_content_layout.setContentsMargins(0, 0, 6, 0)
+        plot_content_layout.setSpacing(6)
+        plot_content_layout.addWidget(plot_splitter)
 
         self.detail_toggle = QtWidgets.QPushButton("展开 MIC patterns / rank 诊断")
         self.detail_toggle.setCheckable(True)
         self.detail_toggle.setChecked(False)
         self.detail_toggle.toggled.connect(self._details_toggled)
-        root.addWidget(self.detail_toggle)
+        plot_content_layout.addWidget(self.detail_toggle)
         self.detail_panel = QtWidgets.QGroupBox("按需详情：patterns 不是源定位或通道生物学贡献率")
         detail_layout = QtWidgets.QVBoxLayout(self.detail_panel)
         detail_controls = QtWidgets.QGridLayout()
@@ -275,8 +362,13 @@ class ConnectivityView(QtWidgets.QWidget):
         detail_splitter.addWidget(rank_panel)
         detail_splitter.setSizes([560, 380])
         detail_layout.addWidget(detail_splitter, stretch=1)
-        root.addWidget(self.detail_panel, stretch=1)
+        plot_content_layout.addWidget(self.detail_panel)
         self.detail_panel.setVisible(False)
+        self.plot_scroll = PlotScrollArea(plot_content, minimum_content_height=960, allow_horizontal=True)
+        # Compatibility alias for callers that previously inspected the
+        # matrix-only scroll area.  It now refers to the complete plot viewport.
+        self.matrix_scroll = self.plot_scroll
+        root.addWidget(self.plot_scroll, stretch=1)
 
         self.metric_combo.currentIndexChanged.connect(self._controls_changed)
         self.band_list.changed.connect(self._controls_changed)
@@ -285,7 +377,11 @@ class ConnectivityView(QtWidgets.QWidget):
         self.matrix_level_combo.currentIndexChanged.connect(self._controls_changed)
         self.swap_matrix_check.stateChanged.connect(self._controls_changed)
         self.font_spin.valueChanged.connect(self._controls_changed)
-        self.pair_list.itemChanged.connect(self._controls_changed)
+        self.spectrum_view_combo.currentIndexChanged.connect(self._controls_changed)
+        self.display_smoothing_check.stateChanged.connect(self._controls_changed)
+        self.line_noise_markers_check.stateChanged.connect(self._controls_changed)
+        self.line_noise_exclusion_check.stateChanged.connect(self._controls_changed)
+        self.pair_group.changed.connect(self._controls_changed)
         self.pattern_pair_combo.currentIndexChanged.connect(self._controls_changed)
         self.pattern_component_combo.currentIndexChanged.connect(self._controls_changed)
         self.pattern_frequency_combo.currentIndexChanged.connect(self._controls_changed)
@@ -294,7 +390,10 @@ class ConnectivityView(QtWidgets.QWidget):
 
     @staticmethod
     def _new_canvas() -> tuple[Figure, FigureCanvasQTAgg]:
-        figure = Figure(figsize=(9, 4), tight_layout=True)
+        # Layout is controlled explicitly after each draw.  ``tight_layout``
+        # on a Qt canvas produced repeated warnings and clipped long labels.
+        figure = Figure(figsize=(9, 4), tight_layout=False)
+        figure.set_layout_engine(None)
         return figure, FigureCanvasQTAgg(figure)
 
     def set_payload(
@@ -338,6 +437,11 @@ class ConnectivityView(QtWidgets.QWidget):
             return
         self.matrix_level_combo.setVisible(True)
         self.swap_matrix_check.setVisible(True)
+        self.spectrum_view_label.setVisible(True)
+        self.spectrum_view_combo.setVisible(True)
+        self.display_smoothing_check.setVisible(True)
+        self.line_noise_display_label.setVisible(True)
+        self.line_noise_display_widget.setVisible(True)
         tables = self._tables()
         methods = available_methods(tables)
         old_method = self._current_method()
@@ -356,10 +460,14 @@ class ConnectivityView(QtWidgets.QWidget):
             self.component_combo.setEnabled(is_mic)
             self.component_label.setVisible(is_mic)
             self.component_combo.setVisible(is_mic)
+            region_spectrum = tables.get("region_summary", pd.DataFrame())
+            self.display_smoothing_check.setEnabled(bool(isinstance(region_spectrum, pd.DataFrame) and not region_spectrum.empty))
             self.band_list.clear()
             for band in available_bands(tables):
                 self.band_list.add_item(band, checked=not old_band_names or str(band["name"]) in old_band_names)
-            self.pair_list.clear()
+            had_pair_items = self.pair_group.count() > 0
+            old_selected_pairs = set(self._selected_pairs())
+            self.pair_group.clear()
             frame = tables.get("region_summary", pd.DataFrame())
             display_regions = infer_region_order(tables)
             pairs: list[tuple[str, str]] = []
@@ -376,11 +484,8 @@ class ConnectivityView(QtWidgets.QWidget):
             order_index = {name: index for index, name in enumerate(display_regions)}
             pairs.sort(key=lambda value: (order_index.get(value[0], 999), order_index.get(value[1], 999)))
             for region_a, region_b in pairs:
-                item = QtWidgets.QListWidgetItem(pair_label(region_a, region_b))
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, (region_a, region_b))
-                item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(QtCore.Qt.CheckState.Checked)
-                self.pair_list.addItem(item)
+                pair = (region_a, region_b)
+                self.pair_group.add_item(pair, checked=(not had_pair_items or pair in old_selected_pairs))
             self._update_matrix_level_options()
             self._populate_pattern_controls()
         finally:
@@ -399,6 +504,11 @@ class ConnectivityView(QtWidgets.QWidget):
             self.component_combo.setVisible(False)
             self.matrix_level_combo.setVisible(False)
             self.swap_matrix_check.setVisible(False)
+            self.spectrum_view_label.setVisible(False)
+            self.spectrum_view_combo.setVisible(False)
+            self.display_smoothing_check.setVisible(False)
+            self.line_noise_display_label.setVisible(False)
+            self.line_noise_display_widget.setVisible(False)
             self.band_list.clear()
             bands = []
             source = band_summary if isinstance(band_summary, pd.DataFrame) and not band_summary.empty else region_spectrum
@@ -407,18 +517,16 @@ class ConnectivityView(QtWidgets.QWidget):
                     bands.append({"name": str(row.frequency_band), "low_hz": float(row.band_low_hz), "high_hz": float(row.band_high_hz)})
             for band in bands:
                 self.band_list.add_item(band, checked=True)
-            self.pair_list.clear()
+            had_pair_items = self.pair_group.count() > 0
+            old_selected_pairs = set(self._selected_pairs())
+            self.pair_group.clear()
             if isinstance(region_spectrum, pd.DataFrame) and not region_spectrum.empty and {"region_a", "region_b"}.issubset(region_spectrum.columns):
                 pairs = region_spectrum[["region_a", "region_b"]].drop_duplicates().itertuples(index=False)
                 for row in pairs:
                     pair = (str(row.region_a), str(row.region_b))
                     if self.selected_regions and not set(pair).issubset(self.selected_regions):
                         continue
-                    item = QtWidgets.QListWidgetItem(pair_label(*pair))
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, pair)
-                    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                    item.setCheckState(QtCore.Qt.CheckState.Checked)
-                    self.pair_list.addItem(item)
+                    self.pair_group.add_item(pair, checked=(not had_pair_items or pair in old_selected_pairs))
             self._populate_pattern_controls()
         finally:
             self._updating = False
@@ -454,12 +562,17 @@ class ConnectivityView(QtWidgets.QWidget):
         selected_bands = self._selected_bands()
         selected_names = {str(band.get("name", "")) for band in selected_bands}
         pair_keys = {_pair_key(*pair) for pair in selected_pairs}
-        if selected_bands and isinstance(spectrum, pd.DataFrame) and not spectrum.empty:
+        if selected_bands and selected_pairs and isinstance(spectrum, pd.DataFrame) and not spectrum.empty:
             spec = spectrum.copy()
             if "frequency_band" in spec:
                 spec = spec.loc[spec["frequency_band"].astype(str).isin(selected_names)]
             if pair_keys and {"region_a", "region_b"}.issubset(spec.columns):
-                spec = spec.loc[[ _pair_key(a, b) in pair_keys for a, b in zip(spec["region_a"], spec["region_b"], strict=False)]]
+                spec = spec.loc[
+                    [
+                        _pair_key(row.region_a, row.region_b) in pair_keys
+                        for row in spec[["region_a", "region_b"]].itertuples(index=False)
+                    ]
+                ]
             primary = self._tde_primary_mode(spec if not spec.empty else spectrum)
             if "antisymmetrized" in spec:
                 spec = spec.loc[self._tde_bool_column(spec).eq(primary)]
@@ -498,12 +611,17 @@ class ConnectivityView(QtWidgets.QWidget):
 
         self.matrix_figure.clear()
         compare_axis = self.matrix_figure.add_subplot(111)
-        if selected_bands and isinstance(band_summary, pd.DataFrame) and not band_summary.empty:
+        if selected_bands and selected_pairs and isinstance(band_summary, pd.DataFrame) and not band_summary.empty:
             summary = band_summary.copy()
             if "frequency_band" in summary:
                 summary = summary.loc[summary["frequency_band"].astype(str).isin(selected_names)]
             if pair_keys and {"region_a", "region_b"}.issubset(summary.columns):
-                summary = summary.loc[[ _pair_key(a, b) in pair_keys for a, b in zip(summary["region_a"], summary["region_b"], strict=False)]]
+                summary = summary.loc[
+                    [
+                        _pair_key(row.region_a, row.region_b) in pair_keys
+                        for row in summary[["region_a", "region_b"]].itertuples(index=False)
+                    ]
+                ]
             if "antisymmetrized" in summary:
                 summary = summary.loc[self._tde_bool_column(summary).eq(primary)]
             delay_column = "region_peak_delay_ms" if "region_peak_delay_ms" in summary else "peak_delay_ms"
@@ -534,10 +652,13 @@ class ConnectivityView(QtWidgets.QWidget):
         self._matrix_info = {"level": "tde", "axis_lookup": {}}
         self._refresh_details()
         n_rows = len(spec) if isinstance(spec, pd.DataFrame) else 0
-        self.status_label.setText(
-            f"TDE：选中脑区对={len(selected_pairs)}；频段={len(selected_bands)}；"
-            f"曲线行数={n_rows}；显示={'antisymmetrized' if primary else 'raw'}；仅筛选已有结果。"
-        )
+        if not selected_pairs:
+            self.status_label.setText("请选择至少一个脑区对；当前 TDE 图为空，未改变已保存结果。")
+        else:
+            self.status_label.setText(
+                f"TDE：选中脑区对={len(selected_pairs)}；频段={len(selected_bands)}；"
+                f"曲线行数={n_rows}；显示={'antisymmetrized' if primary else 'raw'}；仅筛选已有结果。"
+            )
 
     def _populate_pattern_controls(self) -> None:
         patterns = self._tables().get("patterns", pd.DataFrame())
@@ -640,14 +761,7 @@ class ConnectivityView(QtWidgets.QWidget):
         self.rank_table.resizeColumnsToContents()
 
     def _selected_pairs(self) -> list[tuple[str, str]]:
-        pairs: list[tuple[str, str]] = []
-        for index in range(self.pair_list.count()):
-            item = self.pair_list.item(index)
-            if item.checkState() == QtCore.Qt.CheckState.Checked:
-                value = item.data(QtCore.Qt.ItemDataRole.UserRole)
-                if value:
-                    pairs.append(tuple(value))
-        return pairs
+        return list(self.pair_group.checked_data())
 
     def _selected_band(self) -> dict[str, Any] | None:
         bands = self._selected_bands()
@@ -682,7 +796,80 @@ class ConnectivityView(QtWidgets.QWidget):
         self._focus_channel_pair = None
         self._refresh()
 
-    def _refresh(self) -> None:
+    def _display_table_for_plot(self, plot_tables: dict[str, Any]) -> pd.DataFrame:
+        """Build a display-only smooth table using the explicit plot choice.
+
+        A saved display table may have been produced with the historical
+        line-noise plot mask.  Turning plot exclusion off therefore rebuilds
+        only this derived display table from a private copy of the raw
+        region-summary table.  No connectivity estimator or band summary is
+        called here.
+        """
+        saved = plot_tables.get("display_spectrum", pd.DataFrame())
+        if self.line_noise_exclusion_check.isChecked() and isinstance(saved, pd.DataFrame) and not saved.empty:
+            return saved
+        source = plot_tables.get("region_summary", pd.DataFrame())
+        if not isinstance(source, pd.DataFrame) or source.empty:
+            return pd.DataFrame()
+        source = source.copy(deep=True)
+        if not self.line_noise_exclusion_check.isChecked():
+            for column in ("frequency_is_masked_for_plot", "frequency_is_excluded_line_noise"):
+                if column in source:
+                    source[column] = False
+        parameters = self.payload.get("record", {}).get("parameters", {}) if self.payload else {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        if not self.line_noise_exclusion_check.isChecked():
+            # This is a display-only override.  In particular, do not change
+            # mask_for_analysis: saved band summaries retain their configured
+            # analysis policy, while this optional smooth display remains
+            # continuous over finite saved values.
+            parameters = dict(parameters)
+            line_noise = parameters.get("line_noise", {})
+            parameters["line_noise"] = dict(line_noise) if isinstance(line_noise, dict) else {}
+            parameters["line_noise"]["mask_for_plot"] = False
+        smooth_config = {
+            "connectivity": dict(parameters),
+            "visualization": {"connectivity": {"display_smoothing": {"enabled": True, "method": "gaussian", "sigma_hz": 0.5}}},
+        }
+        return smooth_for_display(source, smooth_config, enabled=True)
+
+    def _clear_after_refresh_error(self, error: Exception) -> None:
+        """Avoid leaving a partially redrawn figure looking like valid data."""
+        message = f"刷新失败：{type(error).__name__}: {error}"
+        self._last_refresh_error = message
+        for figure, canvas in ((self.spectrum_figure, self.spectrum_canvas), (self.matrix_figure, self.matrix_canvas)):
+            figure.clear()
+            axis = figure.add_subplot(111)
+            _message = "当前刷新失败，图已清空；请查看状态信息后重试。"
+            axis.text(0.5, 0.5, _message, ha="center", va="center", transform=axis.transAxes, color="#8a1c1c")
+            axis.set_axis_off()
+            canvas.draw_idle()
+        self.status_label.setText(f"{message}；未显示未标记的旧结果。")
+
+    def _refresh(self, *, preserve_scroll: bool = True) -> None:
+        """Refresh only existing tables, with a small re-entrancy guard."""
+        if self._refreshing:
+            self._refresh_pending = True
+            return
+        scroll_position = self.plot_scroll.scroll_position() if preserve_scroll else None
+        self._refreshing = True
+        try:
+            self._refresh_impl()
+        except Exception as error:  # noqa: BLE001 - a view error must not kill the GUI
+            self._clear_after_refresh_error(error)
+        finally:
+            self._refreshing = False
+            if scroll_position is not None:
+                self.plot_scroll.restore_scroll_position(scroll_position)
+            if self._refresh_pending:
+                self._refresh_pending = False
+                QtCore.QTimer.singleShot(0, self._refresh)
+
+    def reset_plot_scroll(self) -> None:
+        self.plot_scroll.reset_position()
+
+    def _refresh_impl(self) -> None:
         if self.payload is None:
             return
         if self._is_tde:
@@ -693,8 +880,11 @@ class ConnectivityView(QtWidgets.QWidget):
         component = int(self.component_combo.currentData() or (components[0] if components else 1))
         pairs = self._selected_pairs()
         plot_pairs = [self._focus_pair] if self._focus_pair is not None else pairs
+        plot_tables = dict(self._tables())
+        if self.display_smoothing_check.isChecked():
+            plot_tables["display_spectrum"] = self._display_table_for_plot(plot_tables)
         self.prepared = prepare_connectivity(
-            self._tables(),
+            plot_tables,
             method,
             component,
             plot_pairs,
@@ -716,7 +906,18 @@ class ConnectivityView(QtWidgets.QWidget):
         selected_bands = self._selected_bands()
         font_size = int(self.font_spin.value())
         title_prefix = f"{self.payload.get('file_id', '')} | "
-        plot_spectrum(self.spectrum_figure.axes[0] if self.spectrum_figure.axes else self.spectrum_figure.add_subplot(111), self.prepared, selected_bands, self.scale_combo.currentData(), title_prefix, font_size)
+        plot_spectrum(
+            self.spectrum_figure.axes[0] if self.spectrum_figure.axes else self.spectrum_figure.add_subplot(111),
+            self.prepared,
+            selected_bands,
+            self.scale_combo.currentData(),
+            title_prefix,
+            font_size,
+            self.spectrum_view_combo.currentData() or "full_highlight",
+            self.display_smoothing_check.isChecked(),
+            self.line_noise_markers_check.isChecked(),
+            self.line_noise_exclusion_check.isChecked(),
+        )
         self.spectrum_figure.subplots_adjust(top=0.82, bottom=0.22, left=0.10, right=0.96)
         self.spectrum_canvas.draw_idle()
         matrix_prepared = prepare_connectivity(
@@ -740,6 +941,11 @@ class ConnectivityView(QtWidgets.QWidget):
             self._matrix_info = plot_band_matrices(self.matrix_figure, matrix_prepared, selected_bands, self.scale_combo.currentData(), title_prefix, font_size)
         matrix_rows = max(1, int(np.ceil(len(selected_bands) / 2)))
         self.matrix_canvas.setMinimumHeight(max(320, matrix_rows * 220 + 90))
+        matrix_columns = min(2, max(1, len(selected_bands)))
+        # Reserve enough width for each matrix plus its own cax.  The parent
+        # scroll area can then scroll the complete layout instead of allowing
+        # a narrow window to compress labels and colorbars into each other.
+        self.matrix_canvas.setMinimumWidth(max(760, matrix_columns * 500))
         self.matrix_canvas.draw_idle()
         self._refresh_details()
         spectrum = self.prepared.get("spectrum", pd.DataFrame())
@@ -747,12 +953,17 @@ class ConnectivityView(QtWidgets.QWidget):
         focus_text = f"；当前点击={pair_label(*self._focus_pair)}" if self._focus_pair else ""
         if self._focus_channel_pair:
             focus_text += f"；通道对={self._focus_channel_pair[0]}→{self._focus_channel_pair[1]}"
-        if not available_methods(self._tables()):
+        if not pairs:
+            self.status_label.setText("请选择至少一个脑区对；当前连接图为空，未改变已保存结果。")
+        elif not available_methods(self._tables()):
             self.status_label.setText("当前连接结果中没有可显示的连接指标；请重新运行并勾选 MIC、MIM、wPLI 或 dPLI。")
         else:
             self.status_label.setText(
                 f"{method.upper()}：选中脑区对={len(pairs)}；用于频谱显示={len(plot_pairs)}；有效 epoch={n_epochs}；"
-                f"频段汇总只在已计算频率覆盖范围内进行；{method_label(method)}；dPLI 正反方向不镜像{focus_text}。"
+                f"频段汇总只在已计算频率覆盖范围内进行；{method_label(method)}；"
+                f"工频标记={'开' if self.line_noise_markers_check.isChecked() else '关'}；"
+                f"绘图排除={'开' if self.line_noise_exclusion_check.isChecked() else '关'}；"
+                f"dPLI 正反方向不镜像{focus_text}。"
             )
 
     def _matrix_clicked(self, event: Any) -> None:
@@ -823,7 +1034,18 @@ class ConnectivityView(QtWidgets.QWidget):
             # legacy two-row combined export remains a compact first-band
             # summary so it does not silently replace the supplied axes.
             first_band = self._selected_band()
-            plot_spectrum(axes[0], self.prepared, first_band, self.scale_combo.currentData(), f"{self.payload.get('file_id', '')} | " if self.payload else "", int(self.font_spin.value()))
+            plot_spectrum(
+                axes[0],
+                self.prepared,
+                first_band,
+                self.scale_combo.currentData(),
+                f"{self.payload.get('file_id', '')} | " if self.payload else "",
+                int(self.font_spin.value()),
+                self.spectrum_view_combo.currentData() or "full_highlight",
+                self.display_smoothing_check.isChecked(),
+                self.line_noise_markers_check.isChecked(),
+                self.line_noise_exclusion_check.isChecked(),
+            )
             matrix_prepared = prepare_connectivity(self._tables(), self._current_method(), int(self.component_combo.currentData() or 1), self._selected_pairs())
             if self.matrix_level_combo.currentData() == "channel_pair":
                 matrix_pair = self._focus_pair or (self._selected_pairs()[0] if self._selected_pairs() else None)
@@ -863,6 +1085,12 @@ class ConnectivityView(QtWidgets.QWidget):
                 "spectrum": self.prepared.get("spectrum", pd.DataFrame()),
                 "band_summary": self.prepared.get("bands", pd.DataFrame()),
                 "channel_pair_band_summary": self.prepared.get("channel_pair_bands", pd.DataFrame()),
+                "frequency_diagnostics": self._tables().get("frequency_diagnostics", pd.DataFrame()),
+                "roughness": self._tables().get("roughness", pd.DataFrame()),
+                "band_cv": self._tables().get("band_cv", pd.DataFrame()),
+                "binned_spectrum": self._tables().get("binned_spectrum", pd.DataFrame()),
+                "display_spectrum": self.prepared.get("display_spectrum", self._tables().get("display_spectrum", pd.DataFrame())),
+                "display_roughness": self._tables().get("display_roughness", pd.DataFrame()),
             }
         for name, frame in tables.items():
             path = base.parent / f"{base.name}_{name}.csv"
@@ -880,6 +1108,10 @@ class ConnectivityView(QtWidgets.QWidget):
                     "selected_bands": "|".join(selected_band_names),
                     "component_index": self.component_combo.currentData() or "",
                     "scale": self.scale_combo.currentData(),
+                    "spectrum_view": self.spectrum_view_combo.currentData(),
+                    "display_smoothing": self.display_smoothing_check.isChecked(),
+                    "line_noise_markers": self.line_noise_markers_check.isChecked(),
+                    "line_noise_exclusion_for_plot": self.line_noise_exclusion_check.isChecked(),
                     "matrix_level": self.matrix_level_combo.currentData(),
                     "matrix_swap": self.swap_matrix_check.isChecked(),
                     "dpli_neutral_reference": 0.5,

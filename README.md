@@ -16,9 +16,9 @@ LUNA supports:
 - Spectral analysis
 - FOOOF/specparam
 - Band power
-- Time-frequency analysis
+- Time-frequency analysis (planned; not part of the current validated pipeline)
 - Functional connectivity
-- Network dynamics
+- Network dynamics (planned; not part of the current validated pipeline)
 
 LUNA focuses on local field potential and neural field signal analysis. Spike sorting and single-unit analysis are not included.
 
@@ -38,6 +38,7 @@ GUI 启动后，导入文件即可查看原始波形、质量提示和实际有�
 - 绝对功率、相对功率和可配置频段汇总。
 - specparam 参数化；保留非周期背景、周期峰、拟合曲线、残差和失败原因。
 - 基于多个有效 epoch 的多变量 MIC、MIM，以及可独立运行的 wPLI、dPLI 和去偏平方 wPLI。
+- 连接频率轴诊断：保存完整频率行、工频标记来源、有限值统计、频率分辨率、DPSS taper 元数据和原始频谱粗糙度指标；支持不跨标记区间的可选分箱与仅显示平滑。
 - wPLI/dPLI 保留全部跨脑区通道对；dPLI 保存两个有序方向，脑区汇总可选 mean 或 median。
 - MIC 保留带符号原始值、绝对强度、多成分轴和后端 patterns；MIM 保留未归一化总相互作用，不被 MIC 成分数截断。
 - 基于 PyBispectra 的双谱时间延迟分析，包含标准和 antisymmetrized 结果。
@@ -53,6 +54,8 @@ GUI 启动后，导入文件即可查看原始波形、质量提示和实际有�
 - 自动进行 LID/LDN 组间比较或治疗效果推断。
 - 默认运行 Granger/时间反转校正；该扩展仍关闭。
 - 分析 spike 数据。
+
+连接频率轴与工频处理的详细说明见 [`docs/connectivity_frequency_diagnostics.md`](docs/connectivity_frequency_diagnostics.md)。
 
 ## 项目结构
 
@@ -166,6 +169,8 @@ GUI 的日常操作流程是：
 
 每次 GUI 运行在输出目录中创建独立 `run_id/`，保存 `parameters.json`、`run_manifest.json`、每个文件的 CSV、完整 PSD/选择数据 NPZ、质量信息及 PNG/SVG 图。输入文件内容变化会产生新的 SHA-256，不能误用旧运行结果。修改显示设置只影响当前图；修改计算参数或数据选择会提示需要重新计算。
 
+顶部“颜色模板”只控制分类显示颜色，不会重新计算数据；同一脑区使用同一色系、同一通道使用稳定的色阶变体。连续数据图（PSD、功率和质量热图）仍使用各自的连续色图。
+
 GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/gui_engine.py`，不依赖 Notebook，也不复制命令行算法。Qt 官方线程文档：[QThread](https://doc.qt.io/qtforpython-6/PySide6/QtCore/QThread.html)；Matplotlib 嵌入 Qt 示例：[Embedding in Qt](https://matplotlib.org/stable/gallery/user_interfaces/embedding_in_qt_sgskip.html)。
 
 ## 依赖和官方文档
@@ -248,7 +253,7 @@ GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/
   --output results/synthetic_validation
 ```
 
-合成数据只用于验证频率识别、功率积分、epoch 边界、连接估计和延迟方法的基本标定，不代表真实实验结果。
+命令行合成验证目前覆盖频率识别、功率积分和 epoch 边界等 PSD/频带功率基本标定；连接、FOOOF/specparam、TDE 和边界情形由 `tests/` 中明确的合成测试覆盖。所有合成数据均不代表真实实验结果。
 
 ### 3. 单文件命令行运行
 
@@ -276,7 +281,7 @@ GUI 使用 PySide6 和 Matplotlib Qt canvas；计算层位于 `src/lfp_analysis/
 
 ### 5. Notebook
 
-打开 `notebooks/01_single_file_workflow.ipynb`，选择项目 `.venv` 内核并按顺序执行。Notebook 用于查看结果；核心计算仍在 `src/lfp_analysis`，因此也可以从 PyCharm 或批量入口运行。
+打开 `notebooks/01_single_file_workflow.ipynb`，选择项目 `.venv` 内核并按顺序执行。Notebook 默认运行唯一目录中的合成验证；要运行真实 FIF，可在启动 Jupyter 前设置 `LUNA_NOTEBOOK_INPUT`，可选用 `LUNA_NOTEBOOK_OUTPUT_DIR` 指定一个空的输出目录。Notebook 拒绝覆盖非空目录。核心计算仍在 `src/lfp_analysis`，因此也可以从 PyCharm 或批量入口运行。
 
 ## 主要输出
 

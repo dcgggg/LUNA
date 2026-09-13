@@ -81,12 +81,15 @@ def fit_single_psd_detailed(
         "peak_status": "fit_failed",
         "n_peaks": 0,
         "failure_reason": "",
+        "backend_warning": "",
         "r_squared": np.nan,
         "error": np.nan,
         "offset": np.nan,
         "exponent": np.nan,
         "knee": np.nan,
         "min_r_squared_requested": float(parameter_cfg.get("min_r_squared", np.nan)),
+        "min_peak_prominence_requested": float(parameter_cfg.get("min_peak_prominence", np.nan)),
+        "min_peak_prominence_status": "unused_by_installed_backend_api",
     }
     peak_rows: list[dict[str, Any]] = []
     model_rows: list[dict[str, Any]] = []
@@ -105,6 +108,8 @@ def fit_single_psd_detailed(
     fit_power = power[finite]
     try:
         Model = _model_class(backend_requested)
+        if backend_requested == "specparam" and Model.__name__ == "FOOOF":
+            base["backend_warning"] = "specparam_unavailable_fell_back_to_fooof"
         model_kwargs = {
             "peak_width_limits": tuple(parameter_cfg.get("peak_width_limits_hz", [1.0, 12.0])),
             "max_n_peaks": int(parameter_cfg.get("max_n_peaks", 6)),
@@ -147,8 +152,15 @@ def fit_single_psd_detailed(
         min_r_squared = float(parameter_cfg.get("min_r_squared", np.nan))
         base["fit_quality_status"] = "pass" if np.isfinite(r_squared) and r_squared >= min_r_squared else "below_configured_min_r_squared"
 
+        is_classic_fooof = Model.__name__ == "FOOOF"
+        bandwidth_definition = "fooof_peak_params_bw_2sigma" if is_classic_fooof else "specparam_peak_fit_sigma_converted_to_2sigma"
         for peak_index, peak in enumerate(peaks.reshape(-1, 3)):
-            gaussian_sigma_hz = float(peak[2])
+            # Classic FOOOF exposes BW=2*sigma, while the installed specparam
+            # result exposes the Gaussian sigma in its peak-fit tuple. Keep
+            # the public table on the documented BW=2*sigma convention.
+            backend_width = float(peak[2])
+            gaussian_sigma_hz = backend_width / 2.0 if is_classic_fooof else backend_width
+            bandwidth_hz = 2.0 * gaussian_sigma_hz
             peak_rows.append(
                 {
                     **context,
@@ -156,12 +168,11 @@ def fit_single_psd_detailed(
                     "center_frequency_hz": float(peak[0]),
                     "peak_height_log10": float(peak[1]),
                     "peak_power_log10": float(peak[1]),
-                    # The backend stores the Gaussian width as sigma.  The
-                    # reported FOOOF/specparam BW is the full two-sided width
-                    # 2*sigma, not FWHM.
-                    "bandwidth_hz": 2.0 * gaussian_sigma_hz,
+                    # BW is the backend's full two-sided width 2*sigma, not
+                    # FWHM. Preserve it exactly in the exported peak table.
+                    "bandwidth_hz": bandwidth_hz,
                     "gaussian_sigma_hz": gaussian_sigma_hz,
-                    "bandwidth_definition": "full_width_2sigma",
+                    "bandwidth_definition": bandwidth_definition,
                     "fit_status": base["fit_status"],
                     "fit_quality_status": base["fit_quality_status"],
                     "r_squared": r_squared,
@@ -178,11 +189,10 @@ def fit_single_psd_detailed(
         observed_minus_aperiodic_log = observed_log - aperiodic_log
         gaussian_columns: dict[str, np.ndarray] = {}
         for peak_index, peak in enumerate(peaks.reshape(-1, 3)):
-            center_frequency, peak_power_log10, gaussian_sigma_hz = [float(value) for value in peak]
-            # FOOOF/specparam defines bandwidth as 2 * sigma.  Reconstruct
-            # each log10 Gaussian with the fitted CF/PW/BW parameters rather
-            # than treating BW as sigma or exponentiating PW as raw PSD.
-            sigma_hz = gaussian_sigma_hz
+            center_frequency, peak_power_log10, backend_width = [float(value) for value in peak]
+            # PW is the log10 height and the exported BW is 2*sigma; use the
+            # backend-specific Gaussian width when reconstructing the model.
+            sigma_hz = backend_width / 2.0 if is_classic_fooof else backend_width
             if sigma_hz > 0:
                 gaussian_columns[f"gaussian_{peak_index}_log10"] = peak_power_log10 * np.exp(
                     -0.5 * ((fit_frequencies - center_frequency) / sigma_hz) ** 2
