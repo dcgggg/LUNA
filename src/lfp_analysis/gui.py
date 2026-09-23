@@ -85,7 +85,11 @@ from .mapping import (
     save_mapping,
     validate_mapping,
 )
+from .project_batch import ProjectBatchRunner
+from .project_gui import ProjectCreationDialog, ProjectWorkspace
+from .project_store import PROJECT_DATABASE, ProjectStore
 from .resources import packaged_resource_path
+from .result_contract import load_result_manifest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 HEADER_CONTENT_WIDTH = 1120
@@ -1533,7 +1537,7 @@ def _load_logo_pixmap(path: Path, width: int = 190, height: int = 58) -> QtGui.Q
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, input_files: list[str] | None = None, output_dir: str | None = None) -> None:
+    def __init__(self, input_files: list[str] | None = None, output_dir: str | None = None, project_root: str | None = None) -> None:
         super().__init__()
         font_family = _load_windows_cjk_font() or "Noto Sans SC"
         # Set the font on the application as well as the main window.  Several
@@ -1561,6 +1565,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.result_payloads: dict[str, dict[str, Any]] = {}
         self.result_records: dict[str, dict[str, Any]] = {}
         self.loaded_run: dict[str, Any] | None = None
+        self.project_store: ProjectStore | None = None
+        self.project_workspace: ProjectWorkspace | None = None
+        self.project_batch_workspace: ProjectWorkspace | None = None
+        self.project_compare_workspace: ProjectWorkspace | None = None
+        self.project_review_workspace: ProjectWorkspace | None = None
+        self.current_project_data_unit: dict[str, Any] | None = None
+        self._project_result_context: dict[str, Any] | None = None
         self.analysis_thread: QtCore.QThread | None = None
         self.analysis_worker: AnalysisWorker | None = None
         self.inspect_thread: QtCore.QThread | None = None
@@ -1572,15 +1583,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self._displayed_result_key = ""
         self._result_table_source = pd.DataFrame()
         self._result_table_loaded = False
+        self._inspection_autosave_enabled = False
+        self._inspection_save_pending = False
+        self._inspection_pending_action = "inspection_edit"
+        self._project_bad_channels: set[str] = set()
+        self._pending_project_result_restore: dict[str, Any] | None = None
+        self._project_result_restore_generation = 0
+        self._inspection_save_timer = QtCore.QTimer(self)
+        self._inspection_save_timer.setSingleShot(True)
+        self._inspection_save_timer.setInterval(700)
+        self._inspection_save_timer.timeout.connect(self._autosave_project_inspection)
         self._build_ui()
         self._wheel_focus_guard = install_wheel_focus_guard(self)
         help_menu = self.menuBar().addMenu("Help")
         about_action = QtGui.QAction("About LUNA", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
+        project_menu = QtWidgets.QMenu("Project", self)
+        self.menuBar().insertMenu(help_menu.menuAction(), project_menu)
+        new_project_action = project_menu.addAction("New project…")
+        new_project_action.triggered.connect(self._new_project)
+        open_project_action = project_menu.addAction("Open project…")
+        open_project_action.triggered.connect(self._open_project)
+        show_project_action = project_menu.addAction("Show project workspace")
+        show_project_action.triggered.connect(self._show_project_workspace)
         self._restore_defaults()
         if output_dir:
             self.output_edit.setText(str(Path(output_dir).expanduser()))
+        if project_root:
+            QtCore.QTimer.singleShot(0, lambda: self._attach_project(ProjectStore(project_root)))
         if input_files:
             QtCore.QTimer.singleShot(100, lambda: self.load_paths(input_files))
 
@@ -1632,11 +1663,30 @@ class MainWindow(QtWidgets.QMainWindow):
         # The result selector and each page's display controls stay outside the
         # plot viewport.  Only plot content scrolls, so controls remain usable
         # while the user inspects lower matrices or figures.
+        result_selector_row = QtWidgets.QHBoxLayout()
+        result_selector_row.setContentsMargins(0, 0, 0, 0)
+        result_selector_row.addWidget(QtWidgets.QLabel("结果"))
         self.result_combo = QtWidgets.QComboBox()
         self.result_combo.setToolTip("选择已读取的预览、分析结果或载入的历史结果。")
         self.result_combo.setFixedHeight(30)
         self.result_combo.currentTextChanged.connect(self._show_selected_result)
-        right_layout.addWidget(self.result_combo, stretch=0)
+        result_selector_row.addWidget(self.result_combo, stretch=1)
+        self.result_info_button = QtWidgets.QPushButton("结果参数")
+        self.result_info_button.setToolTip("查看所选历史结果的只读参数、通道/epoch选择、版本和质量信息。")
+        self.result_info_button.setEnabled(False)
+        self.result_info_button.clicked.connect(self._show_result_info)
+        result_selector_row.addWidget(self.result_info_button)
+        self.result_history_button = QtWidgets.QPushButton("历史版本")
+        self.result_history_button.setToolTip("选择当前数据单元已经保存的其他结果版本；只读浏览，不会重新计算。")
+        self.result_history_button.setEnabled(False)
+        self.result_history_button.clicked.connect(self._show_project_result_history)
+        result_selector_row.addWidget(self.result_history_button)
+        self.apply_result_parameters_button = QtWidgets.QPushButton("应用为待运行参数")
+        self.apply_result_parameters_button.setToolTip("将历史结果的有效参数复制到待运行配置；不会修改历史结果。")
+        self.apply_result_parameters_button.setEnabled(False)
+        self.apply_result_parameters_button.clicked.connect(self._apply_result_parameters)
+        result_selector_row.addWidget(self.apply_result_parameters_button)
+        right_layout.addLayout(result_selector_row, stretch=0)
 
         self.result_stack = QtWidgets.QStackedWidget()
         self.result_stack.setObjectName("resultStack")
@@ -1844,6 +1894,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.color_template_combo.setToolTip("分类颜色模板；改变后只刷新显示，不重新计算分析结果。")
         self.color_template_combo.currentIndexChanged.connect(self._display_color_changed)
         action_row.addWidget(self.color_template_combo)
+        self.project_button = QtWidgets.QPushButton("Project")
+        self.project_button.setObjectName("globalSecondaryAction")
+        self.project_button.setToolTip("Create, open, and manage multi-subject LUNA projects.")
+        self.project_button.clicked.connect(self._show_project_workspace)
+        self.project_button.setFixedHeight(GLOBAL_ACTION_HEIGHT)
+        action_row.addWidget(self.project_button)
+        self.project_batch_button = QtWidgets.QPushButton("Batch")
+        self.project_batch_button.setObjectName("globalSecondaryAction")
+        self.project_batch_button.setToolTip("Choose project data, modules, and complete calculation parameters for a recoverable batch.")
+        self.project_batch_button.clicked.connect(self._show_project_batch)
+        self.project_compare_button = QtWidgets.QPushButton("Compare")
+        self.project_compare_button.setObjectName("globalSecondaryAction")
+        self.project_compare_button.setToolTip("Compare saved project results; this never silently recalculates missing results.")
+        self.project_compare_button.clicked.connect(self._show_project_comparison)
+        self.project_review_button = QtWidgets.QPushButton("Review")
+        self.project_review_button.setObjectName("globalSecondaryAction")
+        self.project_review_button.setToolTip("Review saved result versions and set independent approval status.")
+        self.project_review_button.clicked.connect(self._show_project_review)
+        for button in (self.project_batch_button, self.project_compare_button, self.project_review_button):
+            button.setFixedHeight(GLOBAL_ACTION_HEIGHT)
+            action_row.addWidget(button)
         action_row.addStretch(1)
         self.run_button = QtWidgets.QPushButton("Run Analysis")
         self.run_button.setObjectName("primaryAction")
@@ -1898,6 +1969,35 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(clear)
         row.addStretch(1)
         layout.addLayout(row)
+
+        inspection_row = QtWidgets.QHBoxLayout()
+        inspection_row.setSpacing(6)
+        self.save_inspection_button = QtWidgets.QPushButton("保存检查")
+        self.save_inspection_button.setToolTip("Save this data unit's channel mapping, included channels, epoch/time selection, review status, and notes to the project.")
+        self.save_inspection_button.clicked.connect(self._save_project_inspection)
+        self.inspection_status_combo = QtWidgets.QComboBox()
+        self.inspection_status_combo.addItem("待检查", "unchecked")
+        self.inspection_status_combo.addItem("检查中", "in_progress")
+        self.inspection_status_combo.addItem("已检查", "checked")
+        self.inspection_status_combo.addItem("需复核", "needs_review")
+        self.inspection_status_combo.setToolTip("该状态仅表示人工数据检查，不代表计算完成或结果已复核。")
+        self.inspection_status_combo.currentIndexChanged.connect(lambda _index: self._schedule_project_inspection_save("inspection_status_edit"))
+        self.inspection_notes_edit = QtWidgets.QLineEdit()
+        self.inspection_notes_edit.setPlaceholderText("检查备注（保存在本地项目）")
+        self.inspection_notes_edit.setMinimumWidth(160)
+        self.inspection_notes_edit.editingFinished.connect(lambda: self._schedule_project_inspection_save("inspection_notes_edit"))
+        self.previous_project_data_button = QtWidgets.QPushButton("上一份")
+        self.previous_project_data_button.clicked.connect(lambda: self._open_project_adjacent(-1, unchecked_only=False))
+        self.next_project_data_button = QtWidgets.QPushButton("下一份")
+        self.next_project_data_button.clicked.connect(lambda: self._open_project_adjacent(1, unchecked_only=False))
+        self.next_unchecked_button = QtWidgets.QPushButton("下一份待检查")
+        self.next_unchecked_button.clicked.connect(lambda: self._open_project_adjacent(1, unchecked_only=True))
+        for button in (self.save_inspection_button, self.previous_project_data_button, self.next_project_data_button, self.next_unchecked_button):
+            inspection_row.addWidget(button)
+        inspection_row.addWidget(self.inspection_status_combo)
+        inspection_row.addWidget(self.inspection_notes_edit, 1)
+        inspection_row.addStretch(1)
+        layout.addLayout(inspection_row)
         self.file_combo = QtWidgets.QComboBox()
         self.file_combo.setMinimumWidth(180)
         self.file_combo.setToolTip("当前文件；悬停可查看完整路径。")
@@ -1915,6 +2015,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_info_label = QtWidgets.QLabel("尚未载入文件。")
         self.data_info_label.setWordWrap(True)
         layout.addWidget(self.data_info_label)
+        self.project_context_label = QtWidgets.QLabel("Not attached to a project data unit.")
+        self.project_context_label.setWordWrap(True)
+        self.project_context_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        layout.addWidget(self.project_context_label)
         return box
 
     def _build_mapping_group(self) -> CollapsiblePanel:
@@ -1958,6 +2062,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "_mapping_table_loading", False):
             return
         self._set_dirty(True)
+        self._schedule_project_inspection_save("mapping_edit")
 
     def _populate_mapping_table(self) -> None:
         table = self.current_info.get("channel_table", pd.DataFrame()) if self.current_info else pd.DataFrame()
@@ -2145,6 +2250,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.channel_list.setMinimumHeight(92)
         self.channel_list.setToolTip("勾选参与计算和波形预览的通道；物理编号来自 FIF 通道映射。")
         self.channel_list.itemChanged.connect(self._channel_selection_changed)
+        self.channel_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.channel_list.customContextMenuRequested.connect(self._channel_context_menu)
         layout.addWidget(self.channel_list)
         epoch_row = QtWidgets.QHBoxLayout()
         epoch_row.addWidget(QtWidgets.QLabel("epoch 子集"))
@@ -2765,9 +2872,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _choose_files(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "选择 FIF 文件", str(PROJECT_ROOT / "data" / "real"), "FIF files (*.fif *.fif.gz);;All files (*.*)")
         if paths:
+            self.current_project_data_unit = None
             self.load_paths(paths)
 
     def load_paths(self, paths: list[str]) -> None:
+        # A direct file load is not a project-result history context.  A
+        # project data-unit load sets current_project_data_unit first, so its
+        # context survives inspection and can be used for history browsing.
+        if self.current_project_data_unit is None:
+            self._project_result_context = None
+        self._inspection_autosave_enabled = False
+        self._inspection_save_timer.stop()
         self.result_payloads.clear()
         self.result_records.clear()
         self.result_combo.clear()
@@ -2814,6 +2929,51 @@ class MainWindow(QtWidgets.QMainWindow):
             for info in infos
             if self._file_selection_key(info)
         }
+        if self.current_project_data_unit is not None and len(infos) == 1:
+            unit = self.current_project_data_unit
+            structure = dict(unit.get("source_structure") or {})
+            current_channels = [str(name) for name in infos[0]["loaded"].ch_names]
+            compatible = (
+                (not structure.get("channel_names") or list(map(str, structure.get("channel_names", []))) == current_channels)
+                and (structure.get("n_epochs") is None or int(structure["n_epochs"]) == int(infos[0].get("n_epochs", 0)))
+                and (structure.get("n_times") is None or int(structure["n_times"]) == int(infos[0].get("n_times", 0)))
+                and (structure.get("sampling_rate_hz") is None or np.isclose(float(structure["sampling_rate_hz"]), float(infos[0].get("sfreq", 0.0))))
+            )
+            if not compatible:
+                self._log("项目检查配置与当前源文件的通道/epoch 结构不兼容，未自动套用旧掩码；请人工复核。")
+            mapping_value = unit.get("channel_mapping", {})
+            mapping_list = mapping_value.get("channels", []) if isinstance(mapping_value, dict) else mapping_value
+            if mapping_list and compatible:
+                try:
+                    infos[0]["channel_table"] = apply_mapping(infos[0]["channel_table"], mapping_list)
+                except Exception as exc:  # noqa: BLE001 - preserve readable data even when an old mapping needs review
+                    self._log(f"项目通道映射未能自动应用：{type(exc).__name__}: {exc}")
+            inspection = dict(unit.get("inspection") or {}) if compatible else {}
+            self._project_bad_channels = {
+                str(item.get("channel_name"))
+                for item in inspection.get("bad_channels", [])
+                if isinstance(item, dict) and item.get("channel_name")
+            }
+            epochs = unit.get("epoch_selection", {}).get("indices")
+            if epochs is None:
+                epochs = inspection.get("selected_epoch_indices", list(range(int(infos[0].get("n_epochs", 0)))))
+            selection = unit.get("time_selection", {})
+            key = self._file_selection_key(infos[0])
+            selected_channels = inspection.get("selected_channel_names") or [str(name) for name in infos[0]["loaded"].ch_names]
+            self.file_selections[key] = {
+                "selected_channel_names": list(map(str, selected_channels)),
+                "selected_epoch_indices": list(map(int, epochs)),
+                "epoch_text": ",".join(map(str, epochs)) if len(epochs) != int(infos[0].get("n_epochs", 0)) else "all",
+                "selected_region_pairs": inspection.get("selected_region_pairs", [list(pair) for pair in region_pairs(infos[0].get("channel_table", pd.DataFrame()))]),
+                "selection": {
+                    "time_start_s": float(selection.get("start_s", infos[0].get("tmin", 0.0))),
+                    "time_end_s": float(selection.get("end_s", infos[0].get("tmax", 0.0) + 1.0 / infos[0].get("sfreq", 1.0))),
+                },
+            }
+            status = "needs_review" if not compatible else str(unit.get("inspection_status") or "unchecked")
+            index = self.inspection_status_combo.findData(status)
+            self.inspection_status_combo.setCurrentIndex(max(index, 0))
+            self.inspection_notes_edit.setText(str(unit.get("inspection_notes") or ""))
         self.file_combo.blockSignals(True)
         self.file_combo.clear()
         for info in infos:
@@ -2832,10 +2992,130 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"异常 epoch-channel={int(quality_file.get('n_fail_epoch_channel_rows', 0))} fail / "
                     f"{int(quality_file.get('n_warn_epoch_channel_rows', 0))} warn。"
                 )
+        pending_context = self._pending_project_result_restore
+        self._pending_project_result_restore = None
+        if pending_context is not None and len(infos) == 1:
+            self._restore_project_saved_results(pending_context, generation=self._project_result_restore_generation)
         self.run_button.setEnabled(True)
         self.run_button.setText("Run Analysis")
         self.task_label.setText(f"状态：已读取 {len(infos)} 个文件。")
         self._set_dirty(True)
+        self._inspection_autosave_enabled = bool(self.project_store is not None and self.current_project_data_unit is not None and len(infos) == 1)
+
+    def _save_project_inspection(self) -> None:
+        if self.project_store is None or self.current_project_data_unit is None or self.current_info is None:
+            self._show_message(QtWidgets.QMessageBox.Icon.Information, "Project inspection", "Open one imported project data unit first.")
+            return
+        status = str(self.inspection_status_combo.currentData() or "checked")
+        if status in {"unchecked", "in_progress"}:
+            status = "checked"
+            index = self.inspection_status_combo.findData(status)
+            self.inspection_status_combo.setCurrentIndex(index)
+        self._persist_project_inspection(status=status, action="manual_review_completed", show_error=True)
+
+    def _schedule_project_inspection_save(self, action: str) -> None:
+        if not self._inspection_autosave_enabled or self.project_store is None or self.current_project_data_unit is None:
+            return
+        self._inspection_save_pending = True
+        self._inspection_pending_action = action
+        self.inspection_status_combo.setCurrentIndex(max(0, self.inspection_status_combo.findData("in_progress")))
+        self.project_context_label.setText(self._project_context_text() + " | 保存状态：待保存")
+        self._inspection_save_timer.start()
+
+    def _autosave_project_inspection(self) -> None:
+        if not self._inspection_save_pending:
+            return
+        self._persist_project_inspection(
+            status=str(self.inspection_status_combo.currentData() or "in_progress"),
+            action=self._inspection_pending_action,
+            show_error=False,
+        )
+
+    def _persist_project_inspection(self, *, status: str, action: str, show_error: bool) -> bool:
+        if self.project_store is None or self.current_project_data_unit is None or self.current_info is None:
+            return False
+        try:
+            self._capture_current_file_selection()
+            epochs = self._parse_epochs(self.epoch_edit.text(), self.current_info["n_epochs"])
+            mapping = mapping_rows(self._mapping_table_dataframe())
+            notes = self.inspection_notes_edit.text().strip()
+            included = self._selected_channel_names()
+            all_channels = [str(name) for name in self.current_info["loaded"].ch_names]
+            original_indices = [int(value) for value in getattr(self.current_info["loaded"], "selection", range(int(self.current_info["n_epochs"])))]
+            epoch_reasons = {
+                str(index): "manually excluded"
+                for index in range(int(self.current_info["n_epochs"]))
+                if index not in set(epochs)
+            }
+            inspection = {
+                "selected_channel_names": included,
+                "excluded_channels": [{"channel_name": name, "reason": "manually excluded"} for name in all_channels if name not in set(included)],
+                "bad_channels": [{"channel_name": name, "reason": "manual bad-channel flag"} for name in sorted(self._project_bad_channels)],
+                "selected_epoch_indices": epochs,
+                "selected_original_epoch_indices": [original_indices[index] for index in epochs],
+                "excluded_epoch_indices": [index for index in range(int(self.current_info["n_epochs"])) if index not in set(epochs)],
+                "excluded_original_epoch_indices": [original_indices[index] for index in range(int(self.current_info["n_epochs"])) if index not in set(epochs)],
+                "excluded_epoch_reasons": epoch_reasons,
+                "original_epoch_indices": original_indices,
+                "selected_region_pairs": [list(pair) for pair, checkbox in self.pair_checks.items() if checkbox.isChecked()],
+                "time_selection": {"start_s": self.time_start.value(), "end_s": self.time_end.value()},
+                "manual_artifact_intervals": list((self.current_project_data_unit.get("inspection") or {}).get("manual_artifact_intervals", [])),
+                "preprocessing_settings": dict((self.current_project_data_unit.get("inspection") or {}).get("preprocessing_settings", {})),
+                "mapping_version": self.current_mapping_path.name if self.current_mapping_path else "project-inline",
+            }
+            saved = self.project_store.save_inspection(
+                self.current_project_data_unit["data_unit_id"], inspection,
+                status=status, notes=notes, channel_mapping=mapping, action=action,
+                expected_structure_fingerprint=str(self.current_project_data_unit.get("source_structure_fingerprint") or "") or None,
+            )
+            refreshed = self.project_store.data_units(data_unit_ids=[self.current_project_data_unit["data_unit_id"]])
+            if refreshed:
+                self.current_project_data_unit = refreshed[0]
+            self._inspection_save_pending = False
+            self.project_context_label.setText(self._project_context_text())
+            self._log(
+                f"数据检查已保存：revision={saved['revision']}；status={status}；"
+                f"科学选择变化={saved['scientific_changed']}。原始 FIF 未修改。"
+            )
+            if self.project_workspace is not None:
+                self.project_workspace.refresh_all()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._inspection_save_pending = True
+            self.project_context_label.setText(self._project_context_text() + " | 保存状态：保存失败，待重试")
+            self._log(f"数据检查保存失败：{type(exc).__name__}: {exc}")
+            if show_error:
+                self._show_message(QtWidgets.QMessageBox.Icon.Warning, "Cannot save inspection", str(exc))
+            return False
+
+    def _project_context_text(self) -> str:
+        unit = self.current_project_data_unit
+        if not unit:
+            return "Not attached to a project data unit."
+        timepoint = "unknown time" if unit.get("timepoint_value") is None else f"{unit['timepoint_value']:g} {unit.get('timepoint_unit') or ''}"
+        return (
+            f"Project: {unit.get('project_name', '')} | Subject: {unit.get('subject_code', '')} | "
+            f"Session: {unit.get('session_key', '')} | State: {unit.get('state_display_name', '')} | "
+            f"Condition: {unit.get('condition_label') or 'unknown'} | {timepoint} | "
+            f"Inspection: {unit.get('inspection_status', 'unchecked')}"
+        )
+
+    def _open_project_adjacent(self, step: int, *, unchecked_only: bool) -> None:
+        if self.project_store is None or self.current_project_data_unit is None:
+            self._show_project_workspace()
+            return
+        units = self.project_store.data_units()
+        if unchecked_only:
+            candidates = [unit for unit in units if str(unit.get("inspection_status", "unchecked")) != "checked"]
+            if not candidates:
+                self._show_message(QtWidgets.QMessageBox.Icon.Information, "Inspection complete", "No unchecked project data unit remains.")
+                return
+            current_index = next((index for index, unit in enumerate(candidates) if unit["data_unit_id"] == self.current_project_data_unit["data_unit_id"]), -1)
+            target = candidates[(current_index + 1) % len(candidates)]
+        else:
+            current_index = next((index for index, unit in enumerate(units) if unit["data_unit_id"] == self.current_project_data_unit["data_unit_id"]), 0)
+            target = units[max(0, min(len(units) - 1, current_index + step))]
+        self._open_project_data_unit(str(self.project_store.resolve_source_path(target)), target)
 
     def _inspection_failed(self, payload: str | dict[str, Any]) -> None:
         if isinstance(payload, dict):
@@ -2847,12 +3127,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_button.setEnabled(True)
         self.run_button.setText("Failed")
         self.task_label.setText(f"读取失败：{message}")
+        pending_context = self._pending_project_result_restore
+        self._pending_project_result_restore = None
+        if pending_context is not None:
+            self._restore_project_saved_results(pending_context, generation=self._project_result_restore_generation)
         self._show_message(QtWidgets.QMessageBox.Icon.Critical, "读取 FIF 失败", message)
 
     def _clear_files(self) -> None:
         self.file_infos = []
         self.file_selections.clear()
         self.current_info = None
+        self.current_project_data_unit = None
+        self._project_result_context = None
         self.result_payloads.clear()
         self.result_records.clear()
         self._displayed_result_key = ""
@@ -2869,6 +3155,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.header_data_summary_label.setText("Epoch — / —；片段 —；通道 — / —")
         self.run_button.setText("Run Analysis")
         self.data_info_label.setText("尚未载入文件。")
+        self.project_context_label.setText("Not attached to a project data unit.")
         self.selection_label.setText("选择数据量：尚未载入")
         self._update_preview_epoch_label()
         self.preview_prev_button.setEnabled(False)
@@ -2956,6 +3243,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setForeground(QtGui.QColor("#b00020" if n_fail else "#a06000"))
             else:
                 item.setToolTip("自动质量：当前阈值下未发现 fail/warn")
+            if str(name) in self._project_bad_channels:
+                item.setBackground(QtGui.QColor("#ffe2e2"))
+                item.setToolTip(item.toolTip() + "\n人工标记：坏通道")
             self.channel_list.addItem(item)
         self.channel_list.blockSignals(False)
         saved = self.file_selections.get(self._file_selection_key(info), {})
@@ -3005,6 +3295,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"SHA-256：{info['sha256'][:16]}…"
         )
         self.header_dataset_label.setText(Path(info["path"]).name)
+        self.project_context_label.setText(self._project_context_text())
         self.header_dataset_label.setToolTip(str(info["path"]))
         self._update_header_data_summary()
         self.data_info_label.setToolTip(str(info["path"]))
@@ -3035,6 +3326,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_fooof_filters()
         if hasattr(self, "_refresh_connectivity_filters"):
             self._refresh_connectivity_filters()
+        if hasattr(self, "_schedule_project_inspection_save"):
+            self._schedule_project_inspection_save("selection_edit")
 
     def _channel_selection_changed(self, *_args: Any) -> None:
         self._selection_changed()
@@ -3043,6 +3336,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_fooof_filters()
         if hasattr(self, "_refresh_connectivity_filters"):
             self._refresh_connectivity_filters()
+
+    def _channel_context_menu(self, position: QtCore.QPoint) -> None:
+        item = self.channel_list.itemAt(position)
+        if item is None:
+            return
+        name = str(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        menu = QtWidgets.QMenu(self)
+        is_bad = name in self._project_bad_channels
+        action = menu.addAction("取消坏通道标记" if is_bad else "标记为坏通道")
+        chosen = menu.exec(self.channel_list.viewport().mapToGlobal(position))
+        if chosen is not action:
+            return
+        if is_bad:
+            self._project_bad_channels.discard(name)
+        else:
+            self._project_bad_channels.add(name)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        item.setBackground(QtGui.QColor("#ffe2e2") if name in self._project_bad_channels else QtGui.QColor())
+        self._schedule_project_inspection_save("bad_channel_edit")
 
     def _preview_changed(self, *_args: Any) -> None:
         self._update_preview_epoch_label()
@@ -3135,12 +3447,13 @@ class MainWindow(QtWidgets.QMainWindow):
         key = self._result_key(payload)
         metric = str(payload.get("metric", "Result"))
         file_id = str(payload.get("file_id") or payload.get("display_name") or "file")
-        label = f"{file_id} | {metric}"
+        suffix = str(payload.get("result_label_suffix", ""))
+        label = f"{file_id} | {metric}{suffix}"
         existing_label_index = self.result_combo.findText(label)
         existing_key = self.result_combo.itemData(existing_label_index) if existing_label_index >= 0 else None
         if existing_label_index >= 0 and existing_key != key:
             short_uid = str(payload.get("file_uid", ""))[:8]
-            label = f"{file_id} [{short_uid}] | {metric}" if short_uid else f"{file_id} [{key[:8]}] | {metric}"
+            label = f"{file_id} [{short_uid}] | {metric}{suffix}" if short_uid else f"{file_id} [{key[:8]}] | {metric}{suffix}"
         self.result_payloads[key] = payload
         if record is not None:
             self.result_records[key] = record
@@ -3377,7 +3690,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for info in self.file_infos
             if (state := self.file_selections.get(self._file_selection_key(info))) is not None
         }
-        return {
+        snapshot = {
             "run_id": f"run_{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}",
             "input_files": [str(info["path"]) for info in self.file_infos],
             "output_dir": str(Path(self.output_edit.text()).expanduser()),
@@ -3403,11 +3716,37 @@ class MainWindow(QtWidgets.QMainWindow):
             "display_settings": {"color_template": str(self.color_template_combo.currentData() or DEFAULT_COLOR_TEMPLATE)},
             "parameter_schema": parameter_schema(),
         }
+        if self.project_store is not None and self.current_project_data_unit is not None and len(self.file_infos) == 1:
+            snapshot["project_context"] = {
+                key: self.current_project_data_unit[key]
+                for key in (
+                    "project_id", "subject_id", "session_id", "state_record_id", "data_unit_id",
+                    "subject_code", "group_label", "session_key", "experiment_name", "session_date",
+                    "condition_label", "timepoint_value", "timepoint_unit", "reference_event", "state_display_name",
+                )
+            }
+            snapshot["inspection_snapshot"] = {
+                "revision": int(self.current_project_data_unit.get("inspection_revision") or 0),
+                "fingerprint": self.current_project_data_unit.get("inspection_fingerprint"),
+                "status": self.current_project_data_unit.get("inspection_status", "unchecked"),
+                "notes": self.current_project_data_unit.get("inspection_notes", ""),
+                "source_structure_fingerprint": self.current_project_data_unit.get("source_structure_fingerprint"),
+                "inspection": copy.deepcopy(self.current_project_data_unit.get("inspection", {})),
+            }
+        return snapshot
 
     def _run(self) -> None:
         if self._running:
             self._log("已有分析任务运行中。")
             return
+        if self._inspection_save_pending:
+            self._inspection_save_timer.stop()
+            if not self._persist_project_inspection(
+                status=str(self.inspection_status_combo.currentData() or "in_progress"),
+                action=self._inspection_pending_action,
+                show_error=True,
+            ):
+                return
         try:
             snapshot = self._snapshot()
             if not snapshot["input_files"]:
@@ -3515,15 +3854,397 @@ class MainWindow(QtWidgets.QMainWindow):
             f"警告={len(manifest.get('warnings', []))}。"
         )
         self.loaded_run = outcome
+        if (
+            self.project_store is not None
+            and manifest.get("status") in {"completed", "completed_with_errors"}
+            and outcome.get("run_dir")
+        ):
+            try:
+                runner = ProjectBatchRunner(self.project_store, self.config_path, self.metadata_dir)
+                run_dir = Path(outcome["run_dir"])
+                parameters = json.loads((run_dir / "parameters.json").read_text(encoding="utf-8")).get("values", {})
+                file_records = list(manifest.get("files", []))
+                file_manifest = json.loads((run_dir / file_records[0]["file_dir"] / "file_manifest.json").read_text(encoding="utf-8")) if len(file_records) == 1 else {}
+                frozen_data_unit_id = str((file_manifest.get("project_context") or {}).get("data_unit_id") or "")
+                if frozen_data_unit_id:
+                    runner.index_completed_run(frozen_data_unit_id, parameters, run_dir, manifest)
+                    self._log(f"项目索引已更新：{frozen_data_unit_id}")
+                if self.project_workspace is not None:
+                    self.project_workspace.refresh_all()
+            except Exception as exc:  # noqa: BLE001 - calculation remains valid even if project indexing fails
+                self._log(f"项目索引保存失败：{type(exc).__name__}: {exc}")
         self._active_analysis_task_id = ""
+
+    def _new_project(self) -> None:
+        dialog = ProjectCreationDialog(self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        try:
+            self._attach_project(ProjectStore.create_named(dialog.parent_directory, dialog.project_name))
+        except Exception as exc:  # noqa: BLE001
+            self._show_message(QtWidgets.QMessageBox.Icon.Critical, "Cannot create project", str(exc))
+
+    def _open_project(self) -> None:
+        root = QtWidgets.QFileDialog.getExistingDirectory(self, "Open LUNA project", str(Path.home()))
+        if not root:
+            return
+        try:
+            self._attach_project(ProjectStore(root))
+        except Exception as exc:  # noqa: BLE001
+            self._show_message(QtWidgets.QMessageBox.Icon.Critical, "Cannot open project", str(exc))
+
+    def _attach_project(self, store: ProjectStore) -> bool:
+        for window_name in ("project_workspace", "project_batch_workspace", "project_compare_workspace", "project_review_workspace"):
+            window = getattr(self, window_name, None)
+            if window is not None:
+                window.close()
+                if window.isVisible():
+                    return False
+                setattr(self, window_name, None)
+        self.project_store = store
+        self.output_edit.setText(str(store.paths.results))
+        self.project_button.setText(store.project["name"])
+        self.project_button.setToolTip(str(store.paths.root))
+        self.project_workspace = ProjectWorkspace(store, self.config_path, self.metadata_dir, self, mode="manage")
+        self.project_workspace.open_data_unit.connect(self._open_project_data_unit)
+        self.project_workspace.queue_data_units.connect(self._open_project_batch_with_selection)
+        self.project_workspace.show()
+        QtCore.QSettings("LUNA", "LUNA").setValue("last_project_root", str(store.paths.root))
+        return True
+
+    @QtCore.Slot(object)
+    def _open_project_batch_with_selection(self, data_unit_ids: list[str]) -> None:
+        self._show_project_batch(data_unit_ids=list(data_unit_ids))
+
+    def _show_project_batch(self, _checked: bool = False, *, data_unit_ids: list[str] | None = None) -> None:
+        if self.project_store is None:
+            self._show_project_workspace()
+            if self.project_store is None:
+                return
+        if self.project_batch_workspace is not None:
+            if data_unit_ids:
+                self.project_batch_workspace.initial_data_unit_ids = list(dict.fromkeys(data_unit_ids))
+                self.project_batch_workspace.batch_selected_ids.update(data_unit_ids)
+                self.project_batch_workspace._refresh_batch_data_selector()
+            self.project_batch_workspace.show(); self.project_batch_workspace.raise_(); self.project_batch_workspace.activateWindow()
+            return
+        self.project_batch_workspace = ProjectWorkspace(
+            self.project_store, self.config_path, self.metadata_dir, self,
+            mode="batch", initial_data_unit_ids=data_unit_ids,
+        )
+        self.project_batch_workspace.request_parameter_snapshot.connect(self._copy_current_parameters_to_batch)
+        self.project_batch_workspace.show()
+
+    def _copy_current_parameters_to_batch(self) -> None:
+        if self.project_batch_workspace is None:
+            return
+        try:
+            self.project_batch_workspace.set_batch_task_config(self._read_parameter_values())
+        except Exception as exc:  # noqa: BLE001
+            self._show_message(QtWidgets.QMessageBox.Icon.Warning, "Cannot copy parameters", str(exc))
+
+    def _show_project_comparison(self) -> None:
+        if self.project_store is None:
+            self._show_project_workspace()
+            if self.project_store is None:
+                return
+        if self.project_compare_workspace is None:
+            self.project_compare_workspace = ProjectWorkspace(self.project_store, self.config_path, self.metadata_dir, self, mode="compare")
+            self.project_compare_workspace.queue_data_units.connect(self._open_project_batch_with_selection)
+        else:
+            self.project_compare_workspace.refresh_all()
+        self.project_compare_workspace.show(); self.project_compare_workspace.raise_(); self.project_compare_workspace.activateWindow()
+
+    def _show_project_review(self) -> None:
+        if self.project_store is None:
+            self._show_project_workspace()
+            if self.project_store is None:
+                return
+        if self.project_review_workspace is None:
+            self.project_review_workspace = ProjectWorkspace(self.project_store, self.config_path, self.metadata_dir, self, mode="review")
+        else:
+            self.project_review_workspace.refresh_all()
+        self.project_review_workspace.show(); self.project_review_workspace.raise_(); self.project_review_workspace.activateWindow()
+
+    def _show_project_workspace(self) -> None:
+        if self.project_workspace is not None:
+            self.project_workspace.show()
+            self.project_workspace.raise_()
+            self.project_workspace.activateWindow()
+            return
+        last_root = str(QtCore.QSettings("LUNA", "LUNA").value("last_project_root", ""))
+        if last_root and (Path(last_root) / PROJECT_DATABASE).is_file():
+            try:
+                self._attach_project(ProjectStore(last_root))
+                return
+            except Exception as exc:  # noqa: BLE001 - stale remembered project should not block opening another
+                self._log(f"无法自动恢复上次项目：{type(exc).__name__}: {exc}")
+        self._open_project()
+
+    @QtCore.Slot(str, object)
+    def _open_project_data_unit(self, source_path: str, context: dict[str, Any]) -> None:
+        if self._inspection_save_pending:
+            self._inspection_save_timer.stop()
+            if not self._persist_project_inspection(
+                status=str(self.inspection_status_combo.currentData() or "in_progress"),
+                action=self._inspection_pending_action,
+                show_error=True,
+            ):
+                return
+        self._inspection_autosave_enabled = False
+        self.current_project_data_unit = dict(context)
+        self._project_result_context = dict(context)
+        self._project_result_restore_generation += 1
+        self._pending_project_result_restore = dict(context)
+        source = Path(source_path).expanduser().resolve()
+        if source.is_file():
+            self.load_paths([str(source)])
+        else:
+            self.file_infos = []
+            self.current_info = None
+            self.result_payloads.clear()
+            self.result_records.clear()
+            self.result_combo.clear()
+            self._displayed_result_key = ""
+            self._pending_project_result_restore = None
+            self._restore_project_saved_results(dict(context), generation=self._project_result_restore_generation)
+            self.header_dataset_label.setText(f"结果浏览：{Path(source_path).name}")
+            self.header_data_summary_label.setText("原始 FIF 不可用；仅浏览已保存结果")
+            self.project_context_label.setText(self._project_context_text())
+            self.task_label.setText("状态：原始文件不可用，已尝试恢复已保存结果。")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _load_project_result_record(
+        self,
+        context: dict[str, Any],
+        row: dict[str, Any],
+        *,
+        label_suffix: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Load one project result bundle and its read-only history metadata.
+
+        This helper is intentionally shared by automatic restore and manual
+        history selection.  It prevents the two entry points from drifting in
+        their manifest validation, path handling, or payload construction.
+        """
+        data_unit_id = str(context.get("data_unit_id") or "")
+        bundle = Path(str(row["result_path"]))
+        if not bundle.is_absolute():
+            if self.project_store is None:
+                raise ValueError("project store is not attached")
+            bundle = self.project_store.paths.root / bundle
+        manifest = load_result_manifest(bundle)
+        if str(manifest.get("data_unit_id")) != data_unit_id:
+            raise ValueError("result data_unit_id does not match the selected project data unit")
+        metric = str(row.get("module_name") or manifest.get("module_name") or "")
+        analysis_identifier = str(manifest.get("analysis_id") or row.get("analysis_id") or "")
+        record = {
+            **row,
+            "metric": metric,
+            "status": "completed",
+            "parameters": manifest.get("effective_parameters", row.get("parameters", {})),
+            "paths": {"tables": manifest.get("tables", {})},
+            "method_name": manifest.get("method_name", row.get("method_name", "")),
+            "warnings": manifest.get("warnings", row.get("warnings", [])),
+            "analysis_id": analysis_identifier,
+        }
+        file_id = Path(str(context.get("source_path") or manifest.get("source", {}).get("path") or data_unit_id)).stem
+        # Keep versions distinct in the result selector.  The older code used
+        # only data_unit_id here, which made manual history selection replace
+        # the automatically restored version invisibly.
+        version_uid = f"{data_unit_id}:{analysis_identifier or bundle.name}"
+        payload = self._payload_from_saved_record(record, file_id, bundle, version_uid, file_id)
+        if payload is None:
+            raise ValueError("saved result payload is empty")
+        validity = str(row.get("result_validity") or "")
+        payload.update(
+            {
+                "historical_result": True,
+                "historical_parameters": manifest.get("effective_parameters", {}),
+                "historical_selection": manifest.get("selection", {}),
+                "inspection_snapshot": manifest.get("inspection_snapshot", {}),
+                "quality_summary": manifest.get("quality_summary", {}),
+                "analysis_id": analysis_identifier,
+                "result_label_suffix": label_suffix or (" | 历史结果" if validity == "current" else " | 历史/需重算"),
+            }
+        )
+        return payload, record
+
+    def _show_project_result_history(self) -> None:
+        """Choose a saved version for the currently opened project data unit."""
+        context = self._project_result_context
+        if self.project_store is None or not context or not context.get("data_unit_id"):
+            self._show_message(QtWidgets.QMessageBox.Icon.Information, "结果历史", "当前结果不是从项目数据单元加载的。")
+            return
+        rows = [
+            row for row in self.project_store.analysis_results({"data_unit_id": str(context["data_unit_id"])})
+            if str(row.get("calculation_status")) == "completed" and str(row.get("save_status")) == "saved"
+        ]
+        rows.sort(
+            key=lambda row: (
+                str(row.get("module_name") or ""),
+                str(row.get("created_at_utc") or ""),
+            ),
+            reverse=True,
+        )
+        if not rows:
+            self._show_message(QtWidgets.QMessageBox.Icon.Information, "结果历史", "该数据单元暂无可读取的已保存结果。")
+            return
+        choices: list[str] = []
+        for row in rows:
+            metric = str(row.get("module_name") or "Result")
+            created = str(row.get("created_at_utc") or "时间未知")
+            validity = str(row.get("result_validity") or "unknown")
+            analysis_identifier = str(row.get("analysis_id") or "")
+            choices.append(f"{metric} | {created} | {validity} | {analysis_identifier[:16]}")
+        choice, accepted = QtWidgets.QInputDialog.getItem(self, "选择结果历史版本", "已保存结果：", choices, 0, False)
+        if not accepted or not choice:
+            return
+        row = rows[choices.index(choice)]
+        try:
+            payload, record = self._load_project_result_record(context, row, label_suffix=" | 历史版本")
+            key = self._store_result_payload(payload, record)
+            index = self.result_combo.findData(key)
+            if index >= 0:
+                self.result_combo.setCurrentIndex(index)
+            self._show_payload(payload, force_new_result=True)
+            self._log(f"已载入指定历史结果：{payload.get('metric', 'Result')}；analysis_id={record.get('analysis_id', '')}；未重新计算。")
+        except Exception as exc:  # noqa: BLE001 - present a readable failure and retain existing results
+            self._log(f"指定历史结果读取失败：{type(exc).__name__}: {exc}")
+            self._show_message(QtWidgets.QMessageBox.Icon.Warning, "结果历史读取失败", str(exc))
+
+    def _restore_project_saved_results(self, context: dict[str, Any], *, generation: int) -> None:
+        """Restore persisted module bundles for one data unit without analysis."""
+        if generation != self._project_result_restore_generation or self.project_store is None:
+            return
+        data_unit_id = str(context.get("data_unit_id") or "")
+        if not data_unit_id:
+            return
+        rows = self.project_store.analysis_results({"data_unit_id": data_unit_id})
+        successful = [
+            row for row in rows
+            if str(row.get("calculation_status")) == "completed" and str(row.get("save_status")) == "saved"
+        ]
+        # A current result wins over a stale result; within either class the
+        # newest successful, readable bundle wins.  Failed runs never hide an
+        # earlier successful bundle.
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in successful:
+            grouped.setdefault(str(row.get("module_name") or ""), []).append(row)
+        restored = 0
+        failures = 0
+        for metric, candidates in grouped.items():
+            candidates.sort(key=lambda row: (str(row.get("result_validity") or "") == "current", str(row.get("created_at_utc") or "")), reverse=True)
+            for row in candidates:
+                try:
+                    payload, record = self._load_project_result_record(context, row)
+                    self._store_result_payload(payload, record)
+                    restored += 1
+                    break
+                except Exception as exc:  # noqa: BLE001 - try an older successful bundle
+                    failures += 1
+                    self._log(f"历史结果不可读取，继续尝试更早版本：{metric}；{type(exc).__name__}: {exc}")
+        self._update_result_history_controls(None)
+        if restored:
+            self.task_label.setText(f"状态：已恢复 {restored} 个历史结果；未触发重新计算。")
+            self._log(f"已从项目结果包恢复 {restored} 个模块；失败候选={failures}。")
+            if self.result_combo.count():
+                self.result_combo.setCurrentIndex(0)
+                # The first item can already be current when it is inserted,
+                # so no Qt signal is guaranteed here.  Refresh explicitly to
+                # enable the read-only metadata/history controls and render
+                # the selected restored payload.
+                self._show_selected_result(self.result_combo.currentText())
+        else:
+            self.task_label.setText("状态：该数据单元暂无可读取的已保存结果。")
+            self._log("项目结果恢复：没有找到可读取的 completed/saved 结果包；未自动运行分析。")
 
     def _show_selected_result(self, key: str) -> None:
         resolved_key = self._current_result_key()
         if resolved_key in self.result_payloads:
+            self._update_result_history_controls(self.result_payloads[resolved_key])
             self._show_payload(
                 self.result_payloads[resolved_key],
                 force_new_result=resolved_key != self._displayed_result_key,
             )
+
+    def _update_result_history_controls(self, payload: dict[str, Any] | None) -> None:
+        is_historical = bool(payload and payload.get("historical_result"))
+        if hasattr(self, "result_history_button"):
+            self.result_history_button.setEnabled(bool(self.project_store is not None and self._project_result_context))
+        if hasattr(self, "result_info_button"):
+            self.result_info_button.setEnabled(payload is not None)
+        if hasattr(self, "apply_result_parameters_button"):
+            self.apply_result_parameters_button.setEnabled(is_historical and bool(payload.get("historical_parameters")))
+
+    def _current_result_payload(self) -> dict[str, Any] | None:
+        payload = self.result_payloads.get(self._current_result_key())
+        return payload if isinstance(payload, dict) else None
+
+    def _show_result_info(self) -> None:
+        payload = self._current_result_payload()
+        if payload is None:
+            return
+        record = payload.get("record", {}) if isinstance(payload.get("record"), dict) else {}
+        details = {
+            "metric": payload.get("metric"),
+            "analysis_id": record.get("analysis_id", payload.get("analysis_id", "")),
+            "calculation_status": record.get("calculation_status", record.get("status", "")),
+            "save_status": record.get("save_status", ""),
+            "result_validity": record.get("result_validity", ""),
+            "created_at_utc": record.get("created_at_utc", ""),
+            "method": record.get("method_name", ""),
+            "historical_parameters": payload.get("historical_parameters", record.get("parameters", {})),
+            "selection": payload.get("historical_selection", {}),
+            "inspection_snapshot": payload.get("inspection_snapshot", {}),
+            "quality_summary": payload.get("quality_summary", {}),
+            "warnings": record.get("warnings", []),
+        }
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("结果参数与来源（只读）")
+        dialog.resize(760, 620)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        note = QtWidgets.QLabel("以下参数属于当前选定结果，不是当前待运行配置。历史结果可继续浏览；如需重算，请使用‘应用为待运行参数’后再运行。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        text = QtWidgets.QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(json.dumps(details, ensure_ascii=False, indent=2, default=str))
+        layout.addWidget(text)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _apply_result_parameters(self) -> None:
+        payload = self._current_result_payload()
+        if not payload or not payload.get("historical_parameters"):
+            return
+        values = payload["historical_parameters"]
+        applied = 0
+        with QtCore.QSignalBlocker(self):
+            for definition in PARAMETER_DEFINITIONS:
+                widget = self.parameter_widgets.get(definition.key)
+                if widget is None:
+                    continue
+                value = config_value(values, definition.key, None)
+                if value is None:
+                    continue
+                if isinstance(widget, QtWidgets.QComboBox):
+                    widget.setCurrentText(str(value))
+                elif isinstance(widget, QtWidgets.QCheckBox):
+                    widget.setChecked(bool(value))
+                elif isinstance(widget, QtWidgets.QSpinBox):
+                    widget.setValue(int(value))
+                else:
+                    widget.setValue(float(value))
+                applied += 1
+        self._update_parameter_tabs()
+        self._set_dirty(True)
+        self._log(f"已将历史结果参数复制为待运行配置（{applied} 项）；历史结果本身未修改。")
 
     def _display_color_changed(self, *_args: Any) -> None:
         """Update classification colours without invalidating numeric results."""
@@ -3537,6 +4258,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.canvas.show_payload(payload)
 
     def _show_payload(self, payload: dict[str, Any], *, force_new_result: bool = False) -> None:
+        self._update_result_history_controls(payload)
         result_key = self._result_key(payload)
         is_new_result = force_new_result or result_key != self._displayed_result_key
         is_band_power = str(payload.get("metric", "")) == "Band Power"
@@ -4010,6 +4732,15 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._inspection_save_pending:
+            self._inspection_save_timer.stop()
+            if not self._persist_project_inspection(
+                status=str(self.inspection_status_combo.currentData() or "in_progress"),
+                action=self._inspection_pending_action,
+                show_error=True,
+            ):
+                event.ignore()
+                return
         if self.analysis_worker is not None:
             self.analysis_worker.cancel_event.set()
         if self.analysis_thread is not None and self.analysis_thread.isRunning():
@@ -4027,12 +4758,12 @@ class MainWindow(QtWidgets.QMainWindow):
         event.accept()
 
 
-def launch(input_files: list[str] | None = None, output_dir: str | None = None) -> int:
+def launch(input_files: list[str] | None = None, output_dir: str | None = None, project_root: str | None = None) -> int:
     """Start the desktop GUI and return the Qt exit code."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     app.setStyle("Fusion")
-    window = MainWindow(input_files=input_files, output_dir=output_dir)
+    window = MainWindow(input_files=input_files, output_dir=output_dir, project_root=project_root)
     window.show()
     return app.exec()

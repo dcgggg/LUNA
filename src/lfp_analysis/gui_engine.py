@@ -799,6 +799,11 @@ def run_gui_analysis(
                     "ldn_status": registry_row.get("ldn_status", ""),
                     "ldn_day": registry_row.get("ldn_day", ""),
                 }
+                project_context = snapshot.get("project_context", {})
+                if isinstance(project_context, dict):
+                    for field in ("project_id", "subject_id", "session_id", "state_record_id", "data_unit_id"):
+                        if project_context.get(field) not in (None, ""):
+                            provenance[field] = str(project_context[field])
                 file_dir = run_dir / f"{file_position + 1:02d}_{file_id}"
                 file_dir.mkdir(parents=True, exist_ok=True)
                 _atomic_json(
@@ -823,6 +828,8 @@ def run_gui_analysis(
                         "effective_valid_duration_s": float(analysis_quality["file"].iloc[0]["effective_valid_duration_s"]),
                         "registry_row": registry_row,
                         "provenance_columns": provenance,
+                        "project_context": project_context if isinstance(project_context, dict) else {},
+                        "inspection_snapshot": snapshot.get("inspection_snapshot", {}),
                         "runtime_config": runtime_config,
                         "quality_warnings": warnings,
                     },
@@ -997,6 +1004,8 @@ def run_gui_analysis(
                     "effective_valid_duration_s": float(analysis_quality["file"].iloc[0]["effective_valid_duration_s"]),
                     "file_dir": str(file_dir.relative_to(run_dir)),
                     "metrics": metric_records,
+                    "project_context": project_context if isinstance(project_context, dict) else {},
+                    "inspection_snapshot": snapshot.get("inspection_snapshot", {}),
                 }
                 manifest["files"].append(file_record)
                 _atomic_json(manifest, run_dir / "run_manifest.json")

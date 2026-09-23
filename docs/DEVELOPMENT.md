@@ -175,3 +175,57 @@ C:/Users/PC/AppData/Local/Temp/luna_gui_validation_20260913/
 - 尚未用真实登记数据核实多动物批量键、配对设计和行为匹配。
 - Qt offscreen 不等价于真实 Windows 鼠标操作；1366×768 的构造和截图已完成，125%/150% 系统缩放、实体显示器下的拖拽/点击和人工 GUI 操作仍未核实。
 - 历史 `docs/analysis_plan.md` 和 README 中的“已完成”描述不替代本文件的本次运行证据。
+
+## 6. 项目管理开发线（2026-09-19）
+
+GUI 可直接打开项目：
+
+```powershell
+./.venv/Scripts/python.exe scripts/run_gui.py --project C:/path/to/luna_project
+```
+
+生成明确标记的合成项目并用无 GUI 接口查询：
+
+```powershell
+./.venv/Scripts/python.exe scripts/create_project_demo.py --output C:/Temp/luna_project_demo
+./.venv/Scripts/python.exe scripts/read_project_results.py C:/Temp/luna_project_demo --session-key Day7 --condition SYNTHETIC_DRUG --timepoint 100 --module "Band Power"
+```
+
+本轮实际使用固定只读 FIF 对项目批量核心进行了两类验证：
+
+1. Quality + PSD + Band Power，随后用 `ProjectResults` 重载三个 schema 1.0 结果包，并用第二个相同任务核查精确缓存复用。
+2. 全模块回归，脑区仅使用 `TEST_R1…TEST_R4` 软件测试分组，不作解剖解释；Quality、PSD、Band Power、FOOOF、Connectivity、Time Delay 均保存并通过 manifest 校验。
+
+Qt offscreen 截图路径：
+
+```text
+C:/Users/PC/AppData/Local/Temp/luna_project_gui_validation_20260919_v2/
+```
+
+当前桌面控制通道没有返回 Windows 原生窗口，故未记录真实鼠标和系统 DPI 验收为通过。
+
+## 7. 简化项目目录、导入与主 GUI 工作流（2026-09-22）
+
+新项目创建：
+
+```text
+父目录 + 用户项目名 → 父目录/规范化项目名/project.sqlite3
+```
+
+项目 schema 2 新增项目内原始副本、检查记录与结构模板；schema 3 为被试、session 和状态记录增加持久化 `relative_path`，并建立 `subjects/<被试>/<session>/<状态>/` 可读目录。旧 schema 项目打开时非破坏性迁移并补齐缺失目录。新导入走 `ProjectStore.import_data_unit()`：先复制到临时文件、比较源/副本 SHA-256 与大小、原子替换目标，再登记项目相对路径。旧外部路径不自动改写，使用 `organize_external_data()` 显式迁移。`ProjectStore` 每次打开会更新当前根路径，因此项目目录整体移动后相对数据和结果仍可解析。
+
+项目管理窗口以 `mode="manage"` 只展示结构与导入。主窗口的 `Batch`、`Compare`、`Review` 分别打开对应模式；批处理参数来自主窗口现有单份计算控件或保存的参数方案，单数据检查决定由数据单元单独注入。没有新增第二套分析算法。
+
+本轮验证命令：
+
+```powershell
+./.venv/Scripts/python.exe -m pytest -q
+./.venv/Scripts/python.exe -m ruff check src tests scripts
+./.venv/Scripts/python.exe -m compileall -q src tests scripts
+./.venv/Scripts/python.exe -m pip check
+./.venv/Scripts/python.exe scripts/read_project_results.py C:/Users/PC/AppData/Local/Temp/luna_simplified_workflow_n2vt18_i/Moved_Real_FIF_Workflow --module PSD
+```
+
+结果为 76 tests passed、Ruff passed、compileall passed、pip check 无损坏依赖；移动后的真实样例项目能解析项目内 FIF 并重载 PSD/Band Power manifest。真实原文件 SHA-256 仍为 `2751bce6cdad2a17d7ba72978b0b59221f8265dd27d9c77a8e77600ed75a0582`。
+
+截图仅保存在 `C:/Users/PC/AppData/Local/Temp/luna_simplified_gui_validation_20260922/`。原生应用窗口没有出现在当前 Computer Use inventory，故原生鼠标与系统 DPI 验收仍需人工完成。

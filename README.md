@@ -51,7 +51,9 @@ LUNA is organized around a simple research flow:
 3. Define channels, brain regions, epochs, and analysis scope.
 4. Configure spectral, parameterization, connectivity, or delay methods.
 5. Review channel-level and region-level results.
-6. Export figures, tables, parameters, and provenance records.
+6. Organize subjects, sessions, states and repeated recordings in a local project.
+7. Run the same analysis core on one record or a recoverable batch.
+8. Review, compare and export saved results without rereading raw files.
 
 ## Built for multiregion electrophysiology
 
@@ -69,7 +71,7 @@ The platform records input identity, parameters, valid epochs, effective duratio
 
 LUNA is under active development. The current repository provides a traceable workflow for multichannel, multiregion LFP analysis using preprocessed FIF epochs. It includes a PySide6 desktop GUI, command-line analysis components, configurable metadata, synthetic validation, automated tests, and reusable plotting and export modules.
 
-The current `0.2.x` prerelease line has been checked with a real T80 FIF example at the single-file descriptive level. Raw experimental data are not stored in this repository and are never overwritten by the software. Animal-level inference is intentionally withheld when animal identity, session, treatment time point, or behavioral linkage is incomplete.
+The current `0.3.0.dev0` development line adds local project management while preserving the single-file descriptive workflow. Raw experimental data are not stored in this repository and are never overwritten by the software. Animal-level inference remains unavailable when animal identity, session, treatment time point, or behavioral linkage is incomplete.
 
 Current methodological safeguards include:
 
@@ -167,6 +169,27 @@ The same single-file workflow is available in [`scripts/run_single_file.py`](scr
 
 After importing data, verify the actual channel names and edit the Channel Mapping table if needed. Region pairs are generated from the active mapping; the historical M1/STR/PF/SNr layout is only a sample template, not a fixed experiment definition.
 
+### Project workflow
+
+Use the **Project** button or **Project** menu in the GUI to create/open a local project. Creating a project asks only for a readable project name and a parent folder; that name becomes the actual project-folder name. Imported recordings are copied into `data/raw/` by default, verified by size and SHA-256, registered with a project-relative path, and never modify the external source. Existing projects that still reference external files can use the explicit **Organize data into project** action. LUNA keeps stable internal identities in `project.sqlite3` but hides them from the normal project tree.
+
+In **Structure template**, **Save template** stores only a reusable definition. **Apply current structure** creates persistent subject/session/state records and matching readable folders under `subjects/`; empty states remain visible as “未导入数据”, and applying the same template again reuses existing nodes.
+
+The project manager is intentionally limited to hierarchy/template management, batch import, inspection status, and sending selected data to the main analysis window. Single-record inspection, batch calculation and A/B result comparison use the original analysis GUI and the same calculation core. Batch parameters are copied from the visible single-record controls; data-specific channel, epoch and time selections remain attached to each data unit.
+
+Use **Save project** or `Ctrl+S` in the Project Manager to save structure, imports and metadata changes. A dirty project offers Save/Discard/Cancel when the manager closes; inspection autosave and analysis-result autosave remain separate. Opening a project data unit restores readable saved result bundles directly, without rerunning analysis. Use **结果参数** to inspect the saved parameters and **历史版本** to choose another saved run; **应用为待运行参数** only copies a historical configuration into the pending controls. When the source FIF is unavailable, saved results can still be browsed, but raw-dependent inspection and recomputation require the source.
+
+Project schema 5 also stores lightweight behavior attachments, scores and synchronization metadata. Missing scores remain blank and a recorded score of zero remains zero; LUNA does not process video or infer unverified epoch-level synchronization.
+
+Saved project results use the versioned LUNA result contract and can be queried without Qt:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\read_project_results.py C:\path\to\project `
+  --session-key Day7 --condition L-DOPA --timepoint 100 --module "Band Power"
+```
+
+See [Project workflow](docs/PROJECT_WORKFLOW.md) and [Result schema](docs/RESULT_SCHEMA.md). A five-subject synthetic demonstration can be created with `scripts/create_project_demo.py`; it is clearly marked and is not experimental data.
+
 ## Dependencies
 
 ### Core dependencies
@@ -239,6 +262,8 @@ Detailed guides and method notes are maintained outside the main README:
 - [Development and reproducibility commands](docs/DEVELOPMENT.md)
 - [Metadata definitions](metadata/README.md)
 - [Project status](docs/PROJECT_STATUS.md)
+- [Project workflow](docs/PROJECT_WORKFLOW.md)
+- [Versioned result contract](docs/RESULT_SCHEMA.md)
 
 Repository: [https://github.com/dcgggg/LUNA.git](https://github.com/dcgggg/LUNA.git)
 

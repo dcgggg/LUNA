@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0.dev0] — 2026-09-23 (prerelease)
+
+- Added a local SQLite project model with stable project, subject, session, experimental-state and data-unit identities.
+- Added editable import preview, content-fingerprint duplicate detection, channel-mapping confirmation and source relocation checks.
+- Added project batch orchestration over the existing single-record computation core, frozen parameter snapshots, per-item status, cancellation/resume support and exact cache reuse.
+- Added versioned per-module result manifests, GUI-independent result reading/long-table export, manual review state and saved-result comparison previews.
+- Added a five-subject synthetic project demonstration with missing, duplicate, incompatible and failed-task cases.
+- Simplified project creation so a readable project name becomes the actual folder name, and new imports are verified copies addressed by project-relative paths.
+- Added reusable subject/session/state structure templates, inherited-context multi-file import, persistent per-data inspection decisions, and project portability after moving the root folder.
+- Fixed the template Apply button binding and made template application persist matching subject/session/state records together with readable project folders; repeated application is idempotent and empty states remain visible in the project tree.
+- Moved batch execution, review and A/B comparison entry points back to the main analysis GUI while keeping the project manager focused on hierarchy and import management.
+- Scientific algorithms and default estimator parameters are unchanged.
+
 All notable changes to LUNA are documented here.
 
 ## [0.2.2] — 2026-09-13 (prerelease)
