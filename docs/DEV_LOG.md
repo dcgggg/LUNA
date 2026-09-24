@@ -240,3 +240,123 @@ Python 3.11.9；MNE 1.12.1；MNE-Connectivity 0.9.0；specparam 2.0.0rc7；FOOOF
 - 入口：`scripts/run_gui.py --help`、项目演示脚本和无 GUI 结果读取脚本的帮助检查通过；wheel 将在提交前从当前工作区重新构建。
 - 提交边界：不纳入真实数据、`results/` 衍生结果、缓存、虚拟环境、日志输出目录和 `docs/screenshots/` 本地截图；发布前检查暂存区和远程提交一致性。
 - 限制：当前验证仍不替代实体 Windows 窗口下的鼠标、系统 DPI 和多显示器人工检查；真实动物身份、行为同步和动物层级推断继续保持未解析状态。
+
+## 2026-09-24 09:00:00 +08:00 — v0.3.0-dev1 发布准备
+
+- 范围：发布上次 `v0.3.0-dev0` 之后的项目管理范围收敛、筛选/导出、session 顺序、schema 6 迁移、草稿恢复回归和交接文档；未修改科学算法、默认估计参数或原始 FIF。
+- 版本：源码和动态打包版本更新为 `0.3.0.dev1`，拟使用不可覆盖的新标签 `v0.3.0-dev1` 并创建 GitHub prerelease。
+- 验证：全量 `pytest -q` 通过（103 项）；`ruff check src tests scripts`、`compileall -q src tests scripts`、`pip check` 和 `git diff --check` 通过，仅保留 FOOOF 第三方弃用警告。
+- 固定只读 FIF：已核实 `21×16×5000`、1000 Hz、4.999 s/epoch、有效时长 105 s；文件指纹与既有记录一致，未修改源文件。GUI/结果读取入口帮助检查仍可用。
+- 产品边界：当前 GUI 不再提供跨数据 A/B、跨被试配对、组间/组内统计或科研比较绘图；旧比较存储和读取接口仅作兼容，外部脚本或 notebook 读取保存结果完成下游统计。
+- 限制：原生 Windows 鼠标、实体 DPI、多显示器和视频逐帧同步未在本环境验证；真实身份和行为信息仍未解析。`docs/screenshots/` 本地截图不纳入提交。
+
+## 2026-09-23 10:38:49 +08:00 — 移除软件内跨数据比较并完善项目记录筛选
+
+- 任务：按产品方向将 LUNA 的当前 GUI 范围收敛到项目管理、数据检查、分析计算、结果保存/恢复和单数据可视化；跨被试、组间、组内统计与科研绘图改由独立代码读取保存结果完成。本轮未修改科学算法、默认估计参数、原始 FIF，未 commit、未 push。
+- GUI：主分析窗口删除跨项目 Compare 按钮和工作区引用；Project Manager 不再提供 Compare 模式，新增 `Filter / export list`。筛选只产生数据记录清单，不配对、不平均、不跨记录计算；单条数据内的通道/频带/脑区视图仍保留。
+- 项目管理：数据表支持多选后编辑 group 和 condition，按稳定 `subject_id`/`state_record_id` 写回；混合值显示“多个值”，空值可清除，编辑进入项目 dirty/save 流程。筛选窗口支持同字段 OR、跨字段 AND、结构化时间、检查状态和当前结果可用性，并导出 CSV/JSON。
+- 兼容：保留 `comparison.py`、SQLite `comparison_snapshots` 表和旧比较文件读取能力，避免旧项目打不开；这些接口不再由当前 GUI 调用。移除刷新流程中残留的比较控件刷新调用。
+- 数据模型：项目 schema 从 5 升级到 6，为 session 增加显式 `sort_order`；新建/模板应用按用户输入顺序显示，旧项目按历史创建顺序非破坏迁移。初始化版本标记、迁移、查询排序和结果查询均已同步。
+- 验证：`ruff check src tests scripts`、`compileall -q src tests scripts`、`pytest -q`（88 项）、`pip check` 和 `git diff --check` 通过。指定只读 FIF 实测读取为 21×16×5000、1000 Hz、有效时长 105 s、25 个候选 epoch、4 个非空 drop_log 条目。
+- 合成项目/离屏 Qt：在含空格和中文路径的临时项目中应用 2 被试×2 session×2 state 模板，目录和 SQLite 记录在重开后保留；同一被试 session 显式顺序保持；导入指定 FIF 的项目数据记录可被筛选窗口读取。主 GUI 离屏启动后仅显示 Project、Batch、Review，全局 Compare 按钮不存在。
+- 限制：未在当前环境进行实体 Windows 原生窗口、鼠标、多显示器和 125%/150% DPI 人工验收；真实动物身份、行为同步和动物层统计仍未解析。临时项目与截图未写入仓库。
+
+## 2026-09-23 11:00:03 +08:00 — 产品范围调整后的代码恢复与最终回归
+
+- 复核：移除跨数据比较实现后，逐段恢复并检查项目管理、导入、模板、批处理、结果复核和关闭保存流程；当前 `ProjectWorkspace` 不再创建或刷新比较控件，历史比较存储与读取接口仍保留兼容。
+- 会话字段：项目管理编辑入口现在可修改 session 日期和显式显示顺序；schema 6 的迁移、模板顺序、查询排序和结果索引保持一致。
+- 验证：`pytest -q` 88 项通过；`ruff check src tests scripts`、`compileall -q src tests scripts`、`pip check` 和 `git diff --check` 通过。固定只读 FIF 实测读取为 21×16×5000、1000 Hz、有效时长105 s；临时项目导入和筛选窗口各返回1条对应记录。
+- GUI：Qt offscreen 主窗口实际构造，顶部项目入口为 Project、Batch、Review，`project_compare_button` 不存在；项目管理、Batch、Filter / export list 和 Review 工作区均可构造。未执行原生 Windows 鼠标、系统 DPI 或多显示器人工验收。
+- 边界：未改变 PSD、FOOOF、频带功率、连接、时间延迟及其他分析算法、默认计算参数、原始 FIF 或导出数值语义；本轮未 commit、未 push。临时测试项目和真实数据衍生物未写入仓库。
+
+## 2026-09-23 14:58:11 +08:00 — 项目整体审查与开发交接整理
+
+### 范围
+
+- 依据当前工作区代码、`AGENTS.md`、README、依赖配置、入口、项目管理/结果保存调用链和现有测试，整理 LUNA 的架构、产品范围、证据状态和下一步交接材料。本轮不修改分析算法、默认参数、真实数据或源代码，不执行 commit/push。
+- 创建 `docs/ARCHITECTURE.md` 和 `docs/HANDOFF.md`；将 `docs/DEVELOPMENT.md` 压缩为当前入口/环境/验证指南；在 `docs/PROJECT_STATUS.md` 增加当前审查覆盖；更新 `AGENTS.md` 的首次接手清单语义。
+
+### 代码确认
+
+- 单条和批处理最终复用 `gui_engine.run_gui_analysis()`；`ProjectStore` 负责 schema 6、稳定身份、导入指纹、检查、结果索引和旧比较数据兼容；`ProjectResults` 提供无 Qt 表/数组/长表读取。
+- 当前 GUI 不再调用跨数据比较入口；`comparison.py`、`comparison_snapshots` 和历史比较文件仅保留兼容。行为模块当前是附件/评分/同步字段的结构化存储，不处理视频逐帧或逐 epoch 对齐。
+- 主要维护风险是 `MainWindow`、`ProjectWorkspace` 和 `ProjectStore` 职责集中，以及 Project Manager “编辑即时写 SQLite、Save 确认 backup/marker”的可恢复草稿语义。后者已有 Save/Discard/backup 测试，但不是跨进程事务工作区，交接材料中已列为 P1 语义风险。
+
+### 验证
+
+- `.venv\Scripts\python.exe -m pytest -q`：88 项通过；FOOOF 兼容后端出现第三方弃用警告。
+- `ruff check src tests scripts`、`compileall -q src tests scripts`、`pip check`、`git diff --check`：通过。
+- 固定只读 FIF `C:/Users/PC/Documents/ChatGPT/testdata/LID-T80_all_channels-epo.fif` 读取为 21×16×5000、1000 Hz、4 个非空 `drop_log` 条目；身份未解析。`scripts/run_gui.py --help` 和 `scripts/read_project_results.py --help` 通过。
+- 本轮再次尝试 offscreen 主 GUI 载入时进程以退出码 1 且无输出结束，因此未将该次列为新的 GUI 通过证据；此前离屏构造记录仍保留，但不替代实体 Windows 鼠标、DPI 和多显示器验收。
+
+### 未解决
+
+- 未改变代码，因此未新增源代码回归；下一步应先补 Save/Discard 的崩溃、重开、第二读取者和目录保护测试，再评估 ProjectStore 拆分。真实动物身份、行为同步、动物层统计和原生 GUI/DPI 仍未验证。
+
+## 2026-09-23 15:16:48 +08:00 — Project Manager 草稿恢复与 Save/Discard 回归
+
+### 范围与代码确认
+
+- 沿 `ProjectWorkspace._begin_project_edit()`、`save_project()`、`discard_project_changes()`、`_offer_draft_recovery()` 和 `ProjectStore.backup_database()` / `restore_database_backup()` 检查保存调用链；没有修改分析算法、默认计算参数或真实 FIF。
+- 确认项目编辑在 Save 前已写入活动 SQLite；独立 `ProjectStore` 可立即读到草稿字段。Save 校验层级/数据引用后移除 marker 和备份；Discard 从 SQLite 备份恢复并清理可安全移除的草稿内容，因此该机制是可恢复草稿，不提供第二读取者隔离。
+- 草稿 marker 改为临时文件写入、flush/fsync 后 `os.replace`。崩溃恢复对照初始目录清单补认 marker 尚未记录的新目录；Discard 仍只对项目根内路径调用 `rmdir()`，非空目录不删除。
+
+### 运行验证
+
+- 新增 `tests/test_project_draft.py` 4 项：Save/Discard 与第二 `ProjectStore` 可见性；子进程异常终止、重开后 Discard 和目录保护；异常重开后恢复草稿、Save 并再次重开；schema 5→6 迁移保留层级/数据身份并建立 session 顺序索引。
+- 子进程测试在独立临时项目调用 `os._exit(73)` 模拟进程突然终止；仅使用临时合成项目及合成来源字节，不读取或更改真实 FIF。
+- `.venv\Scripts\python.exe -m pytest -q`：92 项通过（含第三方 FOOOF 弃用警告）；`ruff check src tests scripts`、`compileall -q src tests scripts`、`pip check`、`git diff --check` 均通过。
+- `docs/ARCHITECTURE.md`、`docs/PROJECT_STATUS.md` 和本交接文件已同步当前保存语义、测试覆盖和待产品决策。
+
+### 未验证与限制
+
+- ProjectWorkspace 在 Qt offscreen 下由测试实际构造并触发恢复回调；未进行原生 Windows 鼠标人工操作、实体显示器尺寸、100%/125%/150% DPI 或多显示器验证，也没有生成 GUI 截图。
+- 草稿期间其他读取者可见写入是经测试确认的既有行为，不是故障修复；若产品要求 Save 前隔离，需另行设计 draft DB。测试未覆盖电源/磁盘损坏级故障，也不证明底层文件系统对断电的持久化保证。
+- 本轮未提交或推送；保留原有工作区改动。
+
+## 2026-09-23 16:35:04 +08:00 — Project Manager 目录范围联动与按钮说明
+
+### 根因与修改
+
+- 代码确认的旧根因：`ProjectWorkspace._build_data_tab()` 只把树选择事件接到状态资源刷新；`_refresh_data_table()` 又无条件调用全项目 `ProjectStore.data_units()`，所以选择 project/subject/session/state/data 节点都仍展示整项目数据。
+- `ProjectStore.data_units()` 增加 project、subject、session、state、data unit 稳定 ID 过滤，并将明确传入的空 ID 集合定义为空结果。表格、状态资源、筛选导出按所选层级的父子 ID 查询，名称和路径只用于显示。
+- 左树单击更新范围提示、范围总数和过滤后数量；搜索及 Group/Condition/Inspection 筛选只作用于当前范围。空节点和筛选后无结果分别提示。刷新保留稳定 ID/展开状态；删除选中节点时回退最近仍存在的父节点。行选中与批处理复选框分离，切换范围不自动批量勾选。
+- 直接测试发现关闭 Project Manager 后，非模态 Filter/export 窗口仍可能留在屏幕显示旧项目数据；现改为关闭管理器时同步关闭其全部筛选窗口，并添加回归测试。
+- `docs/PROJECT_WORKFLOW.md` 整理了当前真实按钮、菜单、右键、对话框、保存/文件影响与使用前提。确认主 GUI 的 `Save Result`/`Export Figure` 同接 `_export_figure`，补充双语 tooltip 明确其重复导出路径和自动分析 bundle 的区别；不合并/删除按钮。当前 Project Manager 没有动态语言切换，已在说明中如实列出。
+- 不改分析算法、默认参数或项目 schema；不修改真实 FIF；未 commit/push。
+
+### 运行验证
+
+- 新增/扩展 `tests/test_project_manager_scope.py` 共 7 项：项目/被试/session/state/data 五级范围、同名节点隔离、空 subject/session/state、范围内搜索与筛选、批处理勾选分离、导入后刷新/保存重开、改名后按 ID 保持选择、删除后父级回退、过滤窗口关闭；全量结果为 99 passed。
+- 固定只读 FIF `C:/Users/PC/Documents/ChatGPT/testdata/LID-T80_all_channels-epo.fif` 重新读取：21×16×5000、1000 Hz、`0–4.999 s`、16 个实际通道名称；读取前后 SHA-256 相同。将其仅以 external 引用登记在临时项目的 state 后，右侧范围显示一条；打开信号发出相同源路径和 data-unit ID，源文件未复制、移动或改写。
+- 临时合成项目实际构造 ProjectWorkspace 并渲染 project、subject、session、state、data leaf、空 subject/session/state 及真实 FIF 行共九种界面截图；路径：`C:/Users/PC/AppData/Local/Temp/luna_pm_scope_final_20260923_8dg7mmlu/`。另外用明确标记的合成 Quality bundle（`C:/Users/PC/AppData/Local/Temp/luna_pm_result_restore_20260923_azqm_gt0/`）通过 `MainWindow` 恢复结果和当次参数，确认 `analysis_thread is None` 且未启动计算。测试输出、截图和项目均留在 `%TEMP%`。
+- `.venv\Scripts\python.exe -m pytest -q`：99 项通过；`ruff check src tests scripts`、`compileall -q src tests scripts`、`pip check`、`git diff --check` 均通过。测试只保留 FOOOF 兼容包的既有弃用警告；`git diff --check` 有现存 LF/CRLF 提示，无 whitespace error。
+- 原先全项目展示的根因是代码确认且有回归测试支持；异步过期查询不适用，因为当前查询同步在 GUI 线程完成，没有并行刷新结果可覆盖。
+
+### 未验证与限制
+
+- 本轮 Qt 控件交互与截图在 `QT_QPA_PLATFORM=offscreen` 下完成。Computer Use 返回 `apps=[]`，只暴露 Codex IAB；启动的试验 GUI 进程无原生窗口句柄，因此未完成实体 Windows 鼠标验收、真实屏幕分辨率/DPI 或高 DPI 人工检查。
+- 使用的真实 FIF 没有已有项目结果 bundle；结果直接恢复路径以隔离的合成 bundle 验证，不能称为恢复该真实文件的既有科学结果。
+- Project Manager 无动态中英文切换。按钮/操作清单与明确发现的问题已记于 `docs/PROJECT_WORKFLOW.md`；项目状态和交接材料已同步。
+
+## 2026-09-23 17:09:29 +08:00 — Project Manager 辅助窗口生命周期复核
+
+### 检查结论与修改
+
+- 本轮是对附件所述旧项目窗口串上下文问题做当前代码核验。原先“关闭 Project Manager 后 Filter/export 仍可见”的表现，在本轮开始前已被 `ProjectWorkspace.closeEvent()` 的 accepted-close 分支挡住；关闭确认选择 Cancel 也会 `event.ignore()`，已有筛选窗不应被提前关闭。
+- 但 offscreen 运行检查确认仍有生命周期缺口：accepted close 只 `close()` 隐藏子窗口；`ProjectFilterExportDialog` 的 Qt 对象仍有效、仍持有旧 ProjectStore，旧 ProjectWorkspace 也仍作为 MainWindow QObject 子对象存活。故该场景不是完全无问题，本轮只修复对象销毁/上下文释放。
+- `ProjectFilterExportDialog` 现在使用 `WA_DeleteOnClose`，单独关窗时清理 Workspace 引用；Workspace 关闭只有在 Save/Discard 被接受后才关闭并 `deleteLater()` 全部 Filter/export 子窗，Cancel 路径不变。`MainWindow._attach_project()` 在项目替换后对关闭成功的旧 manager/batch/review workspace 调用 `deleteLater()` 并清空属性；批处理线程运行期间则拒绝切换并提示先停止/等待，避免旧任务窗口被静默隐藏。
+- 其他窗口按代码分为：Import Preview、结构模板、映射、JSON/参数编辑、元数据和重复 state 操作均为有 parent 的模态 `exec()` 对话框；Import Preview 行目标通过 `state_record_id` 保存，背景树选择不会重定向。Batch/Review 是 MainWindow 持有的 project workspace；项目切换时统一关闭/销毁。未发现其他 project-scoped 非模态辅助窗。
+- 未修改分析算法、默认参数、项目 schema 或真实 FIF；没有提交/推送。
+
+### 运行验证
+
+- Qt offscreen 直接复现并记录了基线：A 的筛选窗在 A manager 接受关闭后已不可见，但 `shiboken6.isValid(dialog)` 仍为真且仍是旧 Workspace 的子对象；B 新建窗口自身使用 B 的 store。该证据将“可见残留已修复”和“隐藏对象仍存活”区分开。
+- `tests/test_project_manager_scope.py` 当前 11 项通过，覆盖所有 Filter 窗接受关闭后的销毁、Cancel 保持 Workspace/筛选窗可见、独立关窗清理引用并可重开、A→B 销毁旧对象并绑定 B、运行中批处理阻止切换、Import Preview 目标 ID 在树选择改变后保持不变；原 scope 测试继续覆盖同名层级与空节点。
+- 全量 `.venv\Scripts\python.exe -m pytest -q` 收集/运行 103 项并以 exit code 0 完成；FOOOF 兼容依赖发出既有弃用警告。Ruff、compileall、pip check 和 `git diff --check` 均通过；git 仅报告既有 LF/CRLF 工作区提示。
+- 未加载真实 FIF，因为改动只涉及 Qt 对象生命周期；没有执行 GUI 原生鼠标操作。
+
+### 未验证与限制
+
+- Qt 测试使用 offscreen 平台；原生 Windows 鼠标、125%/150% DPI、多显示器仍未验证。
+- 当前 close/delete 行为通过 Qt 延迟删除队列运行验证；断电级故障与正在退出应用时的操作系统级窗口清理不属于本轮覆盖。

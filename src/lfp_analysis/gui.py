@@ -1568,7 +1568,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_store: ProjectStore | None = None
         self.project_workspace: ProjectWorkspace | None = None
         self.project_batch_workspace: ProjectWorkspace | None = None
-        self.project_compare_workspace: ProjectWorkspace | None = None
         self.project_review_workspace: ProjectWorkspace | None = None
         self.current_project_data_unit: dict[str, Any] | None = None
         self._project_result_context: dict[str, Any] | None = None
@@ -1603,10 +1602,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.menuBar().insertMenu(help_menu.menuAction(), project_menu)
         new_project_action = project_menu.addAction("New project…")
         new_project_action.triggered.connect(self._new_project)
+        new_project_action.setToolTip("创建一个新的 LUNA 项目文件夹；已存在的目录不会被覆盖。 / Create a new LUNA project; existing folders are not overwritten.")
         open_project_action = project_menu.addAction("Open project…")
         open_project_action.triggered.connect(self._open_project)
+        open_project_action.setToolTip("打开现有项目并切换当前 Project Manager。 / Open an existing project and switch the active Project Manager.")
         show_project_action = project_menu.addAction("Show project workspace")
         show_project_action.triggered.connect(self._show_project_workspace)
+        show_project_action.setToolTip("显示当前项目工作区；没有活动项目时尝试恢复上次项目。 / Show the current project, or reopen the last project if none is active.")
         self._restore_defaults()
         if output_dir:
             self.output_edit.setText(str(Path(output_dir).expanduser()))
@@ -1904,15 +1906,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_batch_button.setObjectName("globalSecondaryAction")
         self.project_batch_button.setToolTip("Choose project data, modules, and complete calculation parameters for a recoverable batch.")
         self.project_batch_button.clicked.connect(self._show_project_batch)
-        self.project_compare_button = QtWidgets.QPushButton("Compare")
-        self.project_compare_button.setObjectName("globalSecondaryAction")
-        self.project_compare_button.setToolTip("Compare saved project results; this never silently recalculates missing results.")
-        self.project_compare_button.clicked.connect(self._show_project_comparison)
         self.project_review_button = QtWidgets.QPushButton("Review")
         self.project_review_button.setObjectName("globalSecondaryAction")
         self.project_review_button.setToolTip("Review saved result versions and set independent approval status.")
         self.project_review_button.clicked.connect(self._show_project_review)
-        for button in (self.project_batch_button, self.project_compare_button, self.project_review_button):
+        for button in (self.project_batch_button, self.project_review_button):
             button.setFixedHeight(GLOBAL_ACTION_HEIGHT)
             action_row.addWidget(button)
         action_row.addStretch(1)
@@ -1927,11 +1925,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cancel_button.clicked.connect(self._cancel)
         self.save_result_button = QtWidgets.QPushButton("Save Result")
         self.save_result_button.setObjectName("globalSecondaryAction")
-        self.save_result_button.setToolTip("保存当前结果视图对应的图和数值表；不重新计算。")
+        self.save_result_button.setToolTip(
+            "通过当前指标的导出流程保存结果视图；部分指标也会导出 CSV。"
+            "目前与 Export Figure 共用同一流程，不会重算，也不等同于自动保存的分析结果包。 / "
+            "Export the current result view; some modules also write CSV tables. This currently uses the same flow as Export Figure, does not recalculate, and is not the automatic analysis bundle."
+        )
         self.save_result_button.clicked.connect(self._save_result)
         self.export_figure_button = QtWidgets.QPushButton("Export Figure")
         self.export_figure_button.setObjectName("globalSecondaryAction")
-        self.export_figure_button.setToolTip("导出当前结果图；具体指标视图会提供相应格式。")
+        self.export_figure_button.setToolTip(
+            "通过当前指标的导出流程导出结果图；部分指标也会导出 CSV。"
+            "目前与 Save Result 共用同一流程。 / "
+            "Export through the selected metric's exporter; some modules also write CSV tables. This currently uses the same flow as Save Result."
+        )
         self.export_figure_button.clicked.connect(self._export_figure)
         for button in (self.run_button, self.cancel_button, self.save_result_button, self.export_figure_button):
             button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 28)
@@ -3894,13 +3900,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_message(QtWidgets.QMessageBox.Icon.Critical, "Cannot open project", str(exc))
 
     def _attach_project(self, store: ProjectStore) -> bool:
-        for window_name in ("project_workspace", "project_batch_workspace", "project_compare_workspace", "project_review_workspace"):
+        batch_window = self.project_batch_workspace
+        batch_thread = getattr(batch_window, "batch_thread", None) if batch_window is not None else None
+        if batch_thread is not None and batch_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Batch is running",
+                "Stop the current batch and wait for it to finish before switching projects. The current project remains open.",
+            )
+            return False
+        for window_name in ("project_workspace", "project_batch_workspace", "project_review_workspace"):
             window = getattr(self, window_name, None)
             if window is not None:
                 window.close()
                 if window.isVisible():
                     return False
                 setattr(self, window_name, None)
+                window.deleteLater()
         self.project_store = store
         self.output_edit.setText(str(store.paths.results))
         self.project_button.setText(store.project["name"])
@@ -3942,18 +3958,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.project_batch_workspace.set_batch_task_config(self._read_parameter_values())
         except Exception as exc:  # noqa: BLE001
             self._show_message(QtWidgets.QMessageBox.Icon.Warning, "Cannot copy parameters", str(exc))
-
-    def _show_project_comparison(self) -> None:
-        if self.project_store is None:
-            self._show_project_workspace()
-            if self.project_store is None:
-                return
-        if self.project_compare_workspace is None:
-            self.project_compare_workspace = ProjectWorkspace(self.project_store, self.config_path, self.metadata_dir, self, mode="compare")
-            self.project_compare_workspace.queue_data_units.connect(self._open_project_batch_with_selection)
-        else:
-            self.project_compare_workspace.refresh_all()
-        self.project_compare_workspace.show(); self.project_compare_workspace.raise_(); self.project_compare_workspace.activateWindow()
 
     def _show_project_review(self) -> None:
         if self.project_store is None:

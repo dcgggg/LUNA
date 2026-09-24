@@ -87,7 +87,7 @@ def test_behavior_metadata_distinguishes_missing_and_zero_and_keeps_state_links(
     assert scores[1]["value"] == 0.0
     assert store.behavior_attachments(state)[0]["attachment_id"] == attachment
     assert store.synchronization_records(state)[0]["sync_id"] == sync_id
-    assert store.project["schema_version"] == 5
+    assert store.project["schema_version"] == 6
 
 
 def test_project_database_backup_restores_metadata_without_touching_result_files(tmp_path: Path):
@@ -486,7 +486,7 @@ def test_opening_schema_two_project_backfills_hierarchy_paths_and_folders(tmp_pa
     shutil.rmtree(store.paths.subjects)
 
     reopened = ProjectStore(store.paths.root)
-    assert reopened.project["schema_version"] == 5
+    assert reopened.project["schema_version"] == 6
     assert reopened.subjects()[0]["relative_path"] == "subjects/Mouse01"
     assert reopened.sessions()[0]["relative_path"] == "subjects/Mouse01/Day1"
     assert reopened.state_records()[0]["relative_path"] == "subjects/Mouse01/Day1/T20"
@@ -564,12 +564,12 @@ def test_apply_template_button_uses_current_editor_and_logs_result(tmp_path: Pat
     assert '"status": "completed"' in operation_log.read_text(encoding="utf-8")
 
 
-def test_project_workspace_separates_manage_batch_compare_and_review(tmp_path: Path, monkeypatch):
+def test_project_workspace_separates_manage_batch_filter_and_review(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
 
-    from lfp_analysis.project_gui import ProjectWorkspace
+    from lfp_analysis.project_gui import ProjectFilterExportDialog, ProjectWorkspace
 
     source = tmp_path / "synthetic.fif"
     source.write_bytes(b"synthetic")
@@ -578,18 +578,18 @@ def test_project_workspace_separates_manage_batch_compare_and_review(tmp_path: P
     app = QApplication.instance() or QApplication([])
     manage = ProjectWorkspace(store, Path("configs/luna.yaml"), Path("metadata"), mode="manage")
     batch = ProjectWorkspace(store, Path("configs/luna.yaml"), Path("metadata"), mode="batch", initial_data_unit_ids=[data_id])
-    compare = ProjectWorkspace(store, Path("configs/luna.yaml"), Path("metadata"), mode="compare")
+    filter_view = ProjectWorkspace(store, Path("configs/luna.yaml"), Path("metadata"), mode="filter")
     review = ProjectWorkspace(store, Path("configs/luna.yaml"), Path("metadata"), mode="review")
-    for window in (manage, batch, compare, review):
+    for window in (manage, batch, filter_view, review):
         window.show()
     app.processEvents()
-    assert [manage.tabs.tabText(0), batch.tabs.tabText(0), compare.tabs.tabText(0), review.tabs.tabText(0)] == [
-        "Project data", "Batch analysis", "A / B comparison", "Review results",
+    assert [manage.tabs.tabText(0), batch.tabs.tabText(0), filter_view.tabs.tabText(0), review.tabs.tabText(0)] == [
+        "Project data", "Batch analysis", "Filter / export list", "Review results",
     ]
     assert batch.batch_data_table.columnCount() == 9
-    assert compare.compare_table.columnCount() == 16
-    assert compare.compare_paired.isChecked()
-    for window in (manage, batch, compare, review):
+    assert filter_view.filter_export_dialog.table.columnCount() == len(ProjectFilterExportDialog.COLUMNS)
+    assert filter_view.filter_export_dialog.table.rowCount() == 1
+    for window in (manage, batch, filter_view, review):
         window.close()
 
 

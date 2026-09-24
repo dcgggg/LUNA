@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-PROJECT_SCHEMA_VERSION = 5
+PROJECT_SCHEMA_VERSION = 6
 PROJECT_DATABASE = "project.sqlite3"
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10)),
@@ -236,7 +236,7 @@ class ProjectStore:
             connection.executescript(
                 """
                 CREATE TABLE schema_info(version INTEGER NOT NULL);
-                INSERT INTO schema_info(version) VALUES(5);
+                INSERT INTO schema_info(version) VALUES(6);
                 CREATE TABLE projects(
                     project_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
                     created_at_utc TEXT NOT NULL, root_path TEXT NOT NULL, schema_version INTEGER NOT NULL,
@@ -250,9 +250,9 @@ class ProjectStore:
                 CREATE TABLE sessions(
                     session_id TEXT PRIMARY KEY, subject_id TEXT NOT NULL REFERENCES subjects(subject_id) ON DELETE CASCADE,
                     session_key TEXT NOT NULL, experiment_name TEXT, session_date TEXT, notes TEXT,
-                    created_at_utc TEXT NOT NULL, relative_path TEXT
+                    created_at_utc TEXT NOT NULL, relative_path TEXT, sort_order INTEGER
                 );
-                CREATE INDEX idx_sessions_subject_key ON sessions(subject_id,session_key);
+                CREATE INDEX idx_sessions_subject_order ON sessions(subject_id,sort_order,created_at_utc);
                 CREATE TABLE state_records(
                     state_record_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
                     condition_label TEXT, timepoint_value REAL, timepoint_unit TEXT, reference_event TEXT,
@@ -378,6 +378,9 @@ class ProjectStore:
         if version == 4:
             self._migrate_v4_to_v5()
             version = 5
+        if version == 5:
+            self._migrate_v5_to_v6()
+            version = 6
         if version != PROJECT_SCHEMA_VERSION:
             raise ValueError(f"Unsupported project schema: {version}")
 
@@ -491,6 +494,24 @@ class ProjectStore:
             )
             connection.execute("UPDATE projects SET schema_version=5")
             connection.execute("UPDATE schema_info SET version=5")
+
+    def _migrate_v5_to_v6(self) -> None:
+        """Store explicit session ordering for natural chronological display."""
+        with self.transaction() as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "sort_order" not in columns:
+                connection.execute("ALTER TABLE sessions ADD COLUMN sort_order INTEGER")
+            subjects = [row[0] for row in connection.execute("SELECT DISTINCT subject_id FROM sessions").fetchall()]
+            for subject_id in subjects:
+                rows = connection.execute(
+                    "SELECT session_id FROM sessions WHERE subject_id=? ORDER BY created_at_utc,session_id",
+                    (subject_id,),
+                ).fetchall()
+                for index, row in enumerate(rows):
+                    connection.execute("UPDATE sessions SET sort_order=? WHERE session_id=?", (index, row[0]))
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_sessions_subject_order ON sessions(subject_id,sort_order,created_at_utc)")
+            connection.execute("UPDATE projects SET schema_version=6")
+            connection.execute("UPDATE schema_info SET version=6")
 
     def _allocate_structure_relative_path(
         self,
@@ -670,26 +691,28 @@ class ProjectStore:
                 ).fetchone()
                 if subject is None:
                     raise KeyError(subject_id)
+                order_row = connection.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM sessions WHERE subject_id=?", (subject_id,)).fetchone()
+                sort_order = int(order_row["next_order"])
                 relative_path = self._allocate_structure_relative_path(
                     str(subject["relative_path"]), key, "session", self._used_structure_paths(connection)
                 )
                 created_directories = self._create_structure_directories([relative_path])
                 connection.execute(
                     """INSERT INTO sessions(
-                           session_id,subject_id,session_key,experiment_name,session_date,notes,created_at_utc,relative_path
-                       ) VALUES(?,?,?,?,?,?,?,?)""",
-                    (session_id, subject_id, key, experiment_name.strip() or None, session_date.strip() or None, notes.strip() or None, utc_now(), relative_path),
+                           session_id,subject_id,session_key,experiment_name,session_date,notes,created_at_utc,relative_path,sort_order
+                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (session_id, subject_id, key, experiment_name.strip() or None, session_date.strip() or None, notes.strip() or None, utc_now(), relative_path, sort_order),
                 )
         except Exception:
             self._remove_created_empty_directories(created_directories)
             raise
         return session_id
 
-    def update_session(self, session_id: str, *, session_key: str, experiment_name: str = "", session_date: str = "", notes: str = "") -> None:
+    def update_session(self, session_id: str, *, session_key: str, experiment_name: str = "", session_date: str = "", notes: str = "", sort_order: int | None = None) -> None:
         with self.transaction() as connection:
             connection.execute(
-                "UPDATE sessions SET session_key=?,experiment_name=?,session_date=?,notes=? WHERE session_id=?",
-                (session_key.strip(), experiment_name.strip() or None, session_date.strip() or None, notes.strip() or None, session_id),
+                "UPDATE sessions SET session_key=?,experiment_name=?,session_date=?,notes=?,sort_order=COALESCE(?,sort_order) WHERE session_id=?",
+                (session_key.strip(), experiment_name.strip() or None, session_date.strip() or None, notes.strip() or None, sort_order, session_id),
             )
 
     def add_state_record(
@@ -1100,9 +1123,10 @@ class ProjectStore:
         return self.query("SELECT * FROM subjects ORDER BY subject_code")
 
     def sessions(self, subject_id: str | None = None) -> list[dict[str, Any]]:
+        ordering = "ORDER BY COALESCE(sort_order, 2147483647), session_key, created_at_utc"
         if subject_id:
-            return self.query("SELECT * FROM sessions WHERE subject_id=? ORDER BY session_key,created_at_utc", (subject_id,))
-        return self.query("SELECT * FROM sessions ORDER BY session_key,created_at_utc")
+            return self.query(f"SELECT * FROM sessions WHERE subject_id=? {ordering}", (subject_id,))
+        return self.query(f"SELECT * FROM sessions {ordering}")
 
     def state_records(self, session_id: str | None = None) -> list[dict[str, Any]]:
         if session_id:
@@ -1115,7 +1139,7 @@ class ProjectStore:
             """SELECT r.*,s.session_key,s.experiment_name,u.subject_id,u.subject_code,u.group_label
                FROM state_records r JOIN sessions s ON s.session_id=r.session_id
                JOIN subjects u ON u.subject_id=s.subject_id
-               ORDER BY u.subject_code,s.session_key,r.timepoint_value,r.display_name"""
+               ORDER BY u.subject_code,COALESCE(s.sort_order,2147483647),s.session_key,r.timepoint_value,r.display_name"""
         )
 
     @staticmethod
@@ -1141,7 +1165,7 @@ class ProjectStore:
                        WHERE d.state_record_id=r.state_record_id) AS result_count
                FROM state_records r JOIN sessions s ON s.session_id=r.session_id
                JOIN subjects u ON u.subject_id=s.subject_id
-               ORDER BY u.subject_code,s.session_key,r.created_at_utc"""
+               ORDER BY u.subject_code,COALESCE(s.sort_order,2147483647),s.session_key,r.created_at_utc"""
         )
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for row in states:
@@ -1222,21 +1246,50 @@ class ProjectStore:
             "removed_empty_directories": removed_directories,
         }
 
-    def data_units(self, *, data_unit_ids: Iterable[str] | None = None) -> list[dict[str, Any]]:
+    def data_units(
+        self,
+        *,
+        project_id: str | None = None,
+        subject_id: str | None = None,
+        session_id: str | None = None,
+        state_record_id: str | None = None,
+        data_unit_id: str | None = None,
+        data_unit_ids: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return data records within exact stable-ID scope filters.
+
+        Passing an empty ``data_unit_ids`` iterable intentionally returns no
+        rows.  Names and paths are never used to infer hierarchy membership.
+        """
         sql = """
             SELECT d.*,r.display_name AS state_display_name,r.condition_label,r.timepoint_value,r.timepoint_unit,r.reference_event,
-                   s.session_id,s.session_key,s.experiment_name,s.session_date,u.subject_id,u.subject_code,u.group_label,
+                   s.session_id,s.session_key,s.sort_order AS session_sort_order,s.experiment_name,s.session_date,u.subject_id,u.subject_code,u.group_label,
                    p.project_id,p.name AS project_name
             FROM data_units d JOIN state_records r ON r.state_record_id=d.state_record_id
             JOIN sessions s ON s.session_id=r.session_id JOIN subjects u ON u.subject_id=s.subject_id
             JOIN projects p ON p.project_id=u.project_id
         """
-        parameters: tuple[Any, ...] = ()
-        ids = list(data_unit_ids or [])
-        if ids:
-            sql += f" WHERE d.data_unit_id IN ({','.join('?' for _ in ids)})"
-            parameters = tuple(ids)
-        sql += " ORDER BY u.subject_code,s.session_key,r.timepoint_value,r.display_name,d.created_at_utc"
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        for value, column in (
+            (project_id, "p.project_id"),
+            (subject_id, "u.subject_id"),
+            (session_id, "s.session_id"),
+            (state_record_id, "r.state_record_id"),
+            (data_unit_id, "d.data_unit_id"),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                parameters.append(str(value))
+        if data_unit_ids is not None:
+            ids = list(dict.fromkeys(str(value) for value in data_unit_ids))
+            if not ids:
+                return []
+            clauses.append(f"d.data_unit_id IN ({','.join('?' for _ in ids)})")
+            parameters.extend(ids)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY u.subject_code,COALESCE(s.sort_order,2147483647),s.session_key,r.timepoint_value,r.display_name,d.created_at_utc"
         rows = self.query(sql, parameters)
         for row in rows:
             for key, default in (
@@ -1433,7 +1486,7 @@ class ProjectStore:
                     subject_path = str(subject["relative_path"])
                     counts["subject_ids"].append(subject_id)
                     affected_paths.append(subject_path)
-                    for session_spec in session_specs:
+                    for session_index, session_spec in enumerate(session_specs):
                         key = str(session_spec.get("session_key", "") if isinstance(session_spec, dict) else session_spec).strip()
                         if not key:
                             raise ValueError("Template contains an empty session key")
@@ -1444,9 +1497,9 @@ class ProjectStore:
                             experiment = str(session_spec.get("experiment_name", "") if isinstance(session_spec, dict) else "").strip()
                             connection.execute(
                                 """INSERT INTO sessions(
-                                       session_id,subject_id,session_key,experiment_name,session_date,notes,created_at_utc,relative_path
-                                   ) VALUES(?,?,?,?,?,?,?,?)""",
-                                (session_id, subject_id, key, experiment or None, None, None, utc_now(), relative_path),
+                                       session_id,subject_id,session_key,experiment_name,session_date,notes,created_at_utc,relative_path,sort_order
+                                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                                (session_id, subject_id, key, experiment or None, None, None, utc_now(), relative_path, session_index),
                             )
                             session = {"session_id": session_id, "subject_id": subject_id, "session_key": key, "relative_path": relative_path}
                             sessions[(subject_id, key)] = session
@@ -1724,7 +1777,7 @@ class ProjectStore:
         sql = """
             SELECT a.*,d.state_record_id,d.source_path,d.signal_unit,r.display_name AS state_display_name,
                    r.condition_label,r.timepoint_value,r.timepoint_unit,r.reference_event,
-                   s.session_id,s.session_key,s.experiment_name,s.session_date,u.subject_id,u.subject_code,u.group_label
+                   s.session_id,s.session_key,s.sort_order AS session_sort_order,s.experiment_name,s.session_date,u.subject_id,u.subject_code,u.group_label
             FROM analysis_runs a JOIN data_units d ON d.data_unit_id=a.data_unit_id
             JOIN state_records r ON r.state_record_id=d.state_record_id
             JOIN sessions s ON s.session_id=r.session_id JOIN subjects u ON u.subject_id=s.subject_id
@@ -1743,6 +1796,12 @@ class ProjectStore:
             if key in filters and filters[key] not in (None, ""):
                 clauses.append(f"{column}=?")
                 parameters.append(filters[key])
+        if "data_unit_ids" in filters and filters["data_unit_ids"] is not None:
+            data_unit_ids = list(dict.fromkeys(str(value) for value in filters["data_unit_ids"]))
+            if not data_unit_ids:
+                return []
+            clauses.append(f"a.data_unit_id IN ({','.join('?' for _ in data_unit_ids)})")
+            parameters.extend(data_unit_ids)
         if filters.get("timepoint_min") not in (None, ""):
             clauses.append("r.timepoint_value>=?")
             parameters.append(filters["timepoint_min"])
@@ -1751,7 +1810,7 @@ class ProjectStore:
             parameters.append(filters["timepoint_max"])
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY u.subject_code,s.session_key,r.timepoint_value,a.created_at_utc DESC"
+        sql += " ORDER BY u.subject_code,COALESCE(s.sort_order,2147483647),s.session_key,r.timepoint_value,a.created_at_utc DESC"
         rows = self.query(sql, parameters)
         for row in rows:
             row["parameters"] = _loads(row.pop("parameters_json"), {})

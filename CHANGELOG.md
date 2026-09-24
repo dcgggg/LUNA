@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0.dev1] — 2026-09-24 (prerelease)
+
+- Removed the in-app cross-record A/B comparison entry point. The project manager now provides hierarchy, import, metadata, filter and CSV/JSON list export; cross-subject statistics and scientific comparison figures use the saved result contract externally.
+- Added explicit per-subject session ordering and project schema 6 migration so labels such as Day3 and Day10 retain the user's order.
+- Added stable-ID project scope filtering, auxiliary-window lifecycle cleanup, recoverable project-draft regression coverage and architecture/handoff documentation.
+- Scientific algorithms and default estimator parameters are unchanged.
+
 ## [0.3.0.dev0] — 2026-09-23 (prerelease)
 
 - Added a local SQLite project model with stable project, subject, session, experimental-state and data-unit identities.

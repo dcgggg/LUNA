@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import traceback
 import uuid
@@ -11,17 +12,8 @@ from typing import Any, ClassVar
 
 import numpy as np
 import pandas as pd
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.colors import Normalize, TwoSlopeNorm
-from matplotlib.figure import Figure
 from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
-from .comparison import (
-    paired_subject_summary,
-    select_results,
-    subject_match_preview,
-    subject_summary,
-)
 from .gui_engine import inspect_file
 from .mapping import mapping_rows
 from .project_batch import MODULE_TO_INDICATORS, ProjectBatchRunner
@@ -32,7 +24,6 @@ from .project_store import (
     utc_now,
 )
 from .resources import packaged_resource_path
-from .result_contract import load_result_manifest, load_table
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -205,10 +196,13 @@ class ImportPreviewDialog(QtWidgets.QDialog):
         layout.addWidget(self.table)
         tools = QtWidgets.QHBoxLayout()
         duplicate_row = QtWidgets.QPushButton("Duplicate selected row")
+        duplicate_row.setToolTip("Duplicate the selected import row so one source can be assigned to another state or selection.")
         duplicate_row.clicked.connect(self._duplicate_selected_row)
         fill_down = QtWidgets.QPushButton("Fill current cell down")
+        fill_down.setToolTip("Copy the selected editable epoch/time cell value to following import rows.")
         fill_down.clicked.connect(self._fill_current_down)
         fill_targets = QtWidgets.QPushButton("Fill target state down")
+        fill_targets.setToolTip("Copy the selected row's target state to following import rows.")
         fill_targets.clicked.connect(self._fill_target_down)
         tools.addWidget(duplicate_row); tools.addWidget(fill_down); tools.addWidget(fill_targets); tools.addStretch(1)
         layout.addLayout(tools)
@@ -469,6 +463,7 @@ class ProjectCreationDialog(QtWidgets.QDialog):
         self.name_edit = QtWidgets.QLineEdit()
         self.parent_edit = QtWidgets.QLineEdit(str(Path.home() / "LUNAProjects"))
         browse = QtWidgets.QPushButton("Choose parent…")
+        browse.setToolTip("选择新项目上级目录；实际路径会在下方预览。 / Choose the parent folder; the target path is previewed below.")
         browse.clicked.connect(self._choose_parent)
         parent_row = QtWidgets.QHBoxLayout()
         parent_row.addWidget(self.parent_edit, 1)
@@ -554,6 +549,7 @@ class StructureTemplateDialog(QtWidgets.QDialog):
         self.subject_count = QtWidgets.QSpinBox(); self.subject_count.setRange(1, 9999); self.subject_count.setValue(5)
         self.subject_padding = QtWidgets.QSpinBox(); self.subject_padding.setRange(1, 8); self.subject_padding.setValue(2)
         generate_subjects = QtWidgets.QPushButton("Generate subject list")
+        generate_subjects.setToolTip("按 Prefix、Start、Count 和 Zero padding 生成被试名称列表。 / Generate subject codes from the fields below.")
         generate_subjects.clicked.connect(self._generate_subjects)
         self.steps.addTab(self._text_step(self.subjects_edit, [("Prefix", self.subject_prefix), ("Start", self.subject_start), ("Count", self.subject_count), ("Zero padding", self.subject_padding)], generate_subjects), "1. Subjects")
         self.sessions_edit = QtWidgets.QPlainTextEdit()
@@ -575,6 +571,7 @@ class StructureTemplateDialog(QtWidgets.QDialog):
         for label, widget in (("Start", self.state_start), ("End", self.state_end), ("Step", self.state_step), ("Unit", self.state_unit)):
             range_row.addWidget(QtWidgets.QLabel(label)); range_row.addWidget(widget)
         generate_states = QtWidgets.QPushButton("Generate timepoints")
+        generate_states.setToolTip("Generate state rows from Start, End, Step, and Unit. This only edits the template form until applied.")
         generate_states.clicked.connect(self._generate_states)
         range_row.addWidget(generate_states)
         state_layout.addLayout(range_row)
@@ -597,6 +594,8 @@ class StructureTemplateDialog(QtWidgets.QDialog):
         save_button = buttons.addButton("Save template", QtWidgets.QDialogButtonBox.ButtonRole.ActionRole)
         self.apply_button = buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Apply)
         self.apply_button.setText("Apply current structure")
+        save_button.setToolTip("Save a reusable structure definition only; it does not create project nodes or folders.")
+        self.apply_button.setToolTip("Create or reuse subject/session/state records and folders in the currently open project.")
         save_button.clicked.connect(self._save_template)
         self.apply_button.clicked.connect(self._apply)
         buttons.rejected.connect(self.reject)
@@ -772,6 +771,210 @@ class BatchWorker(QtCore.QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class ProjectFilterExportDialog(QtWidgets.QDialog):
+    """Filter project data units without pairing, averaging, or plotting."""
+
+    COLUMNS: ClassVar[list[str]] = [
+        "subject_code", "group_label", "session_key", "session_date",
+        "state_display_name", "condition_label", "timepoint_value",
+        "timepoint_unit", "reference_event", "inspection_status",
+        "data_unit_id", "source_path", "resolved_source_path",
+        "result_status", "result_analysis_ids",
+    ]
+
+    def __init__(
+        self,
+        store: ProjectStore,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        scope_query: dict[str, Any] | None = None,
+        scope_label: str | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.store = store
+        self.scope_query = dict(scope_query or {"project_id": str(store.project["project_id"])})
+        self.scope_label = scope_label or str(store.project["name"])
+        self.setWindowTitle(f"LUNA — Filter / export data list — {store.project['name']}")
+        self.resize(1240, 760)
+        self._rows: list[dict[str, Any]] = []
+        self._lists: dict[str, QtWidgets.QListWidget] = {}
+        self._build_ui()
+        self.refresh()
+
+    @staticmethod
+    def _checked_values(widget: QtWidgets.QListWidget) -> list[str]:
+        all_item = widget.item(0)
+        if all_item is not None and all_item.checkState() == QtCore.Qt.CheckState.Checked:
+            return []
+        return [
+            widget.item(index).text()
+            for index in range(1, widget.count())
+            if widget.item(index).checkState() == QtCore.Qt.CheckState.Checked
+        ]
+
+    def _make_list(self, name: str, values: list[str]) -> QtWidgets.QListWidget:
+        widget = QtWidgets.QListWidget()
+        widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        widget.setMaximumHeight(72)
+        all_item = QtWidgets.QListWidgetItem("All")
+        all_item.setCheckState(QtCore.Qt.CheckState.Checked)
+        widget.addItem(all_item)
+        for value in values:
+            item = QtWidgets.QListWidgetItem(str(value))
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            widget.addItem(item)
+        widget.itemChanged.connect(lambda changed, current=widget: self._all_item_rule(changed, current))
+        self._lists[name] = widget
+        return widget
+
+    @staticmethod
+    def _all_item_rule(changed: QtWidgets.QListWidgetItem, widget: QtWidgets.QListWidget) -> None:
+        if changed.text() == "All" and changed.checkState() == QtCore.Qt.CheckState.Checked:
+            for index in range(1, widget.count()):
+                widget.item(index).setCheckState(QtCore.Qt.CheckState.Unchecked)
+        elif changed.text() != "All" and changed.checkState() == QtCore.Qt.CheckState.Checked:
+            widget.item(0).setCheckState(QtCore.Qt.CheckState.Unchecked)
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        controls = QtWidgets.QGridLayout()
+        units = self.store.data_units(**self.scope_query)
+        choices = {
+            "group": sorted({str(row.get("group_label") or "未设置") for row in units}),
+            "subject": sorted({str(row.get("subject_code") or "未设置") for row in units}),
+            "session": sorted({str(row.get("session_key") or "未设置") for row in units}),
+            "state": sorted({str(row.get("state_display_name") or "未设置") for row in units}),
+            "condition": sorted({str(row.get("condition_label") or "未设置") for row in units}),
+        }
+        labels = {"group": "Group", "subject": "Subject", "session": "Session", "state": "State", "condition": "Condition"}
+        for column, key in enumerate(("group", "subject", "session", "state", "condition")):
+            controls.addWidget(QtWidgets.QLabel(labels[key]), 0, column)
+            controls.addWidget(self._make_list(key, choices[key]), 1, column)
+        self.unit_combo = QtWidgets.QComboBox(); self.unit_combo.addItem("All", "")
+        for value in sorted({str(row.get("timepoint_unit") or "未设置") for row in units}): self.unit_combo.addItem(value, value)
+        self.reference_combo = QtWidgets.QComboBox(); self.reference_combo.addItem("All", "")
+        for value in sorted({str(row.get("reference_event") or "未设置") for row in units}): self.reference_combo.addItem(value, value)
+        self.inspection_combo = QtWidgets.QComboBox(); self.inspection_combo.addItem("All", "")
+        for value in sorted({str(row.get("inspection_status") or "未设置") for row in units}): self.inspection_combo.addItem(value, value)
+        self.module_combo = QtWidgets.QComboBox(); self.module_combo.addItem("All modules", "")
+        scoped_ids = [str(row["data_unit_id"]) for row in units]
+        scoped_results = self.store.analysis_results({"data_unit_ids": scoped_ids})
+        for value in sorted({str(row.get("module_name") or "") for row in scoped_results if row.get("module_name")}): self.module_combo.addItem(value, value)
+        self.exact_time_check = QtWidgets.QCheckBox("Exact timepoint")
+        self.exact_time = QtWidgets.QDoubleSpinBox(); self.exact_time.setRange(-1_000_000, 1_000_000); self.exact_time.setDecimals(3); self.exact_time.setEnabled(False)
+        self.exact_time_check.toggled.connect(self.exact_time.setEnabled)
+        self.only_result_check = QtWidgets.QCheckBox("Only records with a saved current result")
+        controls.addWidget(QtWidgets.QLabel("Time unit"), 2, 0); controls.addWidget(self.unit_combo, 3, 0)
+        controls.addWidget(QtWidgets.QLabel("Reference event"), 2, 1); controls.addWidget(self.reference_combo, 3, 1)
+        controls.addWidget(QtWidgets.QLabel("Inspection"), 2, 2); controls.addWidget(self.inspection_combo, 3, 2)
+        controls.addWidget(QtWidgets.QLabel("Result module"), 2, 3); controls.addWidget(self.module_combo, 3, 3)
+        time_row = QtWidgets.QHBoxLayout(); time_row.addWidget(self.exact_time_check); time_row.addWidget(self.exact_time); time_row.addStretch(1)
+        controls.addLayout(time_row, 3, 4)
+        controls.addWidget(self.only_result_check, 4, 0, 1, 3)
+        self.scope_summary = QtWidgets.QLabel(f"Current scope: {self.scope_label} · {len(units)} data records before filters")
+        self.scope_summary.setWordWrap(True)
+        layout.addWidget(self.scope_summary)
+        layout.addLayout(controls)
+        actions = QtWidgets.QHBoxLayout()
+        refresh = QtWidgets.QPushButton("Refresh list"); refresh.clicked.connect(self.refresh)
+        clear_filters = QtWidgets.QPushButton("Clear filters"); clear_filters.clicked.connect(self.clear_filters)
+        export_csv = QtWidgets.QPushButton("Export CSV"); export_csv.clicked.connect(lambda: self._export("csv"))
+        export_json = QtWidgets.QPushButton("Export JSON"); export_json.clicked.connect(lambda: self._export("json"))
+        for button in (refresh, clear_filters, export_csv, export_json): actions.addWidget(button)
+        actions.addStretch(1)
+        self.summary = QtWidgets.QLabel(); self.summary.setWordWrap(True); actions.addWidget(self.summary, stretch=1)
+        layout.addLayout(actions)
+        self.table = QtWidgets.QTableWidget(); self.table.setColumnCount(len(self.COLUMNS)); self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(len(self.COLUMNS) - 1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table, stretch=1)
+
+    def _filters(self) -> dict[str, Any]:
+        return {
+            "group_label": self._checked_values(self._lists["group"]),
+            "subject_code": self._checked_values(self._lists["subject"]),
+            "session_key": self._checked_values(self._lists["session"]),
+            "state_display_name": self._checked_values(self._lists["state"]),
+            "condition_label": self._checked_values(self._lists["condition"]),
+            "timepoint_unit": str(self.unit_combo.currentData() or ""),
+            "reference_event": str(self.reference_combo.currentData() or ""),
+            "inspection_status": str(self.inspection_combo.currentData() or ""),
+            "module_name": str(self.module_combo.currentData() or ""),
+            "timepoint_value": float(self.exact_time.value()) if self.exact_time_check.isChecked() else None,
+            "only_result": bool(self.only_result_check.isChecked()),
+        }
+
+    def clear_filters(self) -> None:
+        for widget in self._lists.values():
+            with QtCore.QSignalBlocker(widget):
+                for index in range(widget.count()):
+                    widget.item(index).setCheckState(
+                        QtCore.Qt.CheckState.Checked if index == 0 else QtCore.Qt.CheckState.Unchecked
+                    )
+        for widget in (self.unit_combo, self.reference_combo, self.inspection_combo, self.module_combo):
+            widget.setCurrentIndex(0)
+        self.exact_time_check.setChecked(False)
+        self.only_result_check.setChecked(False)
+        self.refresh()
+
+    def refresh(self) -> None:
+        filters = self._filters()
+        base_units = self.store.data_units(**self.scope_query)
+        base_ids = [str(row["data_unit_id"]) for row in base_units]
+        result_rows = self.store.analysis_results({
+            "calculation_status": "completed", "save_status": "saved", "result_validity": "current",
+            "data_unit_ids": base_ids,
+        })
+        by_unit: dict[str, list[dict[str, Any]]] = {}
+        for row in result_rows: by_unit.setdefault(str(row["data_unit_id"]), []).append(row)
+        rows: list[dict[str, Any]] = []
+        for source in base_units:
+            values = {key: str(source.get(key) or "未设置") for key in ("group_label", "subject_code", "session_key", "state_display_name", "condition_label", "timepoint_unit", "reference_event", "inspection_status")}
+            if any(filters[key] and values[key] not in filters[key] for key in ("group_label", "subject_code", "session_key", "state_display_name", "condition_label")): continue
+            if filters["timepoint_unit"] and values["timepoint_unit"] != filters["timepoint_unit"]: continue
+            if filters["reference_event"] and values["reference_event"] != filters["reference_event"]: continue
+            if filters["inspection_status"] and values["inspection_status"] != filters["inspection_status"]: continue
+            timepoint = source.get("timepoint_value")
+            if filters["timepoint_value"] is not None and (timepoint is None or not np.isclose(float(timepoint), filters["timepoint_value"])): continue
+            available = by_unit.get(str(source["data_unit_id"]), [])
+            if filters["module_name"]: available = [row for row in available if str(row.get("module_name")) == filters["module_name"]]
+            if filters["only_result"] and not available: continue
+            rows.append({**source, "result_status": "; ".join(sorted({str(row.get("module_name")) for row in available})) or "缺少目标结果", "result_analysis_ids": "; ".join(str(row.get("analysis_id")) for row in available)})
+        self._rows = rows
+        self.table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column_index, column in enumerate(self.COLUMNS):
+                value = row.get(column, "")
+                self.table.setItem(row_index, column_index, QtWidgets.QTableWidgetItem("" if value is None else str(value)))
+        self.table.resizeColumnsToContents()
+        subject_count = len({row.get("subject_id") for row in rows}); session_count = len({row.get("session_id") for row in rows}); state_count = len({row.get("state_record_id") for row in rows}); result_count = sum(bool(row.get("result_analysis_ids")) for row in rows)
+        self.scope_summary.setText(
+            f"Current scope: {self.scope_label} · {len(base_units)} data records before filters · "
+            f"{len(rows)} after filters"
+        )
+        self.summary.setText(f"匹配：{subject_count} 个被试、{session_count} 个 session、{state_count} 个 state、{len(rows)} 条数据记录；有目标结果 {result_count} 条。字段之间为且，同一字段勾选为或；缺少结果不会自动排除。")
+
+    def _export(self, kind: str) -> None:
+        suffix = ".csv" if kind == "csv" else ".json"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export data list", str(self.store.paths.exports / f"luna_data_list{suffix}"), f"{kind.upper()} (*{suffix})")
+        if not path: return
+        target = Path(path).expanduser().resolve(); target.parent.mkdir(parents=True, exist_ok=True)
+        frame = pd.DataFrame(self._rows)
+        if kind == "csv": frame.to_csv(target, index=False, encoding="utf-8-sig")
+        else:
+            payload = {"schema_version": 1, "project_id": self.store.project["project_id"], "scope": {"label": self.scope_label, "query": self.scope_query}, "filters": self._filters(), "counts": {"records": len(self._rows), "subjects": len({row.get("subject_id") for row in self._rows}), "sessions": len({row.get("session_id") for row in self._rows}), "states": len({row.get("state_record_id") for row in self._rows})}, "records": frame.where(pd.notna(frame), None).to_dict(orient="records")}
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        self.summary.setText(self.summary.text() + f" 已导出：{target}")
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        parent = self.parentWidget()
+        while parent is not None and not isinstance(parent, ProjectWorkspace):
+            parent = parent.parentWidget()
+        if parent is not None and getattr(parent, "filter_export_dialog", None) is self:
+            parent.filter_export_dialog = None
+        event.accept()
+
+
 class ProjectWorkspace(QtWidgets.QMainWindow):
     open_data_unit = QtCore.Signal(str, object)
     queue_data_units = QtCore.Signal(object)
@@ -801,12 +1004,6 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         self.batch_thread: QtCore.QThread | None = None
         self.batch_worker: BatchWorker | None = None
         self.batch_task_config: dict[str, Any] = {}
-        self.current_comparison_selection: Any = None
-        self.current_comparison_second: Any = None
-        self.current_comparison_preview = pd.DataFrame()
-        self.current_comparison_second_preview = pd.DataFrame()
-        self.current_snapshot_analysis_ids: list[str] | None = None
-        self.current_snapshot_second_ids: list[str] | None = None
         self._project_draft_dirty = False
         self._project_draft_backup: Path | None = None
         self._project_draft_marker = self.store.paths.logs / "project_draft.json"
@@ -818,7 +1015,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         self.setAcceptDrops(self.mode == "manage")
         if parent is None:
             self.setFont(QtGui.QFont(_project_font_family(), 9))
-        role = {"manage": "Project manager", "batch": "Batch analysis", "compare": "Result comparison", "review": "Result review"}.get(mode, "Project")
+        role = {"manage": "Project manager", "batch": "Batch analysis", "filter": "Data filter/export", "review": "Result review"}.get(mode, "Project")
         self.setWindowTitle(f"LUNA — {role} — {store.project['name']}")
         self.resize(1480, 900)
         self.setMinimumSize(1050, 680)
@@ -834,6 +1031,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             actions = (
                 ("Import data", self.import_files),
                 ("Save project", self.save_project),
+                ("Filter/export list", self.open_filter_export),
                 ("Open in analysis", self.open_selected),
                 ("Add to batch", self.add_selected_to_batch),
                 ("Structure template", self.open_structure_template),
@@ -844,17 +1042,31 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             )
         else:
             actions = (("Refresh", self.refresh_all),)
+        self.toolbar_actions: dict[str, QtGui.QAction] = {}
         for text, callback in actions:
             action = toolbar.addAction(text)
             action.triggered.connect(callback)
+            self.toolbar_actions[text] = action
+            action.setToolTip({
+                "Import data": "Import FIF records; source files are copied and verified, then assigned to existing states.",
+                "Save project": "Validate and confirm current project-structure/import draft changes. Analysis results are saved separately.",
+                "Filter/export list": "Filter and export data records inside the selected hierarchy scope.",
+                "Open in analysis": "Open the selected data record and restore saved results if available; does not run analysis.",
+                "Add to batch": "Send only checked records from the currently displayed list to the batch workspace.",
+                "Structure template": "Edit a reusable structure and apply it to this project; saving a template alone creates no project nodes.",
+                "Edit mapping": "Review and save channel-to-region mapping for the selected data record.",
+                "Organize data": "Copy checked external source files into this project and update their links; originals remain untouched.",
+                "Refresh": "Reload project metadata and results while preserving the current tree selection when possible.",
+                "Check duplicate states": "Review exact same-parent duplicate state records; this is not a general delete-data action.",
+            }.get(text, "Reload this Project Manager view."))
         self.tabs = QtWidgets.QTabWidget()
         self.setCentralWidget(self.tabs)
         if self.mode == "manage":
             self.tabs.addTab(self._build_data_tab(), "Project data")
         elif self.mode == "batch":
             self.tabs.addTab(self._build_batch_tab(), "Batch analysis")
-        elif self.mode == "compare":
-            self.tabs.addTab(self._build_compare_tab(), "A / B comparison")
+        elif self.mode == "filter":
+            self.tabs.addTab(self._build_filter_tab(), "Filter / export list")
         elif self.mode == "review":
             self.tabs.addTab(self._build_results_tab(), "Review results")
         else:
@@ -887,37 +1099,98 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         header.addWidget(self.project_save_status)
         layout.addLayout(header)
         row = QtWidgets.QHBoxLayout()
+        self.data_actions: dict[str, QtWidgets.QPushButton] = {}
         for text, callback in (
             ("Add subject", self.add_subject),
             ("Add session", self.add_session),
             ("Add state", self.add_state),
             ("Edit selected", self.edit_selected_hierarchy),
+            ("Edit selected metadata", self.edit_selected_data_metadata),
             ("Apply template", self.open_structure_template),
             ("Add to batch", self.add_selected_to_batch),
+            ("Filter/export list", self.open_filter_export),
             ("Relocate source", self.relocate_selected_source),
             ("Previous data", lambda: self.open_adjacent(-1)),
             ("Next data", lambda: self.open_adjacent(1)),
         ):
             button = QtWidgets.QPushButton(text)
             button.clicked.connect(callback)
+            help_text = {
+                "Add subject": "Create a subject in this project. The project tree is the only data scope; save the project to formalize the draft.",
+                "Add session": "Create a session under the selected subject. Select a subject node first.",
+                "Add state": "Create a state under the selected session. Select a session node first.",
+                "Edit selected": "Edit the selected subject, session, or state; this does not rename stable internal IDs.",
+                "Edit selected metadata": "Edit group/condition metadata for selected data rows; if no row is selected, the selected data node is used.",
+                "Apply template": "Instantiate the current saved structure template in this project; this is different from saving a reusable template.",
+                "Add to batch": "Queue only checked rows in the currently displayed data list. It does not check every row automatically.",
+                "Filter/export list": "Filter and export data records within the currently selected tree node; clearing filters keeps this scope.",
+                "Relocate source": "Relink one selected data record to a file with the same fingerprint; no file is moved or deleted.",
+                "Previous data": "Open the previous row in the currently displayed list.",
+                "Next data": "Open the next row in the currently displayed list.",
+            }
+            button.setToolTip(help_text[text])
+            self.data_actions[text] = button
             row.addWidget(button)
         row.addStretch(1)
         layout.addLayout(row)
+        scope_row = QtWidgets.QHBoxLayout()
+        self.current_range_summary = QtWidgets.QLabel()
+        self.current_range_summary.setObjectName("currentDataRange")
+        self.current_range_summary.setWordWrap(True)
+        scope_row.addWidget(self.current_range_summary, 1)
+        self.visible_data_summary = QtWidgets.QLabel()
+        scope_row.addWidget(self.visible_data_summary)
+        layout.addLayout(scope_row)
+        filter_row = QtWidgets.QHBoxLayout()
+        self.manage_search = QtWidgets.QLineEdit()
+        self.manage_search.setPlaceholderText("Search within current scope: subject, group, session, state, condition, file")
+        self.manage_search.setToolTip("Search only data records belonging to the selected project-tree node.")
+        self.manage_search.textChanged.connect(self._refresh_data_table)
+        filter_row.addWidget(self.manage_search, 1)
+        self.manage_group_filter = QtWidgets.QComboBox()
+        self.manage_group_filter.setToolTip("Filter groups only within the selected tree scope.")
+        self.manage_condition_filter = QtWidgets.QComboBox()
+        self.manage_condition_filter.setToolTip("Filter conditions only within the selected tree scope.")
+        self.manage_inspection_filter = QtWidgets.QComboBox()
+        self.manage_inspection_filter.setToolTip("Filter inspection status only within the selected tree scope.")
+        for label, combo in (("Group", self.manage_group_filter), ("Condition", self.manage_condition_filter), ("Inspection", self.manage_inspection_filter)):
+            combo.addItem(f"All {label.lower()}", "")
+            combo.currentIndexChanged.connect(self._refresh_data_table)
+            filter_row.addWidget(combo)
+        self.clear_data_filters_button = QtWidgets.QPushButton("Clear filters")
+        self.clear_data_filters_button.setToolTip("Clear search and extra filters without changing the selected tree scope.")
+        self.clear_data_filters_button.clicked.connect(self.clear_data_filters)
+        filter_row.addWidget(self.clear_data_filters_button)
+        self.clear_visible_batch_button = QtWidgets.QPushButton("Clear visible batch checks")
+        self.clear_visible_batch_button.setToolTip("Uncheck batch boxes in the visible list only; this does not alter project records.")
+        self.clear_visible_batch_button.clicked.connect(self.clear_visible_batch_checks)
+        filter_row.addWidget(self.clear_visible_batch_button)
+        layout.addLayout(filter_row)
+        self.empty_data_message = QtWidgets.QLabel()
+        self.empty_data_message.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.empty_data_message.setStyleSheet("color: #64748b; padding: 6px;")
+        self.empty_data_message.hide()
+        layout.addWidget(self.empty_data_message)
         splitter = QtWidgets.QSplitter()
         self.hierarchy = QtWidgets.QTreeWidget()
         self.hierarchy.setHeaderLabels(["Project hierarchy"])
         self.hierarchy.setMinimumWidth(320)
         self.hierarchy.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.hierarchy.customContextMenuRequested.connect(self._hierarchy_context_menu)
-        self.hierarchy.itemDoubleClicked.connect(lambda _item, _column: self.open_selected())
+        self.hierarchy.itemDoubleClicked.connect(self._open_tree_item)
         splitter.addWidget(self.hierarchy)
         self.data_table = QtWidgets.QTableWidget()
         self.data_table.setColumnCount(11)
-        self.data_table.setHorizontalHeaderLabels(["Use", "Subject", "Group", "Session", "State", "Condition", "Timepoint", "File", "Validity", "Module status", "data_unit_id"])
+        self.data_table.setHorizontalHeaderLabels(["Batch", "Subject", "Group", "Session", "State", "Condition", "Timepoint", "File", "Validity", "Module status", "data_unit_id"])
         self.data_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.data_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.data_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.data_table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.data_table.customContextMenuRequested.connect(self._data_table_context_menu)
         self.data_table.horizontalHeader().setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.data_table.doubleClicked.connect(self.open_selected)
+        self.data_table.itemChanged.connect(self._update_manage_action_states)
+        self.data_table.itemSelectionChanged.connect(self._update_manage_action_states)
         self.data_table.setColumnHidden(10, True)
         splitter.addWidget(self.data_table)
         splitter.setStretchFactor(1, 1)
@@ -927,8 +1200,104 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         self.state_resources_label.setStyleSheet("color: #5f6b76;")
         self.state_resources_label.setToolTip("行为数据与同步信息仅作为可追溯元数据保存；不根据同名文件推断同步关系。")
         layout.addWidget(self.state_resources_label)
-        self.hierarchy.currentItemChanged.connect(lambda _current, _previous: self._refresh_state_resources())
+        self.hierarchy.currentItemChanged.connect(self._on_hierarchy_selection_changed)
+        self._update_manage_action_states()
         return widget
+
+    def _build_filter_tab(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.addWidget(QtWidgets.QLabel("Filter data records and export a machine-readable list. This view does not compare, pair, average, or calculate across records."))
+        self.filter_export_dialog = ProjectFilterExportDialog(self.store, widget)
+        self.filter_export_dialog.setWindowFlags(QtCore.Qt.WindowType.Widget)
+        layout.addWidget(self.filter_export_dialog)
+        return widget
+
+    def open_filter_export(self) -> None:
+        if self.mode != "manage":
+            return
+        scope = self._current_data_scope()
+        self.filter_export_dialog = ProjectFilterExportDialog(
+            self.store, self, scope_query=scope["query"], scope_label=scope["label"]
+        )
+        self.filter_export_dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.filter_export_dialog.setModal(False)
+        self.filter_export_dialog.show()
+        self.filter_export_dialog.raise_()
+        self.filter_export_dialog.activateWindow()
+
+    def _data_table_context_menu(self, position: QtCore.QPoint) -> None:
+        clicked = self.data_table.itemAt(position)
+        selected_rows = {index.row() for index in self.data_table.selectionModel().selectedRows()}
+        if clicked is not None and clicked.row() not in selected_rows:
+            self.data_table.clearSelection()
+            self.data_table.selectRow(clicked.row())
+        menu = QtWidgets.QMenu(self)
+        edit_action = menu.addAction("Edit selected group/condition")
+        edit_action.setToolTip("Edit group for selected subject(s) and condition for selected state(s). Changes remain in the project draft until Save project.")
+        edit_action.triggered.connect(self.edit_selected_data_metadata)
+        menu.exec(self.data_table.viewport().mapToGlobal(position))
+
+    @staticmethod
+    def _bulk_text_value(parent: QtWidgets.QWidget, title: str, field: str, current_values: set[str]) -> tuple[bool, str]:
+        dialog = QtWidgets.QDialog(parent)
+        dialog.setWindowTitle(title)
+        form = QtWidgets.QFormLayout(dialog)
+        current = "多个值" if len(current_values) > 1 else (next(iter(current_values), "") if current_values else "未设置")
+        form.addRow("当前值", QtWidgets.QLabel(current))
+        edit = QtWidgets.QLineEdit()
+        if len(current_values) == 1:
+            edit.setText(next(iter(current_values)))
+        edit.setPlaceholderText(f"输入新的 {field}；勾选应用后留空表示清空")
+        form.addRow(field, edit)
+        apply_all = QtWidgets.QCheckBox("将此值应用到所有选中记录")
+        apply_all.setChecked(len(current_values) <= 1)
+        form.addRow(apply_all)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted or not apply_all.isChecked():
+            return False, ""
+        return True, edit.text().strip()
+
+    def edit_selected_data_metadata(self) -> None:
+        selected_rows = sorted({index.row() for index in self.data_table.selectionModel().selectedRows()}) if hasattr(self, "data_table") else []
+        if not selected_rows:
+            current = self._current_data_unit()
+            selected_ids = [str(current["data_unit_id"])] if current else []
+        else:
+            selected_ids = [str(self.data_table.item(row, 10).text()) for row in selected_rows if self.data_table.item(row, 10)]
+        units = [row for row in self.store.data_units(data_unit_ids=selected_ids)]
+        if not units:
+            QtWidgets.QMessageBox.information(self, "Edit metadata", "Select one or more data records first.")
+            return
+        subject_ids = {str(row["subject_id"]) for row in units}
+        state_ids = {str(row["state_record_id"]) for row in units}
+        subject_rows = {str(row["subject_id"]): row for row in self.store.subjects() if str(row["subject_id"]) in subject_ids}
+        state_rows = {str(row["state_record_id"]): row for row in self.store.state_records() if str(row["state_record_id"]) in state_ids}
+        group_values = {str(row.get("group_label") or "") for row in subject_rows.values()}
+        condition_values = {str(row.get("condition_label") or "") for row in state_rows.values()}
+        change_group, group = self._bulk_text_value(self, "Edit group", "Group", group_values)
+        if not change_group:
+            return
+        change_condition, condition = self._bulk_text_value(self, "Edit condition", "Condition", condition_values)
+        if not change_condition:
+            return
+        self._begin_project_edit()
+        for subject_id, row in subject_rows.items():
+            self.store.update_subject(subject_id, subject_code=str(row["subject_code"]), group_label=group)
+        for state_id, row in state_rows.items():
+            self.store.update_state_record(
+                state_id,
+                display_name=str(row["display_name"]),
+                condition_label=condition,
+                timepoint_value=row.get("timepoint_value"),
+                timepoint_unit=str(row.get("timepoint_unit") or "min"),
+                reference_event=str(row.get("reference_event") or ""),
+                actual_start=str(row.get("actual_start") or ""),
+                actual_end=str(row.get("actual_end") or ""),
+            )
+        self.refresh_all()
+        self.statusBar().showMessage(f"Updated group for {len(subject_rows)} subject(s) and condition for {len(state_rows)} state(s). Save project to formalize the metadata change.", 10000)
 
     def _project_content_snapshot(self) -> tuple[set[str], set[str]]:
         files: set[str] = set()
@@ -953,7 +1322,17 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             "created_files": sorted(self._project_draft_created_files),
             "created_dirs": sorted(self._project_draft_created_dirs),
         }
-        self._project_draft_marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary = self._project_draft_marker.with_name(
+            f".{self._project_draft_marker.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._project_draft_marker)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _begin_project_edit(self, *_args: Any) -> None:
         """Start a recoverable Project Manager draft before a mutating action."""
@@ -1076,6 +1455,19 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "放弃项目更改失败", str(exc))
             return False
 
+    def _restore_project_draft_marker_state(self, payload: dict[str, Any], backup: Path) -> None:
+        self._project_draft_backup = backup
+        self._project_draft_dirty = True
+        self._project_draft_initial_files = set(map(str, payload.get("initial_files", [])))
+        self._project_draft_initial_dirs = set(map(str, payload.get("initial_dirs", [])))
+        self._project_draft_created_files = set(map(str, payload.get("created_files", [])))
+        self._project_draft_created_dirs = set(map(str, payload.get("created_dirs", [])))
+        # A process may stop after SQLite creates a hierarchy folder but before
+        # the marker is refreshed. Discover only new directories here; discard
+        # removes them only when they are still empty.
+        _, current_directories = self._project_content_snapshot()
+        self._project_draft_created_dirs.update(current_directories - self._project_draft_initial_dirs)
+
     def _offer_draft_recovery(self) -> None:
         if not self._project_draft_marker.is_file():
             return
@@ -1093,18 +1485,10 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.StandardButton.RestoreDefaults,
             )
             if answer == QtWidgets.QMessageBox.StandardButton.Discard:
-                self._project_draft_backup = backup
-                self._project_draft_dirty = True
-                self._project_draft_created_files = set(map(str, payload.get("created_files", [])))
-                self._project_draft_created_dirs = set(map(str, payload.get("created_dirs", [])))
+                self._restore_project_draft_marker_state(payload, backup)
                 self.discard_project_changes()
             elif answer == QtWidgets.QMessageBox.StandardButton.RestoreDefaults:
-                self._project_draft_backup = backup
-                self._project_draft_dirty = True
-                self._project_draft_initial_files = set(map(str, payload.get("initial_files", [])))
-                self._project_draft_initial_dirs = set(map(str, payload.get("initial_dirs", [])))
-                self._project_draft_created_files = set(map(str, payload.get("created_files", [])))
-                self._project_draft_created_dirs = set(map(str, payload.get("created_dirs", [])))
+                self._restore_project_draft_marker_state(payload, backup)
                 self._update_project_draft_ui()
                 self.statusBar().showMessage("已恢复未保存项目草稿；点击 Save project 正式保存。", 10000)
         except Exception as exc:  # noqa: BLE001
@@ -1120,7 +1504,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         attachments = self.store.behavior_attachments(state_id)
         scores = self.store.behavior_scores(state_id)
         syncs = self.store.synchronization_records(state_id)
-        lfp_count = sum(1 for unit in self.store.data_units() if str(unit.get("state_record_id")) == state_id)
+        lfp_count = len(self.store.data_units(state_record_id=state_id))
         score_text = "未录入评分" if not scores else f"评分 {len(scores)} 项（0 分与缺失值分开保存）"
         sync_text = "未确认同步" if not syncs else f"同步记录 {len(syncs)} 条（是否确认：{sum(int(row['confirmed']) for row in syncs)}/{len(syncs)}）"
         self.state_resources_label.setText(
@@ -1136,15 +1520,21 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         self.batch_search.textChanged.connect(self._refresh_batch_data_selector)
         self.batch_checked_only = QtWidgets.QCheckBox("Checked data only")
         self.batch_checked_only.setChecked(True)
+        self.batch_checked_only.setToolTip("This filters by the data inspection status, not by the batch checkbox.")
         self.batch_checked_only.toggled.connect(self._refresh_batch_data_selector)
+        self.batch_selected_only = QtWidgets.QCheckBox("Selected for batch only")
+        self.batch_selected_only.setToolTip("Show the persistent batch selection, including records hidden by the search or inspection filter.")
+        self.batch_selected_only.toggled.connect(self._refresh_batch_data_selector)
         select_visible = QtWidgets.QPushButton("Select filtered")
+        select_visible.setToolTip("Add every currently visible row to the cross-filter batch selection.")
         select_visible.clicked.connect(lambda: self._set_batch_visible_checked(True))
-        clear_selection = QtWidgets.QPushButton("Clear selection")
-        clear_selection.clicked.connect(lambda: self._set_batch_visible_checked(False))
-        filter_row.addWidget(self.batch_search, 1); filter_row.addWidget(self.batch_checked_only); filter_row.addWidget(select_visible); filter_row.addWidget(clear_selection)
+        clear_selection = QtWidgets.QPushButton("Clear all selected")
+        clear_selection.setToolTip("Remove all batch checks, including records currently hidden by filters. This does not delete project data.")
+        clear_selection.clicked.connect(self._clear_all_batch_selection)
+        filter_row.addWidget(self.batch_search, 1); filter_row.addWidget(self.batch_checked_only); filter_row.addWidget(self.batch_selected_only); filter_row.addWidget(select_visible); filter_row.addWidget(clear_selection)
         layout.addLayout(filter_row)
         self.batch_data_table = QtWidgets.QTableWidget(0, 9)
-        self.batch_data_table.setHorizontalHeaderLabels(["Use", "Subject", "Session", "State", "Condition", "Timepoint", "Inspection", "Source", "data_unit_id"])
+        self.batch_data_table.setHorizontalHeaderLabels(["Batch", "Subject", "Session", "State", "Condition", "Timepoint", "Inspection", "Source", "data_unit_id"])
         self.batch_data_table.setColumnHidden(8, True)
         self.batch_data_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.batch_data_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1155,6 +1545,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         self.batch_data_table.setMaximumHeight(260)
         layout.addWidget(self.batch_data_table)
         self.batch_selection_label = QtWidgets.QLabel("0 data units selected")
+        self.batch_selection_label.setToolTip("The count includes batch selections across all current batch filters.")
         layout.addWidget(self.batch_selection_label)
         module_box = QtWidgets.QGroupBox("Modules")
         module_layout = QtWidgets.QGridLayout(module_box)
@@ -1248,219 +1639,6 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             self.batch_settings.setText("Effective parameters (copied)")
         self.statusBar().showMessage("Current single-file calculation parameters copied. Data-specific inspection decisions were not copied.", 8000)
 
-    def _build_compare_tab(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(widget)
-        controls = QtWidgets.QGridLayout()
-        self.compare_session = QtWidgets.QComboBox()
-        self.compare_specific_session = QtWidgets.QComboBox()
-        self.compare_specific_session.addItem("All matching sessions", "")
-        self.compare_subject = QtWidgets.QComboBox()
-        self.compare_subject.addItem("All subjects", "")
-        self.compare_group = QtWidgets.QComboBox()
-        self.compare_condition = QtWidgets.QComboBox()
-        self.compare_timepoint = QtWidgets.QDoubleSpinBox()
-        self.compare_timepoint.setRange(-100000, 100000)
-        self.compare_timepoint.setDecimals(3)
-        self.compare_time_range = QtWidgets.QCheckBox("Timepoint range")
-        self.compare_time_min = QtWidgets.QDoubleSpinBox()
-        self.compare_time_max = QtWidgets.QDoubleSpinBox()
-        for control in (self.compare_time_min, self.compare_time_max):
-            control.setRange(-100000, 100000)
-            control.setDecimals(3)
-            control.setEnabled(False)
-        self.compare_time_max.setValue(180.0)
-        self.compare_time_range.toggled.connect(self.compare_time_min.setEnabled)
-        self.compare_time_range.toggled.connect(self.compare_time_max.setEnabled)
-        self.compare_time_range.toggled.connect(lambda checked: self.compare_timepoint.setEnabled(not checked))
-        self.compare_time_range.toggled.connect(lambda checked: self.compare_paired.setChecked(False) if checked else None)
-        self.compare_paired = QtWidgets.QCheckBox("Enable B group / paired comparison")
-        self.compare_paired.setChecked(True)
-        self.compare_second_timepoint = QtWidgets.QDoubleSpinBox()
-        self.compare_second_timepoint.setRange(-100000, 100000)
-        self.compare_second_timepoint.setDecimals(3)
-        self.compare_second_timepoint.setEnabled(False)
-        self.compare_paired.toggled.connect(self.compare_second_timepoint.setEnabled)
-        self.compare_b_group = QtWidgets.QComboBox()
-        self.compare_b_subject = QtWidgets.QComboBox(); self.compare_b_subject.addItem("All subjects", "")
-        self.compare_b_session = QtWidgets.QComboBox()
-        self.compare_b_condition = QtWidgets.QComboBox()
-        copy_a = QtWidgets.QPushButton("Copy A settings to B")
-        copy_a.clicked.connect(self._copy_compare_a_to_b)
-        self.compare_module = QtWidgets.QComboBox()
-        self.compare_module.addItems(["PSD", "Band Power", "FOOOF", "Connectivity", "Time Delay", "Quality"])
-        self.compare_view = QtWidgets.QComboBox()
-        self.compare_view.addItem("Subject summary")
-        self.compare_view.currentTextChanged.connect(
-            lambda _text: self._plot_comparison(self.current_comparison_selection)
-            if self.current_comparison_selection is not None
-            else None
-        )
-        self.compare_module.currentTextChanged.connect(self._refresh_compare_views)
-        self.compare_band = QtWidgets.QComboBox()
-        self.compare_band.addItem("All")
-        self.compare_band.currentTextChanged.connect(
-            lambda _text: self._plot_comparison(self.current_comparison_selection)
-            if self.current_comparison_selection is not None
-            else None
-        )
-        self.compare_metric = QtWidgets.QComboBox()
-        self.compare_metric.addItem("All")
-        self.compare_metric.currentTextChanged.connect(
-            lambda _text: self._plot_comparison(self.current_comparison_selection)
-            if self.current_comparison_selection is not None
-            else None
-        )
-        self.compare_dimension = QtWidgets.QComboBox()
-        self.compare_dimension.addItems(["All", "Channel", "Region", "Region pair"])
-        self.compare_target = QtWidgets.QComboBox()
-        self.compare_target.addItem("All")
-        self.compare_dimension.currentTextChanged.connect(
-            lambda _text: self._refresh_compare_targets(self.current_comparison_selection)
-            if self.current_comparison_selection is not None
-            else None
-        )
-        self.compare_target.currentTextChanged.connect(
-            lambda _text: self._plot_comparison(self.current_comparison_selection)
-            if self.current_comparison_selection is not None
-            else None
-        )
-        self.compare_pending = QtWidgets.QCheckBox("Include pending review (exploratory)")
-        self.compare_refresh = QtWidgets.QPushButton("Preview matching results")
-        self.compare_refresh.clicked.connect(self._refresh_comparison_from_controls)
-        self.compare_queue_missing = QtWidgets.QPushButton("Add missing results to batch")
-        self.compare_queue_missing.setToolTip("Adds matching data units without a saved compatible result to the batch queue. It does not calculate during comparison.")
-        self.compare_queue_missing.clicked.connect(self._queue_missing_comparison_data)
-        for column, (label, control) in enumerate((("Group", self.compare_group), ("Session key", self.compare_session), ("Condition", self.compare_condition), ("Timepoint", self.compare_timepoint), ("Module", self.compare_module), ("Metric/method", self.compare_metric), ("Band", self.compare_band))):
-            controls.addWidget(QtWidgets.QLabel(label), 0, column)
-            controls.addWidget(control, 1, column)
-        controls.addWidget(self.compare_pending, 2, 4, 1, 2)
-        controls.addWidget(self.compare_refresh, 2, 6)
-        controls.addWidget(self.compare_queue_missing, 7, 4, 1, 2)
-        self.compare_save = QtWidgets.QPushButton("Save comparison snapshot")
-        self.compare_save.clicked.connect(self.save_comparison)
-        controls.addWidget(self.compare_save, 2, 0, 1, 2)
-        self.compare_export = QtWidgets.QPushButton("Export preview CSV")
-        self.compare_export.clicked.connect(self.export_comparison)
-        controls.addWidget(self.compare_export, 2, 2, 1, 2)
-        self.compare_load = QtWidgets.QPushButton("Load saved comparison")
-        self.compare_load.clicked.connect(self.load_comparison)
-        controls.addWidget(self.compare_load, 3, 0, 1, 2)
-        controls.addWidget(self.compare_paired, 3, 2)
-        controls.addWidget(QtWidgets.QLabel("Target level"), 3, 4)
-        controls.addWidget(self.compare_dimension, 3, 5)
-        controls.addWidget(self.compare_target, 3, 6)
-        controls.addWidget(QtWidgets.QLabel("Specific session"), 4, 0)
-        controls.addWidget(self.compare_specific_session, 4, 1, 1, 3)
-        controls.addWidget(self.compare_time_range, 4, 4)
-        controls.addWidget(self.compare_time_min, 4, 5)
-        controls.addWidget(self.compare_time_max, 4, 6)
-        controls.addWidget(QtWidgets.QLabel("Subject"), 5, 0)
-        controls.addWidget(self.compare_subject, 5, 1, 1, 3)
-        controls.addWidget(QtWidgets.QLabel("View"), 5, 4)
-        controls.addWidget(self.compare_view, 5, 5, 1, 2)
-        controls.addWidget(QtWidgets.QLabel("B group"), 6, 0)
-        controls.addWidget(self.compare_b_group, 6, 1)
-        controls.addWidget(QtWidgets.QLabel("B subject"), 6, 2)
-        controls.addWidget(self.compare_b_subject, 6, 3)
-        controls.addWidget(QtWidgets.QLabel("B session"), 6, 4)
-        controls.addWidget(self.compare_b_session, 6, 5)
-        controls.addWidget(QtWidgets.QLabel("B condition"), 6, 6)
-        controls.addWidget(self.compare_b_condition, 7, 6)
-        controls.addWidget(copy_a, 7, 0, 1, 2)
-        controls.addWidget(QtWidgets.QLabel("B timepoint"), 7, 2)
-        controls.addWidget(self.compare_second_timepoint, 7, 3)
-        self.compare_session.currentTextChanged.connect(self._refresh_specific_sessions)
-        layout.addLayout(controls)
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        self.compare_table = QtWidgets.QTableWidget()
-        self.compare_table.setColumnCount(16)
-        self.compare_table.setHorizontalHeaderLabels([
-            "Subject", "Group", "A session", "A condition/time", "A file", "A effective samples", "A status", "A result",
-            "B session", "B condition/time", "B file", "B effective samples", "B status", "B result", "Reason", "Compatibility",
-        ])
-        self.compare_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
-        self.compare_table.horizontalHeader().setSectionResizeMode(14, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        for column in (4, 10):
-            self.compare_table.setColumnWidth(column, 170)
-        for column in (7, 13):
-            self.compare_table.setColumnWidth(column, 155)
-        splitter.addWidget(self.compare_table)
-        self.compare_figure = Figure(figsize=(10, 4), layout="constrained")
-        self.compare_canvas = FigureCanvasQTAgg(self.compare_figure)
-        splitter.addWidget(self.compare_canvas)
-        splitter.setSizes([280, 420])
-        layout.addWidget(splitter, stretch=1)
-        return widget
-
-    def _queue_missing_comparison_data(self) -> None:
-        filters = [self._comparison_filters()]
-        if self.compare_paired.isChecked():
-            filters.append({
-                **filters[0],
-                "group_label": str(self.compare_b_group.currentData() or ""),
-                "subject_id": str(self.compare_b_subject.currentData() or ""),
-                "session_key": self.compare_b_session.currentText(),
-                "condition_label": self.compare_b_condition.currentText(),
-                "timepoint_value": self.compare_second_timepoint.value(),
-                "timepoint_min": None, "timepoint_max": None,
-            })
-        module = self.compare_module.currentText()
-        available = {
-            (row["data_unit_id"], row["module_name"])
-            for row in self.store.analysis_results({
-                "active": 1,
-                "calculation_status": "completed",
-                "save_status": "saved",
-                "result_validity": "current",
-            })
-        }
-        identifiers: list[str] = []
-        for unit in self.store.data_units():
-            for current in filters:
-                if current.get("subject_id") and unit["subject_id"] != current["subject_id"]:
-                    continue
-                if current.get("group_label") and str(unit.get("group_label") or "") != current["group_label"]:
-                    continue
-                if current.get("session_key") and unit["session_key"] != current["session_key"]:
-                    continue
-                if current.get("condition_label") and str(unit.get("condition_label") or "") != current["condition_label"]:
-                    continue
-                if current.get("timepoint_value") is not None and unit.get("timepoint_value") != current["timepoint_value"]:
-                    continue
-                if (unit["data_unit_id"], module) not in available:
-                    identifiers.append(unit["data_unit_id"])
-        identifiers = list(dict.fromkeys(identifiers))
-        if not identifiers:
-            QtWidgets.QMessageBox.information(self, "Batch queue", "No matching data unit with a missing saved result was found.")
-            return
-        self.queue_data_units.emit(identifiers)
-        self.statusBar().showMessage(f"Added {len(identifiers)} data units with missing {module} results to the batch queue.", 8000)
-
-    def _copy_compare_a_to_b(self) -> None:
-        for source, target in (
-            (self.compare_group, self.compare_b_group),
-            (self.compare_subject, self.compare_b_subject),
-            (self.compare_session, self.compare_b_session),
-            (self.compare_condition, self.compare_b_condition),
-        ):
-            data = source.currentData()
-            index = target.findData(data) if data is not None else -1
-            if index < 0:
-                index = target.findText(source.currentText())
-            target.setCurrentIndex(max(0, index))
-        self.compare_second_timepoint.setValue(self.compare_timepoint.value())
-
-    def _refresh_compare_views(self) -> None:
-        current = self.compare_view.currentText()
-        values = ["Subject summary"]
-        if self.compare_module.currentText() == "Connectivity":
-            values.extend(["Connection spectrum", "Region matrices"])
-        with QtCore.QSignalBlocker(self.compare_view):
-            self.compare_view.clear()
-            self.compare_view.addItems(values)
-            self.compare_view.setCurrentText(current if current in values else values[0])
-
     def refresh_all(self) -> None:
         if hasattr(self, "hierarchy"):
             self._refresh_hierarchy()
@@ -1471,14 +1649,107 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             self._refresh_batch_table()
         if hasattr(self, "results_table"):
             self._refresh_results_table()
-        if hasattr(self, "compare_group"):
-            self._refresh_compare_filters()
         if hasattr(self, "state_resources_label"):
             self._refresh_state_resources()
 
+    def _tree_identity(self, item: QtWidgets.QTreeWidgetItem | None = None) -> tuple[str, str]:
+        item = item if item is not None else (self.hierarchy.currentItem() if hasattr(self, "hierarchy") else None)
+        identity = item.data(0, QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+        if isinstance(identity, (tuple, list)) and len(identity) == 2:
+            return str(identity[0]), str(identity[1])
+        project_id = str(self.store.project["project_id"])
+        return "project", project_id
+
+    def _current_data_scope(self) -> dict[str, Any]:
+        """Resolve the selected tree node to an exact ID query and readable path."""
+        kind, stable_id = self._tree_identity()
+        project = self.store.project
+        project_id = str(project["project_id"])
+        if kind == "project" and stable_id == project_id:
+            return {"kind": "project", "id": project_id, "query": {"project_id": project_id}, "label": project["name"]}
+        if kind == "subject":
+            rows = self.store.query(
+                "SELECT subject_code FROM subjects WHERE subject_id=? AND project_id=?",
+                (stable_id, project_id),
+            )
+            if rows:
+                return {"kind": kind, "id": stable_id, "query": {"subject_id": stable_id}, "label": f"{project['name']} / {rows[0]['subject_code']}"}
+        elif kind == "session":
+            rows = self.store.query(
+                "SELECT u.subject_code,s.session_key FROM sessions s JOIN subjects u ON u.subject_id=s.subject_id WHERE s.session_id=? AND u.project_id=?",
+                (stable_id, project_id),
+            )
+            if rows:
+                row = rows[0]
+                return {"kind": kind, "id": stable_id, "query": {"session_id": stable_id}, "label": f"{project['name']} / {row['subject_code']} / {row['session_key']}"}
+        elif kind == "state":
+            rows = self.store.query(
+                "SELECT u.subject_code,s.session_key,r.display_name FROM state_records r JOIN sessions s ON s.session_id=r.session_id JOIN subjects u ON u.subject_id=s.subject_id WHERE r.state_record_id=? AND u.project_id=?",
+                (stable_id, project_id),
+            )
+            if rows:
+                row = rows[0]
+                return {"kind": kind, "id": stable_id, "query": {"state_record_id": stable_id}, "label": f"{project['name']} / {row['subject_code']} / {row['session_key']} / {row['display_name']}"}
+        elif kind == "data":
+            rows = self.store.data_units(data_unit_id=stable_id, project_id=project_id)
+            if rows:
+                row = rows[0]
+                return {
+                    "kind": kind,
+                    "id": stable_id,
+                    "query": {"data_unit_id": stable_id},
+                    "label": f"{project['name']} / {row['subject_code']} / {row['session_key']} / {row['state_display_name']} / {Path(row['source_path']).name}",
+                }
+        return {"kind": "project", "id": project_id, "query": {"project_id": project_id}, "label": project["name"]}
+
+    def _on_hierarchy_selection_changed(self, _current: Any = None, _previous: Any = None) -> None:
+        if hasattr(self, "data_table"):
+            self._refresh_data_table()
+        self._refresh_state_resources()
+        self._update_manage_action_states()
+
+    def clear_data_filters(self) -> None:
+        with QtCore.QSignalBlocker(self.manage_search):
+            self.manage_search.clear()
+        for combo in (self.manage_group_filter, self.manage_condition_filter, self.manage_inspection_filter):
+            with QtCore.QSignalBlocker(combo):
+                combo.setCurrentIndex(0)
+        self._refresh_data_table()
+
+    def clear_visible_batch_checks(self) -> None:
+        with QtCore.QSignalBlocker(self.data_table):
+            for row in range(self.data_table.rowCount()):
+                item = self.data_table.item(row, 0)
+                if item is not None:
+                    item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        self._update_manage_action_states()
+
+    def _update_manage_action_states(self, *_args: Any) -> None:
+        if not hasattr(self, "data_actions") or not hasattr(self, "hierarchy"):
+            return
+        kind, _stable_id = self._tree_identity()
+        selected_rows = self.data_table.selectionModel().selectedRows() if hasattr(self, "data_table") else []
+        checked_count = len(self._selected_data_unit_ids()) if hasattr(self, "data_table") else 0
+        self.data_actions["Add subject"].setEnabled(True)
+        self.data_actions["Add session"].setEnabled(kind == "subject")
+        self.data_actions["Add state"].setEnabled(kind == "session")
+        self.data_actions["Edit selected"].setEnabled(kind in {"subject", "session", "state"})
+        self.data_actions["Edit selected metadata"].setEnabled(bool(selected_rows) or kind == "data")
+        if "Open in analysis" in self.toolbar_actions:
+            self.toolbar_actions["Open in analysis"].setEnabled(len(selected_rows) == 1 or kind == "data")
+        self.data_actions["Add to batch"].setEnabled(checked_count > 0)
+        if "Add to batch" in self.toolbar_actions:
+            self.toolbar_actions["Add to batch"].setEnabled(checked_count > 0)
+        if "Organize data" in self.toolbar_actions:
+            self.toolbar_actions["Organize data"].setEnabled(checked_count > 0)
+        self.data_actions["Relocate source"].setEnabled(len(selected_rows) == 1 or kind == "data")
+        has_rows = bool(getattr(self, "data_table", None) and self.data_table.rowCount())
+        self.data_actions["Previous data"].setEnabled(has_rows)
+        self.data_actions["Next data"].setEnabled(has_rows)
+
     def _refresh_hierarchy(self) -> None:
         expanded: set[tuple[str, str]] = set()
-        selected: tuple[str, str] | None = None
+        selection_chain: list[tuple[str, str]] = []
         if self.hierarchy.topLevelItemCount():
             iterator = QtWidgets.QTreeWidgetItemIterator(self.hierarchy)
             while iterator.value() is not None:
@@ -1488,9 +1759,14 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                     stable_identity = (str(identity[0]), str(identity[1]))
                     if item.isExpanded():
                         expanded.add(stable_identity)
-                    if item is self.hierarchy.currentItem():
-                        selected = stable_identity
                 iterator += 1
+            selected_item = self.hierarchy.currentItem()
+            while selected_item is not None:
+                identity = selected_item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(identity, (tuple, list)) and len(identity) == 2:
+                    selection_chain.append((str(identity[0]), str(identity[1])))
+                selected_item = selected_item.parent()
+        blocker = QtCore.QSignalBlocker(self.hierarchy)
         self.hierarchy.clear()
         units = self.store.data_units()
         by_state: dict[str, list[dict[str, Any]]] = {}
@@ -1500,10 +1776,14 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         root.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("project", self.store.project["project_id"]))
         root.setToolTip(0, str(self.store.paths.root))
         self.hierarchy.addTopLevelItem(root)
+        items_by_identity: dict[tuple[str, str], QtWidgets.QTreeWidgetItem] = {
+            ("project", str(self.store.project["project_id"])): root
+        }
         for subject in self.store.subjects():
             subject_sessions = self.store.sessions(subject["subject_id"])
             subject_item = QtWidgets.QTreeWidgetItem([f"{subject['subject_code']}  ({len(subject_sessions)} sessions)"])
             subject_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("subject", subject["subject_id"]))
+            items_by_identity[("subject", str(subject["subject_id"]))] = subject_item
             if subject.get("relative_path"):
                 subject_item.setToolTip(0, str(self.store.paths.root / Path(subject["relative_path"])))
             root.addChild(subject_item)
@@ -1511,6 +1791,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 session_states = self.store.state_records(session["session_id"])
                 session_item = QtWidgets.QTreeWidgetItem([f"{session['session_key']}  ({len(session_states)} states)"])
                 session_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("session", session["session_id"]))
+                items_by_identity[("session", str(session["session_id"]))] = session_item
                 if session.get("relative_path"):
                     session_item.setToolTip(0, str(self.store.paths.root / Path(session["relative_path"])))
                 subject_item.addChild(session_item)
@@ -1524,6 +1805,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                         status = "待检查"
                     state_item = QtWidgets.QTreeWidgetItem([f"{state['display_name']}  ({len(state_units)} data; {status})"])
                     state_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("state", state["state_record_id"]))
+                    items_by_identity[("state", str(state["state_record_id"]))] = state_item
                     if state.get("relative_path"):
                         state_item.setToolTip(0, str(self.store.paths.root / Path(state["relative_path"])))
                     session_item.addChild(state_item)
@@ -1538,6 +1820,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                         file_name = Path(str(unit.get("source_path") or "")).name
                         data_item = QtWidgets.QTreeWidgetItem([f"{file_name}  [{inspection_status}]"])
                         data_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("data", unit["data_unit_id"]))
+                        items_by_identity[("data", str(unit["data_unit_id"]))] = data_item
                         data_item.setToolTip(
                             0,
                             f"dataset_id: {unit['data_unit_id']}\n"
@@ -1546,16 +1829,19 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                         )
                         state_item.addChild(data_item)
         root.setExpanded(True)
-        iterator = QtWidgets.QTreeWidgetItemIterator(self.hierarchy)
-        while iterator.value() is not None:
-            item = iterator.value()
-            identity = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-            stable_identity = (str(identity[0]), str(identity[1])) if isinstance(identity, tuple) and len(identity) == 2 else None
-            if stable_identity in expanded:
-                item.setExpanded(True)
-            if stable_identity == selected:
-                self.hierarchy.setCurrentItem(item)
-            iterator += 1
+        for stable_identity in expanded:
+            if stable_identity in items_by_identity:
+                items_by_identity[stable_identity].setExpanded(True)
+        selected = next((identity for identity in selection_chain if identity in items_by_identity), None)
+        if selected is None:
+            selected = ("project", str(self.store.project["project_id"]))
+        selected_item = items_by_identity[selected]
+        self.hierarchy.setCurrentItem(selected_item)
+        parent = selected_item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        del blocker
 
     def _reveal_hierarchy_nodes(self, stable_ids: list[str]) -> None:
         """Expand and focus persisted nodes created or reused by an operation."""
@@ -1577,32 +1863,106 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             self.hierarchy.setCurrentItem(first_match)
             self.hierarchy.scrollToItem(first_match, QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
 
-    def _refresh_data_table(self) -> None:
-        units = self.store.data_units()
+    @staticmethod
+    def _refresh_scope_filter(combo: QtWidgets.QComboBox, values: set[str], all_label: str, selected: str | None) -> None:
+        with QtCore.QSignalBlocker(combo):
+            combo.clear()
+            combo.addItem(all_label, "")
+            for value in sorted(values, key=str.casefold):
+                combo.addItem(value, value)
+            index = combo.findData(selected or "")
+            combo.setCurrentIndex(max(0, index))
+
+    def _refresh_data_table(self, *_args: Any) -> None:
+        scope = self._current_data_scope()
+        scope_key = (scope["kind"], scope["id"])
+        scope_changed = scope_key != getattr(self, "_last_data_scope_key", None)
+        previous_checks: dict[str, bool] = {}
+        if not scope_changed and hasattr(self, "data_table"):
+            for row in range(self.data_table.rowCount()):
+                id_item = self.data_table.item(row, 10)
+                batch_item = self.data_table.item(row, 0)
+                if id_item is not None and batch_item is not None:
+                    previous_checks[id_item.text()] = batch_item.checkState() == QtCore.Qt.CheckState.Checked
+        units = self.store.data_units(**scope["query"])
+        old_filter_values = (
+            str(self.manage_group_filter.currentData() or ""),
+            str(self.manage_condition_filter.currentData() or ""),
+            str(self.manage_inspection_filter.currentData() or ""),
+        )
+        self._refresh_scope_filter(self.manage_group_filter, {str(row.get("group_label") or "未设置") for row in units}, "All groups", old_filter_values[0])
+        self._refresh_scope_filter(self.manage_condition_filter, {str(row.get("condition_label") or "未设置") for row in units}, "All conditions", old_filter_values[1])
+        self._refresh_scope_filter(self.manage_inspection_filter, {str(row.get("inspection_status") or "unchecked") for row in units}, "All inspection states", old_filter_values[2])
+        query = self.manage_search.text().strip().casefold()
+        group_filter = str(self.manage_group_filter.currentData() or "")
+        condition_filter = str(self.manage_condition_filter.currentData() or "")
+        inspection_filter = str(self.manage_inspection_filter.currentData() or "")
+        active_filters = []
+        if query:
+            active_filters.append(f"搜索={self.manage_search.text().strip()}")
+        if group_filter:
+            active_filters.append(f"Group={group_filter}")
+        if condition_filter:
+            active_filters.append(f"Condition={condition_filter}")
+        if inspection_filter:
+            active_filters.append(f"Inspection={inspection_filter}")
+        filtered: list[dict[str, Any]] = []
+        for unit in units:
+            if group_filter and str(unit.get("group_label") or "未设置") != group_filter:
+                continue
+            if condition_filter and str(unit.get("condition_label") or "未设置") != condition_filter:
+                continue
+            if inspection_filter and str(unit.get("inspection_status") or "unchecked") != inspection_filter:
+                continue
+            haystack = " ".join(str(unit.get(key) or "") for key in (
+                "subject_code", "group_label", "session_key", "state_display_name", "condition_label", "source_path"
+            )).casefold()
+            if query and query not in haystack:
+                continue
+            filtered.append(unit)
+        ids = [str(unit["data_unit_id"]) for unit in filtered]
         status_by_data: dict[str, list[str]] = {}
-        for result in self.store.analysis_results({"active": 1}):
+        for result in self.store.analysis_results({"active": 1, "data_unit_ids": ids}):
             status_by_data.setdefault(str(result["data_unit_id"]), []).append(
                 f"{result['module_name']}: {result['calculation_status']}/{result['save_status']}/"
                 f"{result.get('result_validity', 'current')}/{result['review_status']}"
             )
-        self.data_table.setRowCount(len(units))
-        for row, unit in enumerate(units):
-            use = QtWidgets.QTableWidgetItem()
-            use.setFlags(use.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            use.setCheckState(QtCore.Qt.CheckState.Checked)
-            self.data_table.setItem(row, 0, use)
-            statuses = status_by_data.get(str(unit["data_unit_id"]), [])
-            validity = f"inspection={unit.get('inspection_status', 'unchecked')}; data={unit['validity_status']}; import={unit.get('import_status', 'ready')}"
-            values = [unit["subject_code"], unit.get("group_label", ""), unit["session_key"], unit["state_display_name"], unit.get("condition_label", ""), "" if unit.get("timepoint_value") is None else f"{unit['timepoint_value']:g} {unit.get('timepoint_unit') or ''}", Path(unit["source_path"]).name, validity, "; ".join(statuses) if statuses else "not run", unit["data_unit_id"]]
-            for column, value in enumerate(values, 1):
-                item = QtWidgets.QTableWidgetItem(str(value or ""))
-                if column == 7:
-                    item.setToolTip(unit["source_path"])
-                elif column == 9:
-                    item.setToolTip("\n".join(statuses) if statuses else "No active result")
-                self.data_table.setItem(row, column, item)
+        with QtCore.QSignalBlocker(self.data_table):
+            self.data_table.setRowCount(len(filtered))
+            for row, unit in enumerate(filtered):
+                use = QtWidgets.QTableWidgetItem()
+                use.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                use.setCheckState(QtCore.Qt.CheckState.Checked if previous_checks.get(str(unit["data_unit_id"]), False) else QtCore.Qt.CheckState.Unchecked)
+                use.setToolTip("Only checked records in the currently displayed list are added to batch.")
+                self.data_table.setItem(row, 0, use)
+                statuses = status_by_data.get(str(unit["data_unit_id"]), [])
+                validity = f"inspection={unit.get('inspection_status', 'unchecked')}; data={unit['validity_status']}; import={unit.get('import_status', 'ready')}"
+                values = [unit["subject_code"], unit.get("group_label", ""), unit["session_key"], unit["state_display_name"], unit.get("condition_label", ""), "" if unit.get("timepoint_value") is None else f"{unit['timepoint_value']:g} {unit.get('timepoint_unit') or ''}", Path(unit["source_path"]).name, validity, "; ".join(statuses) if statuses else "not run", unit["data_unit_id"]]
+                for column, value in enumerate(values, 1):
+                    item = QtWidgets.QTableWidgetItem(str(value or ""))
+                    if column == 7:
+                        item.setToolTip(unit["source_path"])
+                    elif column == 9:
+                        item.setToolTip("\n".join(statuses) if statuses else "No active result")
+                    self.data_table.setItem(row, column, item)
+        self.data_table.setRowCount(len(filtered))
+        self.data_table.clearSelection()
         self.data_table.resizeColumnsToContents()
         self.data_table.horizontalHeader().setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self._last_data_scope_key = scope_key
+        filter_suffix = f"  |  当前筛选生效：{'；'.join(active_filters)}" if active_filters else ""
+        self.current_range_summary.setText(f"当前范围：{scope['label']}{filter_suffix}")
+        self.visible_data_summary.setText(f"数据记录：{len(filtered)} 条 / 范围内 {len(units)} 条")
+        self.visible_data_summary.setToolTip("范围内数量是节点总数；左侧搜索和筛选仅改变当前显示数量，不扩大范围。")
+        if not units:
+            self.empty_data_message.setText("当前节点暂无数据记录。可直接在此状态导入数据。")
+            self.empty_data_message.show()
+        elif not filtered:
+            self.empty_data_message.setText("当前筛选条件下没有符合条件的数据记录。清除筛选不会改变当前目录范围。")
+            self.empty_data_message.show()
+        else:
+            self.empty_data_message.hide()
+        self._update_manage_action_states()
 
     def _selected_data_unit_ids(self) -> list[str]:
         table = self.batch_data_table if hasattr(self, "batch_data_table") else self.data_table
@@ -1627,6 +1987,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
         old_selected = set(self.batch_selected_ids)
         query = self.batch_search.text().strip().lower()
         checked_only = self.batch_checked_only.isChecked()
+        selected_only = self.batch_selected_only.isChecked()
         units = []
         for unit in self.store.data_units():
             haystack = " ".join(str(unit.get(key, "")) for key in ("subject_code", "session_key", "state_display_name", "condition_label", "timepoint_value", "source_path")).lower()
@@ -1634,11 +1995,13 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 continue
             if checked_only and str(unit.get("inspection_status", "unchecked")) != "checked" and unit["data_unit_id"] not in self.batch_selected_ids:
                 continue
+            if selected_only and unit["data_unit_id"] not in self.batch_selected_ids:
+                continue
             units.append(unit)
         with QtCore.QSignalBlocker(self.batch_data_table):
             self.batch_data_table.setRowCount(len(units))
             for row, unit in enumerate(units):
-                use = QtWidgets.QTableWidgetItem(); use.setFlags(use.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                use = QtWidgets.QTableWidgetItem(); use.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                 use.setCheckState(QtCore.Qt.CheckState.Checked if unit["data_unit_id"] in old_selected else QtCore.Qt.CheckState.Unchecked)
                 self.batch_data_table.setItem(row, 0, use)
                 values = [unit["subject_code"], unit["session_key"], unit["state_display_name"], unit.get("condition_label", ""), "" if unit.get("timepoint_value") is None else f"{unit['timepoint_value']:g} {unit.get('timepoint_unit') or ''}", unit.get("inspection_status", "unchecked"), Path(unit["source_path"]).name, unit["data_unit_id"]]
@@ -1648,7 +2011,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
 
     def _update_batch_selection_label(self, *_args: Any) -> None:
         if hasattr(self, "batch_selection_label"):
-            self.batch_selection_label.setText(f"{len(self._selected_data_unit_ids())} data units selected")
+            self.batch_selection_label.setText(f"{len(self._selected_data_unit_ids())} data units selected across filters")
 
     def _set_batch_visible_checked(self, checked: bool) -> None:
         with QtCore.QSignalBlocker(self.batch_data_table):
@@ -1656,18 +2019,37 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 self.batch_data_table.item(row, 0).setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
         self._update_batch_selection_label()
 
+    def _clear_all_batch_selection(self) -> None:
+        self.batch_selected_ids.clear()
+        self._refresh_batch_data_selector()
+
     def _current_data_unit(self) -> dict[str, Any] | None:
+        selected_rows = sorted({index.row() for index in self.data_table.selectionModel().selectedRows()}) if hasattr(self, "data_table") else []
+        if len(selected_rows) == 1:
+            item = self.data_table.item(selected_rows[0], 10)
+            if item is not None:
+                matches = self.store.data_units(data_unit_id=item.text())
+                return matches[0] if matches else None
+        if len(selected_rows) > 1:
+            return None
         item = self.hierarchy.currentItem() if hasattr(self, "hierarchy") else None
         identity = item.data(0, QtCore.Qt.ItemDataRole.UserRole) if item else None
-        if isinstance(identity, tuple) and identity[0] == "data":
-            matches = self.store.data_units(data_unit_ids=[str(identity[1])])
+        if isinstance(identity, (tuple, list)) and len(identity) == 2 and identity[0] == "data":
+            matches = self.store.data_units(data_unit_id=str(identity[1]))
             return matches[0] if matches else None
-        row = self.data_table.currentRow()
-        if row < 0:
-            return None
-        data_unit_id = self.data_table.item(row, 10).text()
-        matches = self.store.data_units(data_unit_ids=[data_unit_id])
-        return matches[0] if matches else None
+        return None
+
+    def _open_tree_item(self, item: QtWidgets.QTreeWidgetItem, _column: int = 0) -> None:
+        identity = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if isinstance(identity, (tuple, list)) and len(identity) == 2 and identity[0] == "data":
+            self.open_data_unit_by_id(str(identity[1]))
+
+    def open_data_unit_by_id(self, data_unit_id: str) -> None:
+        rows = self.store.data_units(data_unit_id=data_unit_id)
+        if not rows:
+            self.statusBar().showMessage("所选数据记录已不存在，请刷新项目目录。", 8000)
+            return
+        self._open_data_unit(rows[0])
 
     def add_subject(self) -> None:
         code, ok = QtWidgets.QInputDialog.getText(self, "Add subject", "Subject code (unique within project)")
@@ -1930,9 +2312,29 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             if not ok or not key.strip():
                 return
             experiment, ok = QtWidgets.QInputDialog.getText(self, "Edit session", "Experiment name", text=str(row.get("experiment_name") or ""))
+            if not ok:
+                return
+            session_date, ok = QtWidgets.QInputDialog.getText(self, "Edit session", "Session date (optional)", text=str(row.get("session_date") or ""))
+            if not ok:
+                return
+            sort_order, ok = QtWidgets.QInputDialog.getInt(
+                self,
+                "Edit session",
+                "Display order (lower first)",
+                value=int(row.get("sort_order") or 0),
+                minValue=0,
+                maxValue=2_147_483_647,
+            )
             if ok:
                 self._begin_project_edit()
-                self.store.update_session(stable_id, session_key=key, experiment_name=experiment, session_date=str(row.get("session_date") or ""), notes=str(row.get("notes") or ""))
+                self.store.update_session(
+                    stable_id,
+                    session_key=key,
+                    experiment_name=experiment,
+                    session_date=session_date,
+                    notes=str(row.get("notes") or ""),
+                    sort_order=sort_order,
+                )
         elif kind == "state":
             row = next(record for record in self.store.state_records() if record["state_record_id"] == stable_id)
             label, ok = QtWidgets.QInputDialog.getText(self, "Edit state", "Display label", text=row["display_name"])
@@ -2069,7 +2471,11 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
     def open_selected(self, *_args: Any) -> None:
         unit = self._current_data_unit()
         if unit is None:
+            self.statusBar().showMessage("请选择一条数据记录后再打开分析。", 5000)
             return
+        self._open_data_unit(unit)
+
+    def _open_data_unit(self, unit: dict[str, Any]) -> None:
         if self._project_draft_dirty:
             answer = QtWidgets.QMessageBox.question(
                 self,
@@ -2292,704 +2698,30 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             self.store.set_review(self.results_table.item(row, 10).text(), status, notes)
         self._refresh_results_table()
 
-    def _refresh_compare_filters(self) -> None:
-        session_value = self.compare_session.currentText() if self.compare_session.count() else ""
-        condition_value = self.compare_condition.currentText() if self.compare_condition.count() else ""
-        sessions = sorted({row["session_key"] for row in self.store.sessions()})
-        conditions = sorted({str(row.get("condition_label") or "") for row in self.store.state_records()})
-        groups = sorted({str(row.get("group_label") or "") for row in self.store.subjects() if str(row.get("group_label") or "")})
-        subject_value = self.compare_subject.currentData() if self.compare_subject.count() else ""
-        group_value = self.compare_group.currentData() if self.compare_group.count() else ""
-        b_group_value = self.compare_b_group.currentData() if self.compare_b_group.count() else ""
-        b_subject_value = self.compare_b_subject.currentData() if self.compare_b_subject.count() else ""
-        b_session_value = self.compare_b_session.currentText() if self.compare_b_session.count() else ""
-        b_condition_value = self.compare_b_condition.currentText() if self.compare_b_condition.count() else ""
-        self.compare_group.clear()
-        self.compare_group.addItem("All", "")
-        for group in groups:
-            self.compare_group.addItem(group, group)
-        self.compare_group.setCurrentIndex(max(0, self.compare_group.findData(group_value)))
-        self.compare_subject.clear()
-        self.compare_subject.addItem("All subjects", "")
-        for subject in self.store.subjects():
-            self.compare_subject.addItem(subject["subject_code"], subject["subject_id"])
-        self.compare_subject.setCurrentIndex(max(0, self.compare_subject.findData(subject_value)))
-        self.compare_session.clear()
-        self.compare_session.addItems(sessions)
-        self.compare_condition.clear()
-        self.compare_condition.addItems(conditions)
-        self.compare_session.setCurrentText(session_value)
-        self.compare_condition.setCurrentText(condition_value)
-        self.compare_b_group.clear(); self.compare_b_group.addItem("All", "")
-        for group in groups:
-            self.compare_b_group.addItem(group, group)
-        self.compare_b_group.setCurrentIndex(max(0, self.compare_b_group.findData(b_group_value)))
-        self.compare_b_subject.clear(); self.compare_b_subject.addItem("All subjects", "")
-        for subject in self.store.subjects():
-            self.compare_b_subject.addItem(subject["subject_code"], subject["subject_id"])
-        self.compare_b_subject.setCurrentIndex(max(0, self.compare_b_subject.findData(b_subject_value)))
-        self.compare_b_session.clear(); self.compare_b_session.addItems(sessions); self.compare_b_session.setCurrentText(b_session_value)
-        self.compare_b_condition.clear(); self.compare_b_condition.addItems(conditions); self.compare_b_condition.setCurrentText(b_condition_value)
-        self._refresh_specific_sessions()
-
-    def _refresh_specific_sessions(self) -> None:
-        current = self.compare_specific_session.currentData() if self.compare_specific_session.count() else ""
-        rows = self.store.query(
-            """SELECT s.session_id,s.session_key,s.experiment_name,u.subject_code
-               FROM sessions s JOIN subjects u ON u.subject_id=s.subject_id
-               WHERE s.session_key=? ORDER BY u.subject_code,s.created_at_utc""",
-            (self.compare_session.currentText(),),
-        )
-        with QtCore.QSignalBlocker(self.compare_specific_session):
-            self.compare_specific_session.clear()
-            self.compare_specific_session.addItem("All matching sessions", "")
-            for row in rows:
-                label = f"{row['subject_code']} | {row.get('experiment_name') or row['session_key']} | {row['session_id'][:18]}…"
-                self.compare_specific_session.addItem(label, row["session_id"])
-            index = self.compare_specific_session.findData(current)
-            self.compare_specific_session.setCurrentIndex(max(0, index))
-
-    def _refresh_comparison_from_controls(self) -> None:
-        self.current_snapshot_analysis_ids = None
-        self.current_snapshot_second_ids = None
-        self.refresh_comparison()
-
-    def _comparison_preview(self, filters: dict[str, Any], selection: Any, snapshot_ids: list[str] | None) -> pd.DataFrame:
-        if snapshot_ids is None:
-            return subject_match_preview(self.store, filters, include_pending_review=self.compare_pending.isChecked())
-        by_subject = {str(row.subject_id): str(row.analysis_id) for row in selection.included.itertuples()}
-        return pd.DataFrame(
-            [
-                {
-                    "subject_id": subject["subject_id"],
-                    "subject_code": subject["subject_code"],
-                    "group_label": subject.get("group_label", ""),
-                    "match_status": "included_from_snapshot" if subject["subject_id"] in by_subject else "not_in_snapshot",
-                    "analysis_id": by_subject.get(subject["subject_id"], ""),
-                    "reason": "Fixed saved comparison membership" if subject["subject_id"] in by_subject else "Not included in the saved snapshot",
-                }
-                for subject in self.store.subjects()
-                if not filters.get("group_label") or str(subject.get("group_label") or "") == str(filters["group_label"])
-                if not filters.get("subject_id") or str(subject["subject_id"]) == str(filters["subject_id"])
-            ]
-        )
-
-    def refresh_comparison(self) -> None:
-        filters = {
-            "group_label": str(self.compare_group.currentData() or ""),
-            "subject_id": str(self.compare_subject.currentData() or ""),
-            "session_key": self.compare_session.currentText(),
-            "session_id": str(self.compare_specific_session.currentData() or ""),
-            "condition_label": self.compare_condition.currentText(),
-            "timepoint_value": None if self.compare_time_range.isChecked() else self.compare_timepoint.value(),
-            "timepoint_min": self.compare_time_min.value() if self.compare_time_range.isChecked() else None,
-            "timepoint_max": self.compare_time_max.value() if self.compare_time_range.isChecked() else None,
-            "module_name": self.compare_module.currentText(),
-        }
-        selection = select_results(
-            self.store,
-            filters,
-            include_pending_review=self.compare_pending.isChecked(),
-            selected_analysis_ids=self.current_snapshot_analysis_ids,
-        )
-        preview = self._comparison_preview(filters, selection, self.current_snapshot_analysis_ids)
-        self.current_comparison_selection = selection
-        second_filters = {
-            **filters,
-            "group_label": str(self.compare_b_group.currentData() or ""),
-            "subject_id": str(self.compare_b_subject.currentData() or ""),
-            "session_key": self.compare_b_session.currentText(),
-            "session_id": "",
-            "condition_label": self.compare_b_condition.currentText(),
-            "timepoint_value": self.compare_second_timepoint.value(),
-            "timepoint_min": None,
-            "timepoint_max": None,
-        }
-        self.current_comparison_second = (
-            select_results(
-                self.store,
-                second_filters,
-                include_pending_review=self.compare_pending.isChecked(),
-                selected_analysis_ids=self.current_snapshot_second_ids,
-            )
-            if self.compare_paired.isChecked()
-            else None
-        )
-        second_preview = (
-            self._comparison_preview(second_filters, self.current_comparison_second, self.current_snapshot_second_ids)
-            if self.current_comparison_second is not None
-            else pd.DataFrame()
-        )
-        self.current_comparison_preview = preview
-        self.current_comparison_second_preview = second_preview
-        self._refresh_compare_bands(selection)
-        self._refresh_compare_metrics(selection)
-        self._refresh_compare_targets(selection)
-        compatibility = dict(zip(selection.compatibility.get("analysis_id", []), selection.compatibility.get("compatible_with_first", [])))
-        result_records = {str(record["analysis_id"]): record for record in self.store.analysis_results()}
-
-        def result_details(analysis_id: str) -> list[str]:
-            if not analysis_id or ";" in analysis_id:
-                return ["", "", "", ""]
-            record = result_records.get(analysis_id)
-            if record is None:
-                return ["", "", "", ""]
-            condition_time = str(record.get("condition_label") or "")
-            if record.get("timepoint_value") is not None:
-                condition_time = f"{condition_time} | {float(record['timepoint_value']):g} {record.get('timepoint_unit') or ''}".strip(" |")
-            samples = ""
-            try:
-                result_path = Path(str(record["result_path"]))
-                manifest = load_result_manifest(result_path if result_path.is_absolute() else self.store.paths.root / result_path)
-                quality = manifest.get("quality_summary", {})
-                parts = []
-                if quality.get("n_epochs") is not None:
-                    parts.append(f"{int(quality['n_epochs'])} epochs")
-                if quality.get("effective_duration_s") is not None:
-                    parts.append(f"{float(quality['effective_duration_s']):g} s")
-                samples = "; ".join(parts)
-            except (OSError, ValueError, KeyError, TypeError):
-                samples = "manifest unavailable"
-            return [str(record.get("session_key") or ""), condition_time, Path(str(record.get("source_path") or "")).name, samples]
-
-        detail_columns = ["session_key", "condition_time", "source_file", "effective_samples"]
-        for frame in (preview, second_preview):
-            if frame.empty:
-                continue
-            details = [result_details(str(value)) for value in frame["analysis_id"]]
-            for index, column in enumerate(detail_columns):
-                frame[column] = [values[index] for values in details]
-        self.current_comparison_preview = preview
-        self.current_comparison_second_preview = second_preview
-
-        self.compare_table.setRowCount(len(preview))
-        for row, item in preview.iterrows():
-            analysis = str(item["analysis_id"])
-            second = second_preview.loc[second_preview["subject_id"].eq(item["subject_id"])] if not second_preview.empty else pd.DataFrame()
-            second_status = str(second.iloc[0]["match_status"]) if not second.empty else ""
-            second_analysis = str(second.iloc[0]["analysis_id"]) if not second.empty else ""
-            first_details = result_details(analysis)
-            second_details = result_details(second_analysis)
-            reasons = [str(item["reason"])]
-            if not second.empty and str(second.iloc[0]["reason"]):
-                reasons.append("Second: " + str(second.iloc[0]["reason"]))
-            values = [
-                item["subject_code"], item.get("group_label", ""), *first_details, item["match_status"], analysis,
-                *second_details, second_status, second_analysis, " | ".join(value for value in reasons if value),
-                "" if not analysis or ";" in analysis else str(compatibility.get(analysis, "")),
-            ]
-            for column, value in enumerate(values):
-                cell = QtWidgets.QTableWidgetItem(str(value or ""))
-                cell.setToolTip(str(value or ""))
-                self.compare_table.setItem(row, column, cell)
-        self._plot_comparison(selection)
-
-    def _comparison_filters(self) -> dict[str, Any]:
-        return {
-            "group_label": str(self.compare_group.currentData() or ""),
-            "subject_id": str(self.compare_subject.currentData() or ""),
-            "session_key": self.compare_session.currentText(),
-            "session_id": str(self.compare_specific_session.currentData() or ""),
-            "condition_label": self.compare_condition.currentText(),
-            "timepoint_value": None if self.compare_time_range.isChecked() else self.compare_timepoint.value(),
-            "timepoint_min": self.compare_time_min.value() if self.compare_time_range.isChecked() else None,
-            "timepoint_max": self.compare_time_max.value() if self.compare_time_range.isChecked() else None,
-            "module_name": self.compare_module.currentText(),
-        }
-
-    def save_comparison(self) -> None:
-        if self.current_comparison_selection is None:
-            self.refresh_comparison()
-        name, ok = QtWidgets.QInputDialog.getText(self, "Save comparison", "Snapshot name", text=f"{self.compare_session.currentText()} {self.compare_condition.currentText()} T{self.compare_timepoint.value():g}")
-        if not ok or not name.strip():
-            return
-        selection = self.current_comparison_selection
-        comparison_id = self.store.create_comparison_snapshot(
-            name,
-            self._comparison_filters(),
-            selection.included.to_dict("records"),
-            selection.excluded.to_dict("records"),
-            {
-                "band": self.compare_band.currentText(),
-                "metric": self.compare_metric.currentText(),
-                "include_pending_review": self.compare_pending.isChecked(),
-                "paired": self.compare_paired.isChecked(),
-                "second_timepoint": self.compare_second_timepoint.value(),
-                "second_filters": {
-                    "group_label": str(self.compare_b_group.currentData() or ""),
-                    "subject_id": str(self.compare_b_subject.currentData() or ""),
-                    "session_key": self.compare_b_session.currentText(),
-                    "condition_label": self.compare_b_condition.currentText(),
-                    "timepoint_value": self.compare_second_timepoint.value(),
-                },
-                "target_level": self.compare_dimension.currentText(),
-                "target": self.compare_target.currentText(),
-                "view": self.compare_view.currentText(),
-                "second_analysis_ids": (
-                    self.current_comparison_second.included["analysis_id"].astype(str).tolist()
-                    if self.current_comparison_second is not None and not self.current_comparison_second.included.empty
-                    else []
-                ),
-            },
-        )
-        self.statusBar().showMessage(f"Saved comparison snapshot: {comparison_id}", 10000)
-
-    def load_comparison(self) -> None:
-        snapshots = self.store.comparison_snapshots()
-        if not snapshots:
-            QtWidgets.QMessageBox.information(self, "Load comparison", "No saved comparison snapshot is available.")
-            return
-        labels = [f"{row['name']} — {row['created_at_utc']}" for row in snapshots]
-        label, ok = QtWidgets.QInputDialog.getItem(self, "Load comparison", "Saved snapshot", labels, editable=False)
-        if not ok:
-            return
-        payload = self.store.load_comparison_snapshot(snapshots[labels.index(label)]["comparison_id"])
-        filters = payload.get("filters", {})
-        settings = payload.get("settings", {})
-        with QtCore.QSignalBlocker(self.compare_group):
-            index = self.compare_group.findData(filters.get("group_label", ""))
-            self.compare_group.setCurrentIndex(max(0, index))
-        subject_index = self.compare_subject.findData(str(filters.get("subject_id", "")))
-        self.compare_subject.setCurrentIndex(max(0, subject_index))
-        self.compare_session.setCurrentText(str(filters.get("session_key", "")))
-        session_index = self.compare_specific_session.findData(str(filters.get("session_id", "")))
-        self.compare_specific_session.setCurrentIndex(max(0, session_index))
-        self.compare_condition.setCurrentText(str(filters.get("condition_label", "")))
-        if filters.get("timepoint_value") is not None:
-            self.compare_timepoint.setValue(float(filters["timepoint_value"]))
-        range_enabled = filters.get("timepoint_min") is not None or filters.get("timepoint_max") is not None
-        self.compare_time_range.setChecked(range_enabled)
-        if filters.get("timepoint_min") is not None:
-            self.compare_time_min.setValue(float(filters["timepoint_min"]))
-        if filters.get("timepoint_max") is not None:
-            self.compare_time_max.setValue(float(filters["timepoint_max"]))
-        self.compare_module.setCurrentText(str(filters.get("module_name", "Band Power")))
-        self.compare_pending.setChecked(bool(settings.get("include_pending_review", False)))
-        self.compare_paired.setChecked(bool(settings.get("paired", False)))
-        if settings.get("second_timepoint") is not None:
-            self.compare_second_timepoint.setValue(float(settings["second_timepoint"]))
-        second_filters = settings.get("second_filters", {})
-        if isinstance(second_filters, dict):
-            for combo, key in (
-                (self.compare_b_group, "group_label"),
-                (self.compare_b_subject, "subject_id"),
-            ):
-                index = combo.findData(str(second_filters.get(key, "")))
-                combo.setCurrentIndex(max(0, index))
-            self.compare_b_session.setCurrentText(str(second_filters.get("session_key", "")))
-            self.compare_b_condition.setCurrentText(str(second_filters.get("condition_label", "")))
-        self.compare_dimension.setCurrentText(str(settings.get("target_level", "All")))
-        self.current_snapshot_analysis_ids = [str(row["analysis_id"]) for row in payload.get("included", []) if row.get("analysis_id")]
-        self.current_snapshot_second_ids = [str(value) for value in settings.get("second_analysis_ids", [])]
-        self.refresh_comparison()
-        if settings.get("band"):
-            self.compare_band.setCurrentText(str(settings["band"]))
-        if settings.get("metric"):
-            self.compare_metric.setCurrentText(str(settings["metric"]))
-        if settings.get("target"):
-            self.compare_target.setCurrentText(str(settings["target"]))
-        if settings.get("view"):
-            self.compare_view.setCurrentText(str(settings["view"]))
-        self.statusBar().showMessage(f"Loaded fixed comparison snapshot: {payload['comparison_id']}", 10000)
-
-    def export_comparison(self) -> None:
-        if self.current_comparison_preview.empty:
-            self.refresh_comparison()
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export comparison preview", str(self.store.paths.root / "comparison_preview.csv"), "CSV (*.csv)")
-        if path:
-            output = self.current_comparison_preview
-            if not self.current_comparison_second_preview.empty:
-                output = output.merge(
-                    self.current_comparison_second_preview,
-                    on=["subject_id", "subject_code", "group_label"],
-                    how="outer",
-                    suffixes=("_first", "_second"),
-                )
-            output.to_csv(path, index=False)
-            self.statusBar().showMessage(f"Exported: {path}", 10000)
-
-    def _refresh_compare_bands(self, selection: Any) -> None:
-        current = self.compare_band.currentText()
-        values: list[str] = []
-        if not selection.included.empty:
-            first = selection.included.iloc[0]
-            try:
-                manifest = load_result_manifest(self.store.paths.root / first["result_path"])
-                table_names = list(manifest.get("tables", {}))
-                preferred = "band_power_summary" if "band_power_summary" in table_names else ("band_summary" if "band_summary" in table_names else "")
-                if preferred:
-                    frame = load_table(manifest, preferred)
-                    column = "band" if "band" in frame else ("frequency_band" if "frequency_band" in frame else "")
-                    if column:
-                        values = list(dict.fromkeys(frame[column].dropna().astype(str)))
-            except (OSError, ValueError, KeyError, TypeError):
-                values = []
-        with QtCore.QSignalBlocker(self.compare_band):
-            self.compare_band.clear()
-            self.compare_band.addItems(values or ["All"])
-            if current in values:
-                self.compare_band.setCurrentText(current)
-
-    def _refresh_compare_metrics(self, selection: Any) -> None:
-        current = self.compare_metric.currentText()
-        values: list[str] = []
-        if not selection.included.empty:
-            first = selection.included.iloc[0]
-            try:
-                manifest = load_result_manifest(self.store.paths.root / first["result_path"])
-                preferred = "band_summary" if "band_summary" in manifest.get("tables", {}) else ""
-                if preferred:
-                    frame = load_table(manifest, preferred)
-                    if "method" in frame:
-                        values = list(dict.fromkeys(frame["method"].dropna().astype(str)))
-            except (OSError, ValueError, KeyError, TypeError):
-                values = []
-        with QtCore.QSignalBlocker(self.compare_metric):
-            self.compare_metric.clear()
-            self.compare_metric.addItems(values or ["All"])
-            if current in values:
-                self.compare_metric.setCurrentText(current)
-
-    def _refresh_compare_targets(self, selection: Any) -> None:
-        current = self.compare_target.currentText()
-        values: list[str] = []
-        level = self.compare_dimension.currentText()
-        if selection is not None and not selection.included.empty and level != "All":
-            table_by_module = {
-                "PSD": "psd_channel_summary",
-                "Band Power": "band_power_summary",
-                "FOOOF": "model",
-                "Connectivity": "band_summary",
-                "Time Delay": "band_summary",
-            }
-            candidates = {
-                "Channel": ("channel_name", "seed_channel", "target_channel"),
-                "Region": ("region", "region_a", "region_b", "seed_region", "target_region"),
-                "Region pair": ("pair_label", "region_pair"),
-            }
-            first = selection.included.iloc[0]
-            try:
-                manifest = load_result_manifest(self.store.paths.root / first["result_path"])
-                table_name = table_by_module.get(self.compare_module.currentText(), "")
-                if table_name and table_name in manifest.get("tables", {}):
-                    frame = load_table(manifest, table_name)
-                    if level == "Region pair" and "region_pair" not in frame:
-                        if {"region_a", "region_b"}.issubset(frame.columns):
-                            frame["region_pair"] = frame["region_a"].astype(str) + "–" + frame["region_b"].astype(str)
-                        elif {"seed_region", "target_region"}.issubset(frame.columns):
-                            frame["region_pair"] = frame["seed_region"].astype(str) + "→" + frame["target_region"].astype(str)
-                    for column in candidates[level]:
-                        if column in frame:
-                            values.extend(frame[column].dropna().astype(str).tolist())
-            except (OSError, ValueError, KeyError, TypeError):
-                values = []
-        values = list(dict.fromkeys(value for value in values if value))
-        with QtCore.QSignalBlocker(self.compare_target):
-            self.compare_target.clear()
-            self.compare_target.addItems(["All", *values])
-            if current in values:
-                self.compare_target.setCurrentText(current)
-
-    def _comparison_row_filters(self, module: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        selected_band = self.compare_band.currentText()
-        if selected_band != "All":
-            filters["frequency_band" if module == "Time Delay" else "band"] = selected_band
-        selected_metric = self.compare_metric.currentText()
-        if selected_metric != "All":
-            filters["method"] = selected_metric
-        target = self.compare_target.currentText()
-        level = self.compare_dimension.currentText()
-        if target != "All":
-            candidates = {
-                "Channel": ("channel_name", "seed_channel", "target_channel"),
-                "Region": ("region", "region_a", "region_b", "seed_region", "target_region"),
-                "Region pair": ("pair_label", "region_pair"),
-            }.get(level, ())
-            filters["__target_columns__"] = {"columns": candidates, "value": target}
-        return filters
-
-    def _plot_comparison(self, selection: Any) -> None:
-        self.compare_figure.clear()
-        module = self.compare_module.currentText()
-        if module == "Connectivity" and self.compare_view.currentText() == "Connection spectrum":
-            self._plot_connectivity_spectra(selection)
-            self.compare_canvas.draw_idle()
-            return
-        if module == "Connectivity" and self.compare_view.currentText() == "Region matrices":
-            self._plot_connectivity_matrices(selection)
-            self.compare_canvas.draw_idle()
-            return
-        axis = self.compare_figure.add_subplot(111)
-        specs = {
-            "PSD": ("psd_channel_summary", "psd_value", ["frequency_hz"]),
-            "Band Power": ("band_power_summary", "absolute_power", ["band"]),
-            "FOOOF": ("model", "exponent", []),
-                "Connectivity": ("band_summary", "value_strength", ["method", "band", "region_pair"]),
-                "Time Delay": ("band_summary", "region_peak_delay_ms", ["frequency_band", "region_pair"]),
-        }
-        if module not in specs or selection.included.empty:
-            axis.text(0.5, 0.5, "No unambiguous saved result available for this selection", ha="center", va="center", transform=axis.transAxes)
-            axis.set_axis_off()
-            self.compare_canvas.draw_idle()
-            return
-        if module == "PSD":
-            if self.compare_paired.isChecked():
-                axis.text(0.5, 0.5, "Paired scalar summaries are available for Band Power, FOOOF, Connectivity, and Time Delay.\nPSD remains an individual-curve comparison.", ha="center", va="center", transform=axis.transAxes)
-                axis.set_axis_off()
-                self.compare_canvas.draw_idle()
-                return
-            self._plot_psd_comparison(axis, selection)
-            self.compare_canvas.draw_idle()
-            return
-        table, value, groups = specs[module]
-        try:
-            selected_band = self.compare_band.currentText()
-            row_filters = self._comparison_row_filters(module)
-            effective_groups = [group for group in groups if group not in {"band", "frequency_band"}]
-            if self.compare_paired.isChecked() and self.current_comparison_second is not None:
-                self._plot_paired_comparison(axis, selection, self.current_comparison_second, table, value, effective_groups, row_filters)
-                self.compare_canvas.draw_idle()
-                return
-            points = subject_summary(self.store, selection, table, value, effective_groups, row_filters=row_filters)
-            if points.empty:
-                raise ValueError("empty summary")
-            if points.duplicated("subject_id", keep=False).any():
-                raise ValueError("Several channel/region targets remain per subject. Select one target level and target before comparing.")
-            subject_order = list(dict.fromkeys(points["subject_code"].astype(str)))
-            xmap = {name: index for index, name in enumerate(subject_order)}
-            signatures = list(dict.fromkeys(points["compatibility_signature"].astype(str)))
-            palette = ["#34345C", "#9281BD", "#D06A45", "#3F8C78"]
-            for signature_index, signature in enumerate(signatures):
-                subset = points.loc[points["compatibility_signature"].astype(str).eq(signature)]
-                axis.scatter(
-                    [xmap[str(subject)] for subject in subset["subject_code"]],
-                    subset[value].astype(float),
-                    color=palette[signature_index % len(palette)],
-                    alpha=0.8,
-                    label=f"parameter set {signature_index + 1}",
-                )
-            axis.set_xticks(range(len(subject_order)), subject_order, rotation=35, ha="right")
-            axis.set_ylabel(value)
-            band_text = f", {selected_band}" if selected_band != "All" else ""
-            axis.set_title(f"{module}{band_text}: subject-level representatives (n={points['subject_id'].nunique()})")
-            axis.grid(axis="y", color="#dddddd", linewidth=0.6)
-            if len(signatures) > 1:
-                axis.legend(title="Not pooled: incompatible parameters")
-        except Exception as exc:  # noqa: BLE001
-            axis.text(0.5, 0.5, f"Comparison preview unavailable:\n{exc}", ha="center", va="center", transform=axis.transAxes)
-            axis.set_axis_off()
-        self.compare_canvas.draw_idle()
-
-    @staticmethod
-    def _with_region_pair(frame: pd.DataFrame) -> pd.DataFrame:
-        result = frame.copy()
-        if "region_pair" not in result:
-            if {"region_a", "region_b"}.issubset(result.columns):
-                result["region_pair"] = result["region_a"].astype(str) + "–" + result["region_b"].astype(str)
-            elif {"seed_region", "target_region"}.issubset(result.columns):
-                result["region_pair"] = result["seed_region"].astype(str) + "→" + result["target_region"].astype(str)
-        return result
-
-    def _connection_method_and_pair(self, frames: list[pd.DataFrame]) -> tuple[str, str]:
-        methods = list(dict.fromkeys(str(value) for frame in frames for value in frame.get("method", pd.Series(dtype=str)).dropna().unique()))
-        method = self.compare_metric.currentText()
-        if method == "All":
-            if len(methods) != 1:
-                raise ValueError("Select one connectivity method before comparing spectra or matrices.")
-            method = methods[0]
-        pairs = list(dict.fromkeys(str(value) for frame in frames for value in self._with_region_pair(frame).get("region_pair", pd.Series(dtype=str)).dropna().unique()))
-        pair = self.compare_target.currentText() if self.compare_dimension.currentText() == "Region pair" else "All"
-        if pair == "All" and len(pairs) == 1:
-            pair = pairs[0]
-        return method, pair
-
-    def _plot_connectivity_spectra(self, selection: Any) -> None:
-        axis = self.compare_figure.add_subplot(111)
-        if selection is None or selection.included.empty:
-            axis.text(0.5, 0.5, "No unambiguous saved connectivity result is available.", ha="center", va="center", transform=axis.transAxes)
-            axis.set_axis_off()
-            return
-        loaded: list[tuple[Any, pd.DataFrame]] = []
-        for row in selection.included.itertuples():
-            manifest = load_result_manifest(self.store.paths.root / row.result_path)
-            loaded.append((row, self._with_region_pair(load_table(manifest, "spectrum"))))
-        try:
-            method, pair = self._connection_method_and_pair([frame for _row, frame in loaded])
-            if pair == "All":
-                raise ValueError("Select Region pair and one pair before comparing connectivity spectra.")
-            count = 0
-            for row, frame in loaded:
-                subset = frame.loc[frame["method"].astype(str).eq(method) & frame["region_pair"].astype(str).eq(pair)].copy()
-                if subset.empty:
-                    continue
-                if "component_index" in subset and subset["component_index"].notna().any():
-                    subset = subset.loc[subset["component_index"].fillna(1).eq(subset["component_index"].dropna().min())]
-                value = "value_strength" if "value_strength" in subset else "value_raw"
-                curve = subset.groupby("frequency_hz", as_index=False)[value].mean().sort_values("frequency_hz")
-                axis.plot(curve["frequency_hz"], curve[value], linewidth=1.2, alpha=0.8, label=str(row.subject_code))
-                count += 1
-            if not count:
-                raise ValueError("The selected method/pair is absent from the included results.")
-            axis.set_xlabel("Frequency (Hz)")
-            axis.set_ylabel("Connectivity strength")
-            axis.set_title(f"{method} | {pair} | individual saved-result spectra (n={count})")
-            axis.grid(color="#dddddd", linewidth=0.6)
-            axis.legend(ncol=2, fontsize=8)
-        except (KeyError, ValueError) as exc:
-            axis.text(0.5, 0.5, str(exc), ha="center", va="center", transform=axis.transAxes)
-            axis.set_axis_off()
-
-    def _plot_connectivity_matrices(self, selection: Any) -> None:
-        if selection is None or selection.included.empty:
-            axis = self.compare_figure.add_subplot(111)
-            axis.text(0.5, 0.5, "No unambiguous saved connectivity result is available.", ha="center", va="center", transform=axis.transAxes)
-            axis.set_axis_off()
-            return
-        loaded: list[tuple[Any, pd.DataFrame]] = []
-        for row in selection.included.itertuples():
-            manifest = load_result_manifest(self.store.paths.root / row.result_path)
-            loaded.append((row, self._with_region_pair(load_table(manifest, "band_summary"))))
-        try:
-            method, _pair = self._connection_method_and_pair([frame for _row, frame in loaded])
-            band = self.compare_band.currentText()
-            if band == "All":
-                raise ValueError("Select one frequency band before displaying region matrices.")
-            filtered: list[tuple[Any, pd.DataFrame]] = []
-            values: list[float] = []
-            for row, frame in loaded:
-                subset = frame.loc[frame["method"].astype(str).eq(method) & frame["band"].astype(str).eq(band)].copy()
-                if "component_index" in subset and subset["component_index"].notna().any():
-                    subset = subset.loc[subset["component_index"].fillna(1).eq(subset["component_index"].dropna().min())]
-                if subset.empty:
-                    continue
-                value_column = "value_raw_or_summary" if method.lower() in {"dpli", "wpli2_debiased", "mim"} else "value_strength"
-                values.extend(pd.to_numeric(subset[value_column], errors="coerce").dropna().tolist())
-                subset["_matrix_value"] = pd.to_numeric(subset[value_column], errors="coerce")
-                filtered.append((row, subset))
-            if not filtered or not values:
-                raise ValueError("The selected method/band is absent from the included results.")
-            lower_method = method.lower()
-            if lower_method == "dpli":
-                norm: Normalize = TwoSlopeNorm(vmin=0.0, vcenter=0.5, vmax=1.0)
-                cmap = "coolwarm"
-            elif lower_method in {"mic", "wpli"}:
-                norm = Normalize(vmin=0.0, vmax=1.0)
-                cmap = "viridis"
-            elif lower_method == "wpli2_debiased" and min(values) < 0 < max(values):
-                bound = max(abs(min(values)), abs(max(values)))
-                norm = TwoSlopeNorm(vmin=-bound, vcenter=0.0, vmax=bound)
-                cmap = "coolwarm"
-            else:
-                vmin, vmax = min(values), max(values)
-                if vmin == vmax:
-                    vmax = vmin + 1.0
-                norm = Normalize(vmin=vmin, vmax=vmax)
-                cmap = "viridis"
-            columns = 2
-            rows = int(np.ceil(len(filtered) / columns))
-            axes = np.asarray(self.compare_figure.subplots(rows, columns, squeeze=False)).ravel()
-            for axis, (record, frame) in zip(axes, filtered, strict=False):
-                regions = list(dict.fromkeys([*frame["region_a"].astype(str), *frame["region_b"].astype(str)]))
-                matrix = np.full((len(regions), len(regions)), np.nan)
-                region_index = {name: index for index, name in enumerate(regions)}
-                for _index, item in frame.iterrows():
-                    a, b = region_index[str(item["region_a"])], region_index[str(item["region_b"])]
-                    matrix[a, b] = float(item["_matrix_value"])
-                    if lower_method != "dpli":
-                        matrix[b, a] = float(item["_matrix_value"])
-                image = axis.imshow(matrix, cmap=cmap, norm=norm, interpolation="nearest")
-                axis.set_xticks(range(len(regions)), regions, rotation=35, ha="right")
-                axis.set_yticks(range(len(regions)), regions)
-                axis.set_title(str(record.subject_code))
-                self.compare_figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
-            for axis in axes[len(filtered):]:
-                axis.set_visible(False)
-            self.compare_figure.suptitle(f"{method} | {band} | one saved matrix per subject; common color scale")
-        except (KeyError, ValueError) as exc:
-            self.compare_figure.clear()
-            axis = self.compare_figure.add_subplot(111)
-            axis.text(0.5, 0.5, str(exc), ha="center", va="center", transform=axis.transAxes)
-            axis.set_axis_off()
-
-    def _plot_paired_comparison(
-        self,
-        axis: Any,
-        first: Any,
-        second: Any,
-        table: str,
-        value: str,
-        groups: list[str],
-        row_filters: dict[str, Any],
-    ) -> None:
-        paired = paired_subject_summary(
-            self.store,
-            first,
-            second,
-            table,
-            value,
-            groups,
-            first_filters=row_filters,
-            second_filters=row_filters,
-        )
-        if paired.empty:
-            raise ValueError("no unambiguous subject pair is available")
-        compatible = paired["compatibility_signature_first"].eq(paired["compatibility_signature_second"])
-        palette = ["#34345C", "#9281BD", "#D06A45", "#3F8C78", "#4C78A8"]
-        for index, row in enumerate(paired.itertuples()):
-            color = palette[index % len(palette)] if bool(compatible.iloc[index]) else "#9E9E9E"
-            axis.plot([0, 1], [getattr(row, f"{value}_first"), getattr(row, f"{value}_second")], marker="o", color=color, alpha=0.8, label=str(row.subject_code))
-        axis.set_xticks([0, 1], [f"T{self.compare_timepoint.value():g}", f"T{self.compare_second_timepoint.value():g}"])
-        axis.set_ylabel(value)
-        axis.set_title(f"Paired by subject_id (complete pairs n={paired['subject_id'].nunique()}); grey = incompatible parameters")
-        axis.grid(axis="y", color="#dddddd", linewidth=0.6)
-        if len(paired) <= 12:
-            axis.legend(ncol=2, fontsize=8)
-
-    def _plot_psd_comparison(self, axis: Any, selection: Any) -> None:
-        palette = ["#34345C", "#9281BD", "#D06A45", "#3F8C78", "#4C78A8"]
-        groups: dict[tuple[str, str], list[tuple[np.ndarray, np.ndarray]]] = {}
-        subject_count = 0
-        for index, row in enumerate(selection.included.itertuples()):
-            manifest = load_result_manifest(self.store.paths.root / row.result_path)
-            frame = load_table(manifest, "psd_channel_summary")
-            if not {"frequency_hz", "psd_value"}.issubset(frame.columns):
-                continue
-            curve = frame.groupby("frequency_hz", as_index=False)["psd_value"].mean().sort_values("frequency_hz")
-            frequencies = curve["frequency_hz"].to_numpy(float)
-            values = curve["psd_value"].to_numpy(float)
-            color = palette[index % len(palette)]
-            axis.plot(frequencies, values, color=color, alpha=0.55, linewidth=1.0, label=str(row.subject_code))
-            groups.setdefault((str(row.group_label or "ungrouped"), str(row.compatibility_signature)), []).append((frequencies, values))
-            subject_count += 1
-        for group_index, ((group_label, _signature), curves) in enumerate(groups.items()):
-            reference = curves[0][0]
-            if len(curves) < 2 or not all(np.array_equal(reference, frequency) for frequency, _values in curves[1:]):
-                continue
-            mean_curve = np.nanmean(np.vstack([values for _frequency, values in curves]), axis=0)
-            axis.plot(reference, mean_curve, color=palette[group_index % len(palette)], linewidth=2.4, linestyle="--", label=f"{group_label} mean (n={len(curves)})")
-        axis.set_xlabel("Frequency (Hz)")
-        axis.set_ylabel("PSD")
-        axis.set_title(f"PSD: individual subject curves (n={subject_count}); means require identical compatible grids")
-        axis.grid(color="#dddddd", linewidth=0.6)
-        axis.legend(ncol=2, fontsize=8)
-
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.mode != "manage" or not self._project_draft_dirty:
             event.accept()
-            return
-        answer = QtWidgets.QMessageBox.question(
-            self,
-            "项目有未保存更改",
-            "项目结构或导入关联尚未正式保存。请选择保存、放弃修改或取消关闭。",
-            QtWidgets.QMessageBox.StandardButton.Save
-            | QtWidgets.QMessageBox.StandardButton.Discard
-            | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Save,
-        )
-        if answer == QtWidgets.QMessageBox.StandardButton.Save:
-            event.setAccepted(self.save_project())
-        elif answer == QtWidgets.QMessageBox.StandardButton.Discard:
-            event.setAccepted(self.discard_project_changes())
         else:
-            event.ignore()
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "项目有未保存更改",
+                "项目结构或导入关联尚未正式保存。请选择保存、放弃修改或取消关闭。",
+                QtWidgets.QMessageBox.StandardButton.Save
+                | QtWidgets.QMessageBox.StandardButton.Discard
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Save,
+            )
+            if answer == QtWidgets.QMessageBox.StandardButton.Save:
+                event.setAccepted(self.save_project())
+            elif answer == QtWidgets.QMessageBox.StandardButton.Discard:
+                event.setAccepted(self.discard_project_changes())
+            else:
+                event.ignore()
+        if event.isAccepted():
+            # Filter/export windows capture a stable scope and may be visible
+            # independently of the manager. Destroy them only after Save or
+            # Discard accepts closing; Cancel must leave them intact.
+            for dialog in self.findChildren(ProjectFilterExportDialog):
+                dialog.close()
+                dialog.deleteLater()
+            self.filter_export_dialog = None

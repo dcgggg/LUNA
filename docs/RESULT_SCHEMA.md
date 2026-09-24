@@ -32,7 +32,7 @@ Manifests also expose the clearer aliases `state_id`, `dataset_id`, and `analysi
 
 Renaming or reordering a project item therefore does not change its result links.
 
-`selection` and `inspection_snapshot` freeze the inspection status, revision, fingerprint, source-structure fingerprint, effective channel/mapping, retained/original epoch identities and within-epoch time selection used by that run. Later inspection edits set `result_validity=needs_recompute` without changing the historical `calculation_status=completed` or `save_status=saved`. The old bundle remains readable; automatic reuse and default comparison require `result_validity=current`.
+`selection` and `inspection_snapshot` freeze the inspection status, revision, fingerprint, source-structure fingerprint, effective channel/mapping, retained/original epoch identities and within-epoch time selection used by that run. Later inspection edits set `result_validity=needs_recompute` without changing the historical `calculation_status=completed` or `save_status=saved`. The old bundle remains readable; automatic reuse and current-result queries require `result_validity=current`. Cross-record pairing, group statistics and scientific comparison figures are intentionally performed outside LUNA from these saved bundles.
 
 ## Required provenance
 
