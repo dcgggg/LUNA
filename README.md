@@ -264,6 +264,9 @@ Detailed guides and method notes are maintained outside the main README:
 - [Project status](docs/PROJECT_STATUS.md)
 - [Project workflow](docs/PROJECT_WORKFLOW.md)
 - [Versioned result contract](docs/RESULT_SCHEMA.md)
+- [Analysis workflow and figure-reading guide](docs/ANALYSIS_GUIDE.md)
+- [Saved result and metric data dictionary](docs/RESULT_DATA_DICTIONARY.md)
+- [Figure–field–function index](docs/FIGURE_RESULT_INDEX.md)
 
 Repository: [https://github.com/dcgggg/LUNA.git](https://github.com/dcgggg/LUNA.git)
 
