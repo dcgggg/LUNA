@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import threading
 import traceback
 import uuid
@@ -16,6 +17,7 @@ from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
 from .gui_engine import inspect_file
 from .mapping import mapping_rows
+from .portable_paths import portable_path_name
 from .project_batch import MODULE_TO_INDICATORS, ProjectBatchRunner
 from .project_store import (
     PROJECT_DATABASE,
@@ -24,26 +26,13 @@ from .project_store import (
     utc_now,
 )
 from .resources import packaged_resource_path
+from .ui_fonts import choose_ui_font_family
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _project_font_family() -> str:
-    installed = set(QtGui.QFontDatabase.families())
-    for family in ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Segoe UI"):
-        if family in installed:
-            return family
-    for candidate in (
-        Path(r"C:\Windows\Fonts\Noto Sans SC (TrueType).otf"),
-        Path(r"C:\Windows\Fonts\simhei.ttf"),
-        Path(r"C:\Windows\Fonts\Deng.ttf"),
-    ):
-        if candidate.is_file():
-            font_id = QtGui.QFontDatabase.addApplicationFont(str(candidate))
-            families = QtGui.QFontDatabase.applicationFontFamilies(font_id)
-            if families:
-                return str(families[0])
-    return "Arial"
+    return choose_ui_font_family(QtGui.QFontDatabase.families(), platform.system())
 
 
 def _project_logo_pixmap(width: int = 172, height: int = 48) -> QtGui.QPixmap:
@@ -661,7 +650,7 @@ class StructureTemplateDialog(QtWidgets.QDialog):
                 f"Creation plan: add {plan['subjects_created']} subjects, {plan['sessions_created']} sessions, "
                 f"{plan['states_created']} states; reuse {plan['subjects_reused']}/{plan['sessions_reused']}/{plan['states_reused']}. "
                 f"Total state records in this template: {n_subjects * n_sessions * n_states}. "
-                f"Target: {self.store.paths.root / Path(first_target) if first_target else self.store.paths.subjects}."
+                f"Target: {self.store.resolve_project_relative_path(first_target) if first_target else self.store.paths.subjects}."
             )
         except ValueError as exc:
             self.summary.setText(f"Invalid state row: {exc}")
@@ -1380,7 +1369,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 raise FileNotFoundError(f"Imported project file is missing: {unit.get('source_path')}")
         for row in (*self.store.subjects(), *self.store.sessions(), *self.store.state_records()):
             relative = str(row.get("relative_path") or "")
-            if relative and not (self.store.paths.root / Path(relative)).is_dir():
+            if relative and not self.store.resolve_project_relative_path(relative).is_dir():
                 raise FileNotFoundError(f"Hierarchy directory is missing: {relative}")
 
     def save_project(self) -> bool:
@@ -1410,9 +1399,8 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
 
     def _cleanup_project_draft_files(self) -> None:
         for relative in sorted(self._project_draft_created_files, key=len, reverse=True):
-            target = (self.store.paths.root / Path(relative)).resolve()
             try:
-                target.relative_to(self.store.paths.root)
+                target = self.store.resolve_project_relative_path(relative)
             except ValueError:
                 continue
             if target.is_file():
@@ -1422,9 +1410,8 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 except OSError:
                     pass
         for relative in sorted(self._project_draft_created_dirs, key=len, reverse=True):
-            target = (self.store.paths.root / Path(relative)).resolve()
             try:
-                target.relative_to(self.store.paths.root)
+                target = self.store.resolve_project_relative_path(relative)
                 target.rmdir()
             except (OSError, ValueError):
                 pass
@@ -1698,7 +1685,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                     "kind": kind,
                     "id": stable_id,
                     "query": {"data_unit_id": stable_id},
-                    "label": f"{project['name']} / {row['subject_code']} / {row['session_key']} / {row['state_display_name']} / {Path(row['source_path']).name}",
+                    "label": f"{project['name']} / {row['subject_code']} / {row['session_key']} / {row['state_display_name']} / {portable_path_name(row['source_path'])}",
                 }
         return {"kind": "project", "id": project_id, "query": {"project_id": project_id}, "label": project["name"]}
 
@@ -1785,7 +1772,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
             subject_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("subject", subject["subject_id"]))
             items_by_identity[("subject", str(subject["subject_id"]))] = subject_item
             if subject.get("relative_path"):
-                subject_item.setToolTip(0, str(self.store.paths.root / Path(subject["relative_path"])))
+                subject_item.setToolTip(0, str(self.store.resolve_project_relative_path(subject["relative_path"])))
             root.addChild(subject_item)
             for session in subject_sessions:
                 session_states = self.store.state_records(session["session_id"])
@@ -1793,7 +1780,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 session_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("session", session["session_id"]))
                 items_by_identity[("session", str(session["session_id"]))] = session_item
                 if session.get("relative_path"):
-                    session_item.setToolTip(0, str(self.store.paths.root / Path(session["relative_path"])))
+                    session_item.setToolTip(0, str(self.store.resolve_project_relative_path(session["relative_path"])))
                 subject_item.addChild(session_item)
                 for state in session_states:
                     state_units = by_state.get(str(state["state_record_id"]), [])
@@ -1807,7 +1794,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                     state_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("state", state["state_record_id"]))
                     items_by_identity[("state", str(state["state_record_id"]))] = state_item
                     if state.get("relative_path"):
-                        state_item.setToolTip(0, str(self.store.paths.root / Path(state["relative_path"])))
+                        state_item.setToolTip(0, str(self.store.resolve_project_relative_path(state["relative_path"])))
                     session_item.addChild(state_item)
                     for unit in state_units:
                         inspection_labels = {
@@ -1817,7 +1804,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                             "needs_review": "需复核",
                         }
                         inspection_status = inspection_labels.get(str(unit.get("inspection_status") or "unchecked"), str(unit.get("inspection_status") or "待检查"))
-                        file_name = Path(str(unit.get("source_path") or "")).name
+                        file_name = portable_path_name(str(unit.get("source_path") or ""))
                         data_item = QtWidgets.QTreeWidgetItem([f"{file_name}  [{inspection_status}]"])
                         data_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ("data", unit["data_unit_id"]))
                         items_by_identity[("data", str(unit["data_unit_id"]))] = data_item
@@ -1937,7 +1924,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 self.data_table.setItem(row, 0, use)
                 statuses = status_by_data.get(str(unit["data_unit_id"]), [])
                 validity = f"inspection={unit.get('inspection_status', 'unchecked')}; data={unit['validity_status']}; import={unit.get('import_status', 'ready')}"
-                values = [unit["subject_code"], unit.get("group_label", ""), unit["session_key"], unit["state_display_name"], unit.get("condition_label", ""), "" if unit.get("timepoint_value") is None else f"{unit['timepoint_value']:g} {unit.get('timepoint_unit') or ''}", Path(unit["source_path"]).name, validity, "; ".join(statuses) if statuses else "not run", unit["data_unit_id"]]
+                values = [unit["subject_code"], unit.get("group_label", ""), unit["session_key"], unit["state_display_name"], unit.get("condition_label", ""), "" if unit.get("timepoint_value") is None else f"{unit['timepoint_value']:g} {unit.get('timepoint_unit') or ''}", portable_path_name(unit["source_path"]), validity, "; ".join(statuses) if statuses else "not run", unit["data_unit_id"]]
                 for column, value in enumerate(values, 1):
                     item = QtWidgets.QTableWidgetItem(str(value or ""))
                     if column == 7:
@@ -2004,7 +1991,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 use = QtWidgets.QTableWidgetItem(); use.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                 use.setCheckState(QtCore.Qt.CheckState.Checked if unit["data_unit_id"] in old_selected else QtCore.Qt.CheckState.Unchecked)
                 self.batch_data_table.setItem(row, 0, use)
-                values = [unit["subject_code"], unit["session_key"], unit["state_display_name"], unit.get("condition_label", ""), "" if unit.get("timepoint_value") is None else f"{unit['timepoint_value']:g} {unit.get('timepoint_unit') or ''}", unit.get("inspection_status", "unchecked"), Path(unit["source_path"]).name, unit["data_unit_id"]]
+                values = [unit["subject_code"], unit["session_key"], unit["state_display_name"], unit.get("condition_label", ""), "" if unit.get("timepoint_value") is None else f"{unit['timepoint_value']:g} {unit.get('timepoint_unit') or ''}", unit.get("inspection_status", "unchecked"), portable_path_name(unit["source_path"]), unit["data_unit_id"]]
                 for column, value in enumerate(values, 1):
                     self.batch_data_table.setItem(row, column, QtWidgets.QTableWidgetItem(str(value or "")))
         self._update_batch_selection_label()
@@ -2402,7 +2389,7 @@ class ProjectWorkspace(QtWidgets.QMainWindow):
                 reveal_ids.extend([state_id, data_id])
             except Exception as exc:  # noqa: BLE001 - each import row is independently reportable and retryable
                 failed += 1
-                errors.append(f"{Path(row['source_path']).name}: {type(exc).__name__}: {exc}")
+                errors.append(f"{portable_path_name(row['source_path'])}: {type(exc).__name__}: {exc}")
         self.refresh_all()
         self._reveal_hierarchy_nodes(reveal_ids)
         summary = f"Import finished: {imported} succeeded, {failed} failed, {reused_copy} reused an existing project copy."

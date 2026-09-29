@@ -57,6 +57,23 @@ def test_mim_plot_keeps_raw_value_and_does_not_use_mic_component_axis():
     plt.close(figure)
 
 
+def test_connectivity_spectrum_wraps_long_title_without_losing_labels():
+    prepared = prepare_connectivity(_tables(), "mic", 1, [["M1", "STR"]])
+    figure, axis = plt.subplots(figsize=(5, 3))
+    bands = [
+        {"name": f"band-{index}", "low_hz": float(index), "high_hz": float(index + 1)}
+        for index in range(8)
+    ]
+    plot_spectrum(axis, prepared, bands, title_prefix="LID-T80_all_channels-epo | ")
+    title = axis.get_title()
+    assert "\n" in title
+    assert "LID-T80_all_channels-epo" in title
+    assert "band-0 [0–1 Hz]" in title
+    assert "band-7 [7–8 Hz]" in title
+    figure.canvas.draw()
+    plt.close(figure)
+
+
 def test_multiband_matrices_use_one_colorbar_axis_per_panel():
     tables = _tables()
     prepared = prepare_connectivity(tables, "mic", 1, [["M1", "STR"]])

@@ -11,8 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
-from .gui_engine import build_runtime_config, inspect_file, run_gui_analysis
+from .gui_engine import (
+    build_runtime_config,
+    inspect_file,
+    resolve_manifest_path,
+    run_gui_analysis,
+)
 from .mapping import mapping_rows
+from .portable_paths import portable_path_name
 from .project_store import ProjectStore, utc_now
 from .result_contract import (
     RESULT_SCHEMA_VERSION,
@@ -82,7 +88,7 @@ def _array_paths(metric_record: dict[str, Any]) -> dict[str, str]:
     value = metric_record.get("paths", {}).get("arrays")
     if not value:
         return {}
-    return {"primary": Path(str(value)).name}
+    return {"primary": portable_path_name(str(value))}
 
 
 def _axes_for(metric: str) -> dict[str, list[str]]:
@@ -292,7 +298,7 @@ class ProjectBatchRunner:
     def _index_run(self, unit: dict[str, Any], parameters: dict[str, Any], run_dir: Path, run_manifest: dict[str, Any]) -> None:
         identities = {key: str(unit[key]) for key in ("project_id", "subject_id", "session_id", "state_record_id", "data_unit_id")}
         for file_record in run_manifest.get("files", []):
-            file_dir = run_dir / file_record["file_dir"]
+            file_dir = resolve_manifest_path(run_dir, file_record["file_dir"], "file_dir")
             file_manifest = json.loads((file_dir / "file_manifest.json").read_text(encoding="utf-8"))
             frozen_inspection = dict(file_manifest.get("inspection_snapshot") or {})
             frozen_context = dict(file_manifest.get("project_context") or {})
@@ -377,7 +383,7 @@ class ProjectBatchRunner:
                         "data_unit_id": unit["data_unit_id"],
                         "module_name": metric,
                         "method_name": manifest["method_name"],
-                        "result_path": str(bundle_dir.relative_to(self.store.paths.root)),
+                        "result_path": bundle_dir.relative_to(self.store.paths.root).as_posix(),
                         "schema_version": RESULT_SCHEMA_VERSION,
                         "parameter_fingerprint": manifest["parameter_fingerprint"],
                         "data_fingerprint": manifest["data_fingerprint"],

@@ -71,7 +71,7 @@ The platform records input identity, parameters, valid epochs, effective duratio
 
 LUNA is under active development. The current repository provides a traceable workflow for multichannel, multiregion LFP analysis using preprocessed FIF epochs. It includes a PySide6 desktop GUI, command-line analysis components, configurable metadata, synthetic validation, automated tests, and reusable plotting and export modules.
 
-The current `0.3.0.dev1` development line adds local project management while preserving the single-file descriptive workflow. Raw experimental data are not stored in this repository and are never overwritten by the software. Animal-level inference remains unavailable when animal identity, session, treatment time point, or behavioral linkage is incomplete.
+The current `0.3.0.dev2` development line adds local project management, portable installation paths, optional-backend diagnostics, and cross-platform packaging checks while preserving the single-file descriptive workflow. Raw experimental data are not stored in this repository and are never overwritten by the software. Animal-level inference remains unavailable when animal identity, session, treatment time point, or behavioral linkage is incomplete.
 
 Current methodological safeguards include:
 
@@ -81,6 +81,26 @@ Current methodological safeguards include:
 - retention of full channel-pair information for connectivity analysis;
 - explicit reporting of rank, dimensionality, stability, and method failures;
 - separation of file-level description from animal-level statistical inference.
+
+## Current release and validation boundary
+
+The current source version is `0.3.0.dev2`, published as a GitHub prerelease when the corresponding release tag is created. This is a development snapshot, not a claim that every supported operating system or display configuration has been validated.
+
+Validated for the current release line:
+
+- Windows x64 with Python 3.11.9 in the repository environment and Python 3.12.14 in an isolated wheel environment;
+- 136 automated tests with Qt offscreen tests explicitly enabled, plus Ruff, Python compilation, and `pip check`;
+- the fixed read-only FIF sample: 21 retained epochs, 16 channels, 1000 Hz, 5-second epochs, and 105 seconds of accumulated valid epoch duration;
+- installation-package resource loading, `luna-gui --help`, and `luna-diagnose --self-test-connectivity` on Windows;
+- synthetic execution checks for MIC, MIM, wPLI, debiased squared wPLI, dPLI, imcoh, and coherence.
+
+Not yet equivalent to native validation:
+
+- macOS installation, native Qt rendering, and macOS scientific execution;
+- native Windows mouse/DPI/multi-monitor inspection;
+- real animal-level inference, LDN pairing, AIMs synchronization, and cross-subject statistics when the required metadata are absent.
+
+See [Dependencies and cross-platform support](docs/DEPENDENCIES.md) for the exact environment boundary and diagnostic workflow. The GitHub [release list](https://github.com/dcgggg/LUNA/releases) contains the published prereleases and their wheel assets.
 
 ## The idea behind the name
 
@@ -111,18 +131,22 @@ CHANGELOG.md            Version history and release validation notes
 
 Recommended environment:
 
-- Windows 10/11 (the current version has been validated on Windows)
-- Python 3.11; project constraint: `>=3.11,<3.13`
-- `pip` and a project-local `.venv`
+- Python 3.11 or 3.12; the declared range is `>=3.11,<3.13`. Windows x64 was tested on Python 3.11.9 and 3.12.14. Native macOS workflow is not yet verified.
+- Windows 10/11 is the currently exercised desktop environment. macOS installation paths and CI smoke checks are provided, but native macOS GUI/data workflow has not yet been run on this development machine.
+- A dedicated virtual environment. Install and launch LUNA with the same interpreter; avoid mixing a global install, an old `mouse-lfp-analysis` install, and this checkout in one environment because they share the `lfp_analysis` import namespace.
 
-Create the environment and install LUNA from the repository root:
+### Windows PowerShell
+
+Create the environment and install the GUI plus all currently implemented analysis backends from the repository root:
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e ".[all]"
+python -m pip install -e ".[desktop]"
 ```
+
+Python 3.12 is also validated on Windows x64; replace `py -3.11` with `py -3.12` to create that environment.
 
 If PowerShell blocks script activation, call the environment interpreter directly:
 
@@ -138,7 +162,22 @@ To reproduce the recorded dependency snapshot:
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-`requirements-lock.txt` is an auditable snapshot of the current Windows/Python 3.11 environment. For cross-platform installation, prefer the dependency ranges in `pyproject.toml`.
+`requirements-lock.txt` is an auditable snapshot of the current Windows/Python 3.11 environment, not a portable macOS lockfile. `pyproject.toml` is the maintained source of Python and package version constraints.
+
+### macOS (Apple Silicon or Intel)
+
+Use Python 3.11 for your machine architecture and a fresh environment:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install ".[desktop]"
+python -m lfp_analysis.diagnostics --output luna-diagnostic.json
+luna-gui
+```
+
+From a source checkout, use `python -m pip install -e ".[desktop]"`. For core analysis without the desktop and optional backends, install `python -m pip install .`; add `.[gui]`, `.[connectivity]`, `.[tde]`, or `.[parameterization]` only for features needed. Exact platform wheel availability is controlled by upstream projects; macOS Apple Silicon and Intel still require native validation (see [Dependencies and cross-platform support](docs/DEPENDENCIES.md)).
 
 The default configuration is [`configs/luna.yaml`](configs/luna.yaml), which extends the analysis settings in [`configs/default.yaml`](configs/default.yaml).
 
@@ -155,6 +194,16 @@ Start the desktop GUI from PyCharm by opening [`scripts/run_gui.py`](scripts/run
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_gui.py
 ```
+
+After installing `.[desktop]`, the installed cross-platform command is `luna-gui` (or `python -m lfp_analysis.gui`). To create a shareable, redacted environment report without starting Qt, run `python -m lfp_analysis.diagnostics --output luna-diagnostic.json`; optionally add `--input /path/to/epochs-epo.fif` to inspect FIF header metadata only. To check that the installed connectivity backend can execute each supported MNE-Connectivity method without using study data, add `--self-test-connectivity`; this uses synthetic signals and returns a nonzero exit code if a method fails. The report excludes signal samples and channel names. See [diagnostic and dependency guide](docs/DEPENDENCIES.md).
+
+To confirm that PyCharm or a terminal is using this checkout rather than an older editable installation, run:
+
+```powershell
+\.venv\Scripts\python.exe -c "import lfp_analysis, sys; print(sys.executable); print(lfp_analysis.__file__); print(lfp_analysis.__version__)"
+```
+
+The reported module path should be this checkout or the intended installed wheel environment. If it points to an older project, create a fresh virtual environment and install LUNA there; do not mix the historical `mouse-lfp-analysis` distribution with this checkout.
 
 For a single FIF file without the GUI:
 
@@ -223,9 +272,14 @@ Dependency groups are defined in `pyproject.toml`:
 .[tde]                PyBispectra
 .[parameterization]   specparam and FOOOF
 .[notebook]           JupyterLab, Notebook, and ipykernel
+.[desktop]            PySide6 + all currently implemented optional analysis backends
 .[dev]                pytest and Ruff
 .[all]                All optional analysis, notebook, and development dependencies
 ```
+
+Important: **MNE-Python (`mne`) and MNE-Connectivity (`mne-connectivity`) are separate distributions.** The core install includes MNE-Python for FIF I/O, but MIC, MIM, wPLI, dPLI and the other MNE-Connectivity estimators require the separate `mne-connectivity` package. Install it in the same environment as LUNA with `python -m pip install -e ".[connectivity]"`, or include it via `.[desktop]` / `.[all]`. This project currently requires MNE-Connectivity `>=0.9,<1`; LUNA never silently substitutes another connectivity algorithm when this backend is unavailable. The GUI checks optional backend imports and required API symbols before enabling MIC/MIM/wPLI/dPLI, TDE and FOOOF/specparam; missing methods show the extra needed while core methods remain usable.
+
+MNE-Connectivity brings its own required packages (including `netCDF4`, `xarray` and scikit-learn); PyBispectra brings its numerical dependencies (including Numba/llvmlite and joblib). Install the LUNA extras instead of manually guessing those transitive packages. See the dependency guide for method mapping, platform notes and diagnostics.
 
 ## Analysis conventions and limitations
 
@@ -260,6 +314,10 @@ Detailed guides and method notes are maintained outside the main README:
 - [GUI guide](docs/gui_guide.md)
 - [Analysis plan and implementation notes](docs/analysis_plan.md)
 - [Development and reproducibility commands](docs/DEVELOPMENT.md)
+- [Dependencies and cross-platform support](docs/DEPENDENCIES.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Developer handoff](docs/HANDOFF.md)
+- [Development log](docs/DEV_LOG.md)
 - [Metadata definitions](metadata/README.md)
 - [Project status](docs/PROJECT_STATUS.md)
 - [Project workflow](docs/PROJECT_WORKFLOW.md)

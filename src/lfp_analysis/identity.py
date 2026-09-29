@@ -14,6 +14,8 @@ from typing import Any
 
 import pandas as pd
 
+from .portable_paths import portable_path_name
+
 
 def normalize_path(value: str | Path, base_dir: str | Path | None = None) -> Path:
     """Return an absolute, normalized path without touching the file."""
@@ -93,7 +95,7 @@ def resolve_registry_match(
         return result
 
     basename = normalized_input.name.casefold()
-    fallback = frame.loc[frame["file_path"].map(lambda value: Path(str(value)).name.casefold() == basename)]
+    fallback = frame.loc[frame["file_path"].map(lambda value: portable_path_name(str(value)).casefold() == basename)]
     candidate_ids = fallback.get("file_id", pd.Series(dtype=object)).fillna("").astype(str).tolist()
     if len(fallback) == 1:
         row = fallback.iloc[0].to_dict()

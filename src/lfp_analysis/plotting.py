@@ -74,7 +74,7 @@ def plot_psd(psd_summary: pd.DataFrame, output_base: str | Path, dpi: int = 150,
         axis.set_yscale("log")
         axis.legend(ncol=2, fontsize=7)
     axis.set_xlabel("Frequency (Hz)")
-    axis.set_ylabel("PSD (power²/Hz in source unit)")
+    axis.set_ylabel("PSD (source unit²/Hz)")
     axis.set_title(title)
     axis.grid(True, which="both", color="#dddddd", linewidth=0.4)
     fig.subplots_adjust(left=0.10, right=0.97, bottom=0.12, top=0.90)
@@ -88,12 +88,17 @@ def plot_band_power(band_power: pd.DataFrame, output_base: str | Path, dpi: int 
     for axis, band in zip(axes, bands):
         subset = band_power.loc[band_power["band"] == band]
         summary = subset.groupby("channel_name", as_index=False)["absolute_power"].mean()
+        absolute_unit = (
+            str(subset["absolute_power_unit"].dropna().iloc[0])
+            if "absolute_power_unit" in subset and subset["absolute_power_unit"].notna().any()
+            else "source unit²"
+        )
         metadata = subset[[column for column in ("channel_name", "region") if column in subset.columns]].drop_duplicates().to_dict("records")
         color_map = channel_colors(metadata, DEFAULT_COLOR_TEMPLATE)
         colors_for_bars = [color_map.get(str(name), "#777777") for name in summary["channel_name"]]
         axis.bar(summary["channel_name"], summary["absolute_power"], color=colors_for_bars)
         axis.set_title(f"Band power: {band}")
-        axis.set_ylabel("Absolute power")
+        axis.set_ylabel(f"Absolute power ({absolute_unit})")
         axis.tick_params(axis="x", rotation=90)
         axis.grid(axis="y", color="#dddddd", linewidth=0.4)
     if not bands:

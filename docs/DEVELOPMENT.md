@@ -6,7 +6,7 @@
 
 项目根目录：`C:/Users/PC/Documents/ChatGPT/LID_Tetrode_Analysis`。
 
-当前分支为 `master`，版本为 `0.3.0.dev1`。本地工作区存在本次发布前的未提交修改，接手时不得 reset、checkout、清理或覆盖；最终提交 SHA 以发布后的 Git 记录为准。当前修改涉及 `AGENTS.md`、README、CHANGELOG、项目文档、`gui.py`、`project_gui.py`、`project_store.py`、项目存储测试以及未跟踪的 `docs/screenshots/`；具体以 `git status --short` 为准。
+当前分支为 `master`，项目版本为 `0.3.0.dev2`；remote `origin` 指向 `https://github.com/dcgggg/LUNA.git`。本轮发布前工作区含项目 GUI、绘图、帮助文档、可选依赖诊断、跨平台路径和测试修改；最终提交 SHA 以发布后的 Git 记录为准。不得 reset、checkout、清理或覆盖这些修改；精确范围以 `git status --short` 为准。
 
 ## 2. 环境
 
@@ -52,7 +52,34 @@ GUI：
 git diff --check
 ```
 
-最近一轮核实上述检查均通过：103 项测试通过，Ruff、compileall、pip check 和 `git diff --check` 通过；FOOOF 兼容后端有第三方弃用警告。`scripts/run_gui.py --help`、`scripts/read_project_results.py --help` 通过。固定只读文件为 `C:/Users/PC/Documents/ChatGPT/testdata/LID-T80_all_channels-epo.fif`，历史读取结果为 21×16×5000、1000 Hz、4.999 s/epoch，4 个非空 `drop_log` 条目，身份仍未解析。真实 Windows 鼠标、系统 DPI 和多显示器不在本环境的验证范围内。
+中文分析读图说明和数据字典的唯一内容源为 `src/lfp_analysis/analysis_help_content.py`；更新后运行：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/build_analysis_docs.py
+.\.venv\Scripts\python.exe -m pytest -q tests/test_analysis_help.py
+```
+
+## 跨系统项目路径
+
+项目数据库与保存清单中的内部相对路径写为 `/` 分隔。读取器通过 `lfp_analysis.portable_paths` 同时接受旧 Windows `\` 路径，并拒绝绝对路径、`..` 与通过符号链接逃离项目目录的目标。移动整个项目时，项目内部复制的数据和 LUNA 结果可随项目重载；数据库若记录外部源文件，则仍须在新电脑显式重新定位，不能用同名文件自动替代。具体回归与平台限制见 `docs/PROJECT_STATUS.md` 最新的项目迁移条目。
+
+GUI 的“如何读图”按钮及帮助菜单读取同一内容源，不需要联网或调用模型服务。
+
+2026-09-28 本轮核实：项目 `.venv` Python 3.11 当前全量124项通过（含显式启用 Qt offscreen 窗口测试），Ruff、compileall、pip check、`git diff --check` 通过；另创建临时 Python 3.12.14 x64 环境，按 `.[desktop,dev]` 安装后既有全量120项测试、Ruff、compileall、依赖一致性均通过。固定只读文件 `C:/Users/PC/Documents/ChatGPT/testdata/LID-T80_all_channels-epo.fif` 哈希为 `2751bce6cdad2a17d7ba72978b0b59221f8265dd27d9c77a8e77600ed75a0582`，21×16×5000、1000 Hz，动物身份未解析。Python 3.12 环境又以显式 QC 通道分组运行 MIC/MIM/wPLI/dPLI/wPLI²-debiased，保存并重载完整连接 CSV 成功；样例源哈希未变。仅 GUI 的 Python 3.12 环境未安装所有可选分析后端，但 GUI PSD 分析、结果表与 manifest 保存/重载和关窗均通过。FOOOF 弃用、Matplotlib Qt 高 DPI 枚举弃用及连接表混合 metadata 的 pandas `DtypeWarning` 均如实保留。没有 macOS 主机；macOS 原生 GUI/数据流程仍未验证。
+
+2026-09-28 补充跨平台依赖解析：临时 uv 解析器以 `--only-binary :all:` 分别为 macOS arm64/x86_64、Python 3.11/3.12 解析 `.[desktop,dev]`，四种目标均成功（每种52个包）。这是当前包索引下的预编译发行件解析证据，不代表这些 wheel 已在 macOS 安装、导入或运行。详见 `docs/DEPENDENCIES.md`。
+
+2026-09-28 补充可选后端缺失行为：Windows x64/Python 3.12.14 临时 `.[gui]` 环境实际未安装 mne-connectivity、pybispectra、specparam、fooof，offscreen MainWindow 与固定只读 FIF 读取通过；MIC、TDE、FOOOF 禁用，PSD可用。完整错误诊断及本次修复见 `docs/DEV_LOG.md`。
+
+2026-09-28 补充 CI 的 GUI 覆盖：原有四项 Qt 窗口测试曾在 `CI=true` 时无条件跳过。现在需设置 `LUNA_RUN_QT_TESTS=1` 才在 CI offscreen 环境启用，GitHub Actions 已设置该开关；新增合成 FIF GUI 集成检查，覆盖 MainWindow 异步导入、运行 PSD、保存结果并在新窗口载入历史结果。本机以 `CI=true`, `QT_QPA_PLATFORM=offscreen`, `LUNA_RUN_QT_TESTS=1` 执行全量 124 项通过。此为 Windows 本机 offscreen 证据，Mac runner 尚未运行。
+
+2026-09-29 补充：当前 Windows x64/Python 3.11 全量 129 项通过；诊断器按 PySide6 子模块 API 核验 QtCore/QtWidgets。新增 `luna-diagnose --self-test-connectivity` 合成 smoke test，执行七种 MNE-Connectivity 方法并区分缺依赖/计算失败。当前 wheel 在全新 Python 3.11 venv 中仅安装 `.[desktop]` 后，`pip check`、诊断、GUI CLI 帮助和 PySide6 offscreen 主窗口创建/关闭通过，Logo/YAML 资源可用；同一隔离环境又用固定 FIF 完成五种 GUI 连接方法计算、保存和重载，身份未解析、通道使用临时 QC 标签。另一次纯诊断参数传入 FIF 时仅核对文件头，未载入样本。Ruff、compileall、pip check、git diff --check 通过；Mac 和远端故障机仍未验证。详情见 `docs/DEPENDENCIES.md` 与 `docs/DEV_LOG.md`。
+
+2026-09-29 补充安装包回归：在全新 Windows wheel venv 中确认测试导入路径指向安装后的 `site-packages`，运行完整测试套件 129 passed、81 warnings（Matplotlib Qt 高 DPI 与 FOOOF 上游弃用，28.82秒）。这不是 macOS 或其他电脑验证。
+
+2026-09-29 CI诊断附件：平台 smoke matrix 在每个 job 结束后上传脱敏的常规诊断与合成连接诊断 JSON，按 OS/Python 版本分开、保留7天。工作流仍是本地未提交改动，需远端触发后才能验证实际上传。
+
+2026-09-29 核心版缺可选依赖验证：干净 Windows wheel venv 仅安装核心包时，`python -m lfp_analysis.diagnostics` 正常运行；连接自检标记 `dependency_unavailable`、指出 `.[connectivity]` 并退出2。`pip check` 通过，未读取真实数据。
 
 ## 4. 主要调用链
 

@@ -53,6 +53,25 @@ def test_band_power_summary_only_table_is_supported() -> None:
     assert set(prepared["summary"]["n_epochs"]) == {2}
 
 
+def test_band_power_restores_missing_region_labels_from_saved_channel_table() -> None:
+    source = _band_table().drop(columns=["physical_channel_number", "region"])
+    source_before = source.copy(deep=True)
+    channel_table = _band_table(False)[
+        ["channel_array_index", "channel_name", "physical_channel_number", "region"]
+    ].drop_duplicates("channel_name")
+
+    prepared = prepare_band_power(
+        {"band_power_epoch_channel": source, "channel_table": channel_table},
+        selected_regions=["M1"],
+    )
+
+    assert not prepared["epoch"].empty
+    assert set(prepared["epoch"]["region"]) == {"M1"}
+    assert set(prepared["epoch"]["channel_name"]) == {"M1-1"}
+    assert set(prepared["epoch"]["physical_channel_number"]) == {"1"}
+    pd.testing.assert_frame_equal(source, source_before)
+
+
 def test_band_power_plots_keep_two_requested_plot_structures() -> None:
     import matplotlib
 

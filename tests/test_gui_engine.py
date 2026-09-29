@@ -24,10 +24,13 @@ def test_saved_run_schema_is_checked_and_legacy_schema_is_readable(tmp_path):
 
 def test_saved_run_paths_must_stay_inside_run_directory(tmp_path):
     assert resolve_manifest_path(tmp_path, "file/quality.csv").parent == tmp_path / "file"
+    assert resolve_manifest_path(tmp_path, r"file\quality.csv") == tmp_path / "file" / "quality.csv"
     with pytest.raises(ValueError, match="escapes"):
         resolve_manifest_path(tmp_path, "../outside.csv")
     with pytest.raises(ValueError, match="relative"):
         resolve_manifest_path(tmp_path, tmp_path / "outside.csv")
+    with pytest.raises(ValueError, match="relative"):
+        resolve_manifest_path(tmp_path, r"C:\outside\quality.csv")
 
 
 def test_per_file_epoch_selection_is_not_silently_clipped(tmp_path):

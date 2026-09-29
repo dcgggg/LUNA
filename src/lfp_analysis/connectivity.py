@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import traceback
 from itertools import combinations
 from typing import Any
 
@@ -32,6 +33,8 @@ FAILURE_COLUMNS = [
     "rank_seed",
     "rank_target",
     "n_components_requested",
+    "failure_stage",
+    "failure_traceback",
 ]
 ESTIMATION_CALL_COLUMNS = [
     "analysis_task_id",
@@ -68,6 +71,7 @@ ESTIMATION_CALL_COLUMNS = [
     "status",
     "elapsed_s",
     "error",
+    "error_traceback",
 ]
 
 
@@ -363,6 +367,7 @@ def _finish_estimation_call(call: dict[str, Any], result: list[Any] | None = Non
     call["status"] = "failed" if error is not None else "ok"
     if error is not None:
         call["error"] = f"{type(error).__name__}: {error}"
+        call["error_traceback"] = "".join(traceback.format_exception(type(error), error, error.__traceback__))
 
 
 def _estimate_multivariate(
@@ -1206,6 +1211,8 @@ def _append_bivariate_rows(
                 "rank_seed": rank_seed,
                 "rank_target": rank_target,
                 "n_components_requested": np.nan,
+                "failure_stage": "connectivity_estimation_or_result_validation",
+                "failure_traceback": traceback.format_exc(),
             }
         )
 
@@ -1283,6 +1290,46 @@ def compute_connectivity(
             }
         )
         return empty
+    requested_backend_methods = [method for method in methods if method in MULTIVARIATE_METHODS or method in BIVARIATE_METHODS]
+    if requested_backend_methods:
+        try:
+            _load_connectivity_api()
+        except Exception as exc:  # noqa: BLE001 - classify unavailable/broken backend before expensive rank checks
+            failure_traceback = traceback.format_exc()
+            failures = [
+                {
+                    "region_a": region_a,
+                    "region_b": region_b,
+                    "method": method,
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                    "n_epochs": n_valid,
+                    "rank_seed": region_info["rank_map"].get(region_a, np.nan),
+                    "rank_target": region_info["rank_map"].get(region_b, np.nan),
+                    "n_components_requested": requested_components if method == "mic" else np.nan,
+                    "failure_stage": "connectivity_backend_import",
+                    "failure_traceback": failure_traceback,
+                }
+                for region_a, region_b in pairs_to_run
+                for method in requested_backend_methods
+            ]
+            empty.update(
+                {
+                    "status": "not_run_connectivity_backend_unavailable",
+                    "redundancy_correlation": region_info["correlation"],
+                    "redundancy_singular_values": region_info["singular_values"],
+                    "rank_summary": region_info["summary"],
+                    "failures": pd.DataFrame(failures, columns=FAILURE_COLUMNS),
+                    "metadata": {
+                        "methods_requested": methods,
+                        "selected_region_pairs": [list(pair) for pair in pairs_to_run],
+                        "n_valid_epochs": n_valid,
+                        "effective_valid_duration_s": effective_duration,
+                        "failure_stage": "connectivity_backend_import",
+                        "backend": "mne-connectivity",
+                    },
+                }
+            )
+            return empty
     rows: list[dict[str, Any]] = []
     pattern_rows: list[dict[str, Any]] = []
     failure_rows: list[dict[str, Any]] = []
@@ -1305,6 +1352,8 @@ def compute_connectivity(
                     "rank_seed": rank_seed,
                     "rank_target": rank_target,
                     "n_components_requested": requested_components,
+                    "failure_stage": "mic_parameter_validation",
+                    "failure_traceback": "",
                 }
             )
             multivariate_methods.remove("mic")
@@ -1319,6 +1368,8 @@ def compute_connectivity(
                     "rank_seed": rank_seed,
                     "rank_target": rank_target,
                     "n_components_requested": requested_components,
+                    "failure_stage": "mic_parameter_validation",
+                    "failure_traceback": "",
                 }
             )
             multivariate_methods.remove("mic")
@@ -1378,6 +1429,8 @@ def compute_connectivity(
                         "rank_seed": rank_seed,
                         "rank_target": rank_target,
                         "n_components_requested": requested_components,
+                        "failure_stage": "multivariate_estimation_or_result_parse",
+                        "failure_traceback": traceback.format_exc(),
                     }
                 )
         bivariate_methods = [method for method in BIVARIATE_METHODS if method in methods]
@@ -1433,11 +1486,12 @@ def compute_connectivity(
         empty.update({"status": "failed_empty_result", "redundancy_correlation": region_info["correlation"], "redundancy_singular_values": region_info["singular_values"], "rank_summary": region_info["summary"], "failures": pd.DataFrame(failure_rows, columns=FAILURE_COLUMNS), "estimation_calls": pd.DataFrame(call_log, columns=ESTIMATION_CALL_COLUMNS)})
         return empty
     frequency_products = _frequency_products(spectrum, config)
+    region_summary = _summarize_region_spectrum(spectrum, config)
     empty.update(
         {
             "status": "ok" if not failure_rows else "ok_with_pair_failures",
             "spectrum": spectrum,
-            "region_summary": _summarize_region_spectrum(spectrum, config),
+            "region_summary": region_summary,
             "band_summary": _band_summary(spectrum, config),
             "channel_pair_band_summary": _channel_pair_band_summary(spectrum, config),
             "patterns": pd.DataFrame(pattern_rows),
@@ -1469,7 +1523,7 @@ def compute_connectivity(
                 **estimate_multitaper_metadata(array_data.shape[-1], sfreq, config),
                 "frequency_range_hz": [float(conn_cfg.get("fmin_hz", 2.0)), float(conn_cfg.get("fmax_hz", 100.0))],
                 "raw_spectrum_long_shape": [int(spectrum.shape[0]), int(spectrum.shape[1])],
-                "region_summary_shape": [int(empty["region_summary"].shape[0]), int(empty["region_summary"].shape[1])],
+                "region_summary_shape": [int(region_summary.shape[0]), int(region_summary.shape[1])],
                 "plot_frequency_indices_note": "plot_frequency_index is zero-based within each method in connectivity_frequency_diagnostics.csv",
                 "frequency_step_hz": round(float(np.median(np.diff(np.sort(spectrum["frequency_hz"].dropna().unique())))), 10) if spectrum["frequency_hz"].nunique() > 1 else np.nan,
                 "frequency_grid_definition": "MNE-Connectivity multitaper frequency grid; full grid retained in connectivity_spectrum.csv",

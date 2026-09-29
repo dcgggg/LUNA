@@ -186,25 +186,37 @@ class ConnectivityView(QtWidgets.QWidget):
         self._is_tde = False
 
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(6)
-        controls = QtWidgets.QGridLayout()
-        controls.setHorizontalSpacing(8)
-        controls.setVerticalSpacing(6)
+        root.setContentsMargins(3, 3, 3, 3)
+        root.setSpacing(4)
         self.metric_combo = QtWidgets.QComboBox()
         self.metric_combo.setToolTip("当前结果中的连接指标；切换只刷新展示，不重新计算。")
-        self.pair_group = _PairCheckGroup()
+        self.pair_group = _PairCheckGroup(self)
+        self.pair_group.hide()
         self.pair_list = self.pair_group  # compatibility alias for existing callers
-        self.pair_scroll = QtWidgets.QScrollArea()
+        self.pair_scroll = QtWidgets.QScrollArea(self)
         self.pair_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.pair_scroll.setWidgetResizable(True)
         self.pair_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.pair_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.pair_scroll.setWidget(self.pair_group)
         self.pair_scroll.setMaximumHeight(104)
+        self.pair_scroll.hide()
         self.pair_scroll.setToolTip("脑区对按行排列；窗口变窄时自动换行，脑区较多时可纵向滚动。")
-        self.band_list = _BandCheckGroup()
+        self.band_list = _BandCheckGroup(self)
+        self.band_list.hide()
         self.band_list.setToolTip("勾选需要同时显示的频段；矩阵将按两列网格展示。")
+        self.band_selection_button = QtWidgets.QToolButton()
+        self.band_selection_button.setText("频带 0/0")
+        self.band_selection_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.band_selection_menu = QtWidgets.QMenu(self.band_selection_button)
+        self.band_selection_button.setMenu(self.band_selection_menu)
+        self.band_selection_button.setToolTip("勾选需要显示的频带；只刷新当前结果的图形与矩阵。")
+        self.pair_selection_button = QtWidgets.QToolButton()
+        self.pair_selection_button.setText("脑区对 0/0")
+        self.pair_selection_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.pair_selection_menu = QtWidgets.QMenu(self.pair_selection_button)
+        self.pair_selection_button.setMenu(self.pair_selection_menu)
+        self.pair_selection_button.setToolTip("勾选要显示的脑区对；有向指标仍按结果中的 seed/target 方向解释。")
         self.component_combo = QtWidgets.QComboBox()
         self.scale_combo = QtWidgets.QComboBox()
         self.scale_combo.addItem("线性", "linear")
@@ -236,36 +248,77 @@ class ConnectivityView(QtWidgets.QWidget):
         self.font_spin = QtWidgets.QSpinBox()
         self.font_spin.setRange(7, 18)
         self.font_spin.setValue(9)
+        self.metric_label = QtWidgets.QLabel("Indicator")
+        self.scale_label = QtWidgets.QLabel("坐标尺度")
+        self.matrix_level_label = QtWidgets.QLabel("矩阵层级")
+        self.font_label = QtWidgets.QLabel("字号")
         self.component_label = QtWidgets.QLabel("MIC 成分")
-        self.band_label = QtWidgets.QLabel("Frequency bands display")
+        self.band_label = QtWidgets.QLabel("频带")
+        self.pair_label = QtWidgets.QLabel("脑区对（可多选）")
         self.spectrum_view_label = QtWidgets.QLabel("频谱视图")
-        fields = (
-            ("Indicator", self.metric_combo),
-            ("坐标尺度", self.scale_combo),
-            ("矩阵层级", self.matrix_level_combo),
-            ("字号", self.font_spin),
-            ("MIC 成分", self.component_combo),
-            ("", QtWidgets.QWidget()),
+        self.more_settings_button = QtWidgets.QToolButton()
+        self.more_settings_button.setText("更多绘图设置 ▾")
+        self.more_settings_button.setCheckable(True)
+        self.more_settings_button.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.more_settings_button.toggled.connect(self._toggle_more_settings)
+
+        # Keep the frequently used selectors in the fixed result header;
+        # display-only tuning stays available in a compact, collapsed panel.
+        common_row = QtWidgets.QHBoxLayout()
+        common_row.setSpacing(6)
+        common_row.addWidget(self.metric_label)
+        common_row.addWidget(self.metric_combo)
+        common_row.addWidget(self.component_label)
+        common_row.addWidget(self.component_combo)
+        common_row.addWidget(self.more_settings_button)
+        common_row.addStretch(1)
+        root.addLayout(common_row)
+
+        self.band_label.setMinimumWidth(self.band_label.sizeHint().width())
+        self.pair_label.setMinimumWidth(self.pair_label.sizeHint().width())
+        selection_row = QtWidgets.QHBoxLayout()
+        selection_row.setContentsMargins(0, 0, 0, 0)
+        selection_row.setSpacing(6)
+        selection_row.addWidget(self.band_label)
+        selection_row.addWidget(self.band_selection_button)
+        selection_row.addSpacing(10)
+        selection_row.addWidget(self.pair_label)
+        selection_row.addWidget(self.pair_selection_button)
+        selection_row.addStretch(1)
+        root.addLayout(selection_row)
+        self.more_settings_panel = QtWidgets.QWidget()
+        advanced = QtWidgets.QGridLayout(self.more_settings_panel)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        advanced.setHorizontalSpacing(8)
+        advanced.setVerticalSpacing(4)
+        advanced.addWidget(self.scale_label, 0, 0)
+        advanced.addWidget(self.scale_combo, 0, 1)
+        advanced.addWidget(self.matrix_level_label, 0, 2)
+        advanced.addWidget(self.matrix_level_combo, 0, 3)
+        advanced.addWidget(self.font_label, 0, 4)
+        advanced.addWidget(self.font_spin, 0, 5)
+        advanced.addWidget(self.swap_matrix_check, 1, 0, 1, 2)
+        advanced.addWidget(self.spectrum_view_label, 1, 2)
+        advanced.addWidget(self.spectrum_view_combo, 1, 3)
+        advanced.addWidget(self.display_smoothing_check, 1, 4, 1, 2)
+        advanced.addWidget(self.line_noise_display_label, 2, 0)
+        advanced.addWidget(self.line_noise_display_widget, 2, 1, 1, 5)
+        root.addWidget(self.more_settings_panel)
+        self._advanced_control_widgets = (
+            self.scale_label,
+            self.scale_combo,
+            self.matrix_level_label,
+            self.matrix_level_combo,
+            self.font_label,
+            self.font_spin,
+            self.swap_matrix_check,
+            self.spectrum_view_label,
+            self.spectrum_view_combo,
+            self.display_smoothing_check,
+            self.line_noise_display_label,
+            self.line_noise_display_widget,
         )
-        for index, (label, widget) in enumerate(fields):
-            if not label:
-                continue
-            row = index // 4
-            column = (index % 4) * 2
-            label_widget = self.component_label if label == "MIC 成分" else QtWidgets.QLabel(label)
-            controls.addWidget(label_widget, row, column)
-            controls.addWidget(widget, row, column + 1)
-        controls.addWidget(self.swap_matrix_check, 1, 2, 1, 2)
-        controls.addWidget(self.spectrum_view_label, 1, 4)
-        controls.addWidget(self.spectrum_view_combo, 1, 5)
-        controls.addWidget(self.display_smoothing_check, 1, 6, 1, 2)
-        controls.addWidget(self.line_noise_display_label, 2, 0)
-        controls.addWidget(self.line_noise_display_widget, 2, 1, 1, 7)
-        controls.addWidget(self.band_label, 3, 0)
-        controls.addWidget(self.band_list, 3, 1, 1, 7)
-        controls.addWidget(QtWidgets.QLabel("脑区对（可多选）"), 4, 0)
-        controls.addWidget(self.pair_scroll, 4, 1, 1, 7)
-        root.addLayout(controls)
+        self.more_settings_panel.setVisible(False)
 
         # Keep a small compatibility alias for callers that used the former
         # single-band combo; new code always reads the checked band list.
@@ -283,7 +336,7 @@ class ConnectivityView(QtWidgets.QWidget):
 
         self.status_label = QtWidgets.QLabel("连接结果尚未载入")
         self.status_label.setWordWrap(True)
-        self.status_label.setMaximumHeight(44)
+        self.status_label.setMaximumHeight(36)
         root.addWidget(self.status_label)
         plot_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.spectrum_figure, self.spectrum_canvas = self._new_canvas()
@@ -371,7 +424,7 @@ class ConnectivityView(QtWidgets.QWidget):
         root.addWidget(self.plot_scroll, stretch=1)
 
         self.metric_combo.currentIndexChanged.connect(self._controls_changed)
-        self.band_list.changed.connect(self._controls_changed)
+        self.band_list.changed.connect(self._selection_groups_changed)
         self.component_combo.currentIndexChanged.connect(self._controls_changed)
         self.scale_combo.currentIndexChanged.connect(self._controls_changed)
         self.matrix_level_combo.currentIndexChanged.connect(self._controls_changed)
@@ -381,12 +434,16 @@ class ConnectivityView(QtWidgets.QWidget):
         self.display_smoothing_check.stateChanged.connect(self._controls_changed)
         self.line_noise_markers_check.stateChanged.connect(self._controls_changed)
         self.line_noise_exclusion_check.stateChanged.connect(self._controls_changed)
-        self.pair_group.changed.connect(self._controls_changed)
+        self.pair_group.changed.connect(self._selection_groups_changed)
         self.pattern_pair_combo.currentIndexChanged.connect(self._controls_changed)
         self.pattern_component_combo.currentIndexChanged.connect(self._controls_changed)
         self.pattern_frequency_combo.currentIndexChanged.connect(self._controls_changed)
         self.pattern_mode_combo.currentIndexChanged.connect(self._controls_changed)
         self.matrix_canvas.mpl_connect("button_press_event", self._matrix_clicked)
+
+    def _toggle_more_settings(self, expanded: bool) -> None:
+        self.more_settings_panel.setVisible(expanded)
+        self.more_settings_button.setText("收起绘图设置 ▴" if expanded else "更多绘图设置 ▾")
 
     @staticmethod
     def _new_canvas() -> tuple[Figure, FigureCanvasQTAgg]:
@@ -435,13 +492,10 @@ class ConnectivityView(QtWidgets.QWidget):
         if self._is_tde:
             self._populate_tde_controls()
             return
-        self.matrix_level_combo.setVisible(True)
-        self.swap_matrix_check.setVisible(True)
-        self.spectrum_view_label.setVisible(True)
-        self.spectrum_view_combo.setVisible(True)
-        self.display_smoothing_check.setVisible(True)
-        self.line_noise_display_label.setVisible(True)
-        self.line_noise_display_widget.setVisible(True)
+        self.more_settings_button.setVisible(True)
+        for widget in self._advanced_control_widgets:
+            widget.setVisible(True)
+        self.more_settings_panel.setVisible(self.more_settings_button.isChecked())
         tables = self._tables()
         methods = available_methods(tables)
         old_method = self._current_method()
@@ -465,6 +519,7 @@ class ConnectivityView(QtWidgets.QWidget):
             self.band_list.clear()
             for band in available_bands(tables):
                 self.band_list.add_item(band, checked=not old_band_names or str(band["name"]) in old_band_names)
+            self._rebuild_selection_menu(self.band_selection_menu, self.band_list)
             had_pair_items = self.pair_group.count() > 0
             old_selected_pairs = set(self._selected_pairs())
             self.pair_group.clear()
@@ -486,6 +541,7 @@ class ConnectivityView(QtWidgets.QWidget):
             for region_a, region_b in pairs:
                 pair = (region_a, region_b)
                 self.pair_group.add_item(pair, checked=(not had_pair_items or pair in old_selected_pairs))
+            self._rebuild_selection_menu(self.pair_selection_menu, self.pair_group)
             self._update_matrix_level_options()
             self._populate_pattern_controls()
         finally:
@@ -498,17 +554,17 @@ class ConnectivityView(QtWidgets.QWidget):
         band_summary = tables.get("band_summary", pd.DataFrame())
         self._updating = True
         try:
+            with QtCore.QSignalBlocker(self.more_settings_button):
+                self.more_settings_button.setChecked(False)
+            self.more_settings_button.setText("更多绘图设置 ▾")
+            self.more_settings_button.setVisible(False)
+            self.more_settings_panel.setVisible(False)
+            for widget in self._advanced_control_widgets:
+                widget.setVisible(False)
             self.metric_combo.clear()
             self.metric_combo.addItem("TDE（时间延迟）", "tde")
             self.component_label.setVisible(False)
             self.component_combo.setVisible(False)
-            self.matrix_level_combo.setVisible(False)
-            self.swap_matrix_check.setVisible(False)
-            self.spectrum_view_label.setVisible(False)
-            self.spectrum_view_combo.setVisible(False)
-            self.display_smoothing_check.setVisible(False)
-            self.line_noise_display_label.setVisible(False)
-            self.line_noise_display_widget.setVisible(False)
             self.band_list.clear()
             bands = []
             source = band_summary if isinstance(band_summary, pd.DataFrame) and not band_summary.empty else region_spectrum
@@ -517,6 +573,7 @@ class ConnectivityView(QtWidgets.QWidget):
                     bands.append({"name": str(row.frequency_band), "low_hz": float(row.band_low_hz), "high_hz": float(row.band_high_hz)})
             for band in bands:
                 self.band_list.add_item(band, checked=True)
+            self._rebuild_selection_menu(self.band_selection_menu, self.band_list)
             had_pair_items = self.pair_group.count() > 0
             old_selected_pairs = set(self._selected_pairs())
             self.pair_group.clear()
@@ -527,6 +584,7 @@ class ConnectivityView(QtWidgets.QWidget):
                     if self.selected_regions and not set(pair).issubset(self.selected_regions):
                         continue
                     self.pair_group.add_item(pair, checked=(not had_pair_items or pair in old_selected_pairs))
+            self._rebuild_selection_menu(self.pair_selection_menu, self.pair_group)
             self._populate_pattern_controls()
         finally:
             self._updating = False
@@ -769,6 +827,39 @@ class ConnectivityView(QtWidgets.QWidget):
 
     def _selected_bands(self) -> list[dict[str, Any]]:
         return self.band_list.checked_data()
+
+    def _rebuild_selection_menu(self, menu: QtWidgets.QMenu, group: QtWidgets.QWidget) -> None:
+        """Mirror existing checkboxes in a compact fixed toolbar menu."""
+        menu.clear()
+        checks = getattr(group, "_checks", [])
+        for checkbox, _value in checks:
+            action = menu.addAction(checkbox.text())
+            action.setCheckable(True)
+            action.setChecked(checkbox.isChecked())
+            action.toggled.connect(checkbox.setChecked)
+            checkbox.toggled.connect(action.setChecked)
+        self._update_selection_button_texts()
+
+    def _update_selection_button_texts(self) -> None:
+        bands = getattr(self, "band_list", None)
+        pairs = getattr(self, "pair_group", None)
+        if bands is not None and hasattr(self, "band_selection_button"):
+            selected = bands.checked_data()
+            self.band_selection_button.setText(f"频带 {len(selected)}/{bands.count()}")
+            band_names = [str(item.get("name", "")) for item in selected]
+            self.band_selection_button.setToolTip("已选频带：" + ("、".join(band_names) if band_names else "无；图中将不显示频带结果"))
+        if pairs is not None and hasattr(self, "pair_selection_button"):
+            selected_pairs = pairs.checked_data()
+            self.pair_selection_button.setText(f"脑区对 {len(selected_pairs)}/{pairs.count()}")
+            pair_names = [pair_label(*pair) for pair in selected_pairs]
+            self.pair_selection_button.setToolTip(
+                "已选脑区对：" + ("、".join(pair_names) if pair_names else "无；图中将不显示连接结果")
+                + "。有向指标仍按保存结果中的 seed/target 方向解释。"
+            )
+
+    def _selection_groups_changed(self, *_args: Any) -> None:
+        self._update_selection_button_texts()
+        self._controls_changed()
 
     def _selected_band_names(self) -> set[str]:
         return {str(band.get("name", "")) for band in self._selected_bands()}

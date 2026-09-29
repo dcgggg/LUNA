@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import os
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -9,6 +11,11 @@ import pytest
 
 from lfp_analysis.gui_engine import build_runtime_config
 from lfp_analysis.gui_specs import normalize_gui_values, validate_snapshot
+
+_SKIP_QT_WINDOW_TESTS = (
+    os.environ.get("CI", "").lower() == "true"
+    and os.environ.get("LUNA_RUN_QT_TESTS") != "1"
+)
 
 
 def _channel_table() -> pd.DataFrame:
@@ -48,6 +55,34 @@ def test_gui_validation_rejects_welch_window_longer_than_selection() -> None:
     snapshot = _snapshot(values={**_values(), "psd": {**_values()["psd"], "window_seconds": 6.0}})
     errors, _warnings = validate_snapshot(snapshot, 1000.0, 5000, 5, _channel_table())
     assert any("超过选定时间窗" in error for error in errors)
+
+
+def test_worker_emits_failure_even_when_diagnostic_write_fails(monkeypatch, tmp_path) -> None:
+    from lfp_analysis import gui as gui_module
+
+    def fail_analysis(*_args, **_kwargs):
+        raise RuntimeError("connectivity backend failed")
+
+    def fail_report(*_args, **_kwargs):
+        raise PermissionError("diagnostic directory is read-only")
+
+    monkeypatch.setattr(gui_module, "run_gui_analysis", fail_analysis)
+    monkeypatch.setattr(gui_module, "write_failure_report", fail_report)
+    monkeypatch.setattr(gui_module, "default_log_directory", lambda _root: tmp_path)
+    worker = gui_module.AnalysisWorker(
+        {"run_id": "diagnostic-write-failure", "indicators": ["MIC"], "values": {"connectivity": {"n_jobs": 1}}},
+        tmp_path / "config.yaml",
+        tmp_path / "metadata",
+    )
+    outcomes = []
+    worker.finished.connect(outcomes.append)
+
+    worker.run()
+
+    assert len(outcomes) == 1
+    assert outcomes[0]["manifest"]["status"] == "failed"
+    assert "connectivity backend failed" in outcomes[0]["manifest"]["errors"][0]
+    assert "diagnostic directory is read-only" in outcomes[0]["diagnostic_report_error"]
 
 
 def test_analysis_parameter_change_does_not_refresh_raw_preview() -> None:
@@ -120,6 +155,47 @@ def test_runtime_config_maps_multitaper_psd_parameters() -> None:
     assert not errors
 
 
+def test_gui_optional_parameterization_check_uses_configured_backend(monkeypatch) -> None:
+    from lfp_analysis import gui as gui_module
+    from lfp_analysis.gui import MainWindow
+
+    calls = []
+
+    def availability(method, **kwargs):
+        calls.append((method, kwargs))
+        return False, "backend unavailable"
+
+    monkeypatch.setattr(gui_module, "optional_method_availability", availability)
+    window_stub = SimpleNamespace(base_config={"parameterization": {"backend": "fooof"}})
+
+    assert MainWindow._optional_method_availability(window_stub, "FOOOF") == (False, "backend unavailable")
+    assert calls == [("FOOOF", {"parameterization_backend": "fooof"})]
+
+
+def test_close_event_tolerates_a_qthread_already_deleted_by_qt() -> None:
+    pytest.importorskip("PySide6")
+    import shiboken6
+    from PySide6 import QtCore, QtGui
+
+    from lfp_analysis.gui import MainWindow
+
+    app = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
+    thread = QtCore.QThread()
+    thread.deleteLater()
+    app.sendPostedEvents(thread, QtCore.QEvent.Type.DeferredDelete)
+    assert not shiboken6.isValid(thread)
+
+    fake_window = SimpleNamespace(
+        _inspection_save_pending=False,
+        analysis_worker=None,
+        analysis_thread=None,
+        inspect_thread=thread,
+    )
+    event = QtGui.QCloseEvent()
+    MainWindow.closeEvent(fake_window, event)
+    assert event.isAccepted()
+
+
 def test_runtime_config_passes_only_active_welch_parameters() -> None:
     snapshot = _snapshot()
     config = build_runtime_config({}, snapshot, 1000.0, 5000)
@@ -147,22 +223,64 @@ def test_psd_normalization_does_not_mutate_values_and_drops_inactive_branch() ->
     assert "nperseg" not in normalized["psd"]
 
 
-@pytest.mark.skipif(os.environ.get("CI") == "true", reason="Qt window test is local/offscreen")
-def test_main_window_constructs_offscreen(monkeypatch) -> None:
+@pytest.mark.skipif(_SKIP_QT_WINDOW_TESTS, reason="Set LUNA_RUN_QT_TESTS=1 to opt into offscreen Qt window tests in CI")
+def test_main_window_constructs_offscreen(monkeypatch, request, tmp_path) -> None:
     pytest.importorskip("PySide6")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PySide6 import QtCore, QtWidgets
     from PySide6.QtWidgets import QApplication
 
+    from lfp_analysis import gui as gui_module
     from lfp_analysis.gui import (
         GLOBAL_ACTION_HEIGHT,
-        HEADER_PANEL_HEIGHT,
+        HEADER_LOGO_HEIGHT,
+        HEADER_LOGO_WIDTH,
         RESULT_TABLE_EXPANDED_HEIGHT,
         MainWindow,
     )
 
     app = QApplication.instance() or QApplication([])
+    settings_class = QtCore.QSettings
+    settings_file = tmp_path / "LUNA.ini"
+
+    def isolated_qsettings(organization: str, application: str):
+        if (organization, application) == ("LUNA", "LUNA"):
+            return settings_class(str(settings_file), settings_class.Format.IniFormat)
+        return settings_class(organization, application)
+
+    monkeypatch.setattr(gui_module.QtCore, "QSettings", isolated_qsettings)
+    splitter_settings = settings_class(str(settings_file), settings_class.Format.IniFormat)
+    assert Path(splitter_settings.fileName()).resolve() == settings_file.resolve()
+    splitter_settings.sync()
+    had_saved_width = splitter_settings.contains("main_analysis_panel_width")
+    saved_width = splitter_settings.value("main_analysis_panel_width")
+
+    def restore_splitter_setting() -> None:
+        if had_saved_width:
+            splitter_settings.setValue("main_analysis_panel_width", saved_width)
+        else:
+            splitter_settings.remove("main_analysis_panel_width")
+        splitter_settings.sync()
+
+    request.addfinalizer(restore_splitter_setting)
+    splitter_settings.setValue("main_analysis_panel_width", 320)
+    splitter_settings.sync()
     window = MainWindow()
+    opened_help_topics: list[str] = []
+
+    class StubAnalysisHelpDialog:
+        def __init__(self, topic_id: str, _parent) -> None:
+            opened_help_topics.append(topic_id)
+
+        def exec(self) -> int:
+            return 0
+
+    from lfp_analysis import gui as gui_module
+
+    monkeypatch.setattr(gui_module, "AnalysisHelpDialog", StubAnalysisHelpDialog)
+    window._current_result_payload = lambda: {"metric": "PSD"}
+    window.analysis_help_button.click()
+    assert opened_help_topics == ["psd"]
     window.show()
     app.processEvents()
     assert len(window.indicator_checks) == 10
@@ -174,12 +292,12 @@ def test_main_window_constructs_offscreen(monkeypatch) -> None:
     assert window.fooof_view.peak_mode_combo.currentData() == "representative"
     assert window.fooof_view.curve_mode_combo.currentData() == "observed"
     assert window.fooof_view.band_combo.currentData() is None
-    from lfp_analysis.gui import HEADER_CONTENT_WIDTH
-
-    assert window.header_content_widget.width() == HEADER_CONTENT_WIDTH
     header = window.findChild(QtWidgets.QWidget, "topToolbarPanel")
     assert header is not None
-    assert header.height() == HEADER_PANEL_HEIGHT
+    assert header.width() == window.centralWidget().width() - 12
+    assert not hasattr(window, "header_scroll")
+    assert header.height() < 122
+    assert window.header_logo.size() == QtCore.QSize(HEADER_LOGO_WIDTH, HEADER_LOGO_HEIGHT)
     assert window.header_logo_path.name == "luna-logo.svg"
     assert window.header_logo.pixmap() is not None
     assert not window.header_logo.pixmap().isNull()
@@ -236,22 +354,55 @@ def test_main_window_constructs_offscreen(monkeypatch) -> None:
     app.processEvents()
     assert not window.parameter_widgets["connectivity.rank_strategy"].isEnabled()
     assert not window.parameter_widgets["connectivity.n_components"].isVisible()
-    assert window.minimumSize().width() >= 900
-    assert window.minimumSize().height() >= 600
+    assert window.minimumSize().width() == 860
+    assert window.minimumSize().height() == 600
     assert not window.status_text.isVisible()
     window.log_toggle.setChecked(True)
     app.processEvents()
     assert window.status_text.isVisible()
     assert window.log_toggle.text() == "收起详细日志"
     window.log_toggle.setChecked(False)
-    for width, height in ((980, 620), (1366, 768), (1920, 1080)):
+    observed_header_heights = []
+    observed_plot_widths = []
+    observed_plot_heights = []
+    observed_analysis_widths = []
+    for width, height in ((860, 600), (1366, 768), (1920, 1080)):
         window.resize(width, height)
         app.processEvents()
-        assert header.height() == HEADER_PANEL_HEIGHT
+        observed_header_heights.append(header.height())
         assert window.run_button.isVisible()
         assert window.general_plot_widget.isVisible()
-        assert window.general_plot_widget.width() >= 500
-    window.resize(980, 620)
+        assert not window.analysis_config_scroll.horizontalScrollBar().isVisible()
+        observed_plot_widths.append(window.general_plot_scroll.viewport().width())
+        observed_plot_heights.append(window.general_plot_scroll.viewport().height())
+        observed_analysis_widths.append(window.analysis_config_scroll.width())
+        for control in (
+            window.save_inspection_button,
+            window.previous_project_data_button,
+            window.next_project_data_button,
+            window.next_unchecked_button,
+        ):
+            assert control.width() >= control.minimumSizeHint().width()
+            assert control.geometry().right() <= window.inspection_controls_grid.geometry().right()
+    assert max(observed_header_heights) - min(observed_header_heights) <= 2
+    assert max(observed_header_heights) <= 110
+    assert observed_analysis_widths[1] <= 360
+    assert observed_plot_widths[1] >= 1000
+    assert observed_plot_widths[2] > observed_plot_widths[1]
+    assert observed_plot_heights[1] >= 420
+
+    normal_left_width = window.analysis_config_scroll.width()
+    window.focus_plot_button.setChecked(True)
+    app.processEvents()
+    assert not window.analysis_config_scroll.isVisible()
+    assert window.focus_plot_button.text() == "退出专注绘图"
+    assert window.result_stack.isVisible()
+    window.focus_plot_button.setChecked(False)
+    app.processEvents()
+    assert window.analysis_config_scroll.isVisible()
+    assert window.analysis_config_scroll.width() >= min(normal_left_width, 280)
+
+    window.resize(860, 600)
     app.processEvents()
     combo_position = window.result_combo.mapTo(window, QtCore.QPoint(0, 0))
     window.general_plot_scroll.verticalScrollBar().setValue(window.general_plot_scroll.verticalScrollBar().maximum())
@@ -270,7 +421,7 @@ def test_main_window_constructs_offscreen(monkeypatch) -> None:
     assert window.table_toggle.text() == "▼ 收起结果表"
     assert window.status_text.isVisible()
     assert window.quality_alert_text.isVisible()
-    assert header.height() == HEADER_PANEL_HEIGHT
+    assert header.height() == observed_header_heights[-1]
     window.table_toggle.setChecked(False)
     window.quality_toggle.setChecked(False)
     window.log_toggle.setChecked(False)
@@ -302,7 +453,7 @@ def test_main_window_constructs_offscreen(monkeypatch) -> None:
     app.quit()
 
 
-@pytest.mark.skipif(os.environ.get("CI") == "true", reason="Qt window test is local/offscreen")
+@pytest.mark.skipif(_SKIP_QT_WINDOW_TESTS, reason="Set LUNA_RUN_QT_TESTS=1 to opt into offscreen Qt window tests in CI")
 def test_connectivity_view_links_matrix_selection_to_spectrum(monkeypatch) -> None:
     pytest.importorskip("PySide6")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -323,17 +474,48 @@ def test_connectivity_view_links_matrix_selection_to_spectrum(monkeypatch) -> No
     view.set_payload({"metric": "Connectivity", "file_id": "synthetic", "tables": {"region_summary": spectrum, "band_summary": bands}})
     assert view.metric_combo.currentData() == "mic"
     assert view.pair_list.count() == 1
+    assert view.band_selection_button.text() == "频带 1/1"
+    assert view.pair_selection_button.text() == "脑区对 1/1"
+    assert view.band_list.isHidden()
+    assert view.pair_scroll.isHidden()
+    assert view.more_settings_panel.isHidden()
+    assert not view.plot_scroll.widget().isAncestorOf(view.more_settings_button)
+    view.more_settings_button.setChecked(True)
+    app.processEvents()
+    assert not view.more_settings_panel.isHidden()
+    view.more_settings_button.setChecked(False)
+    app.processEvents()
     view._matrix_clicked(type("Event", (), {"inaxes": view.matrix_figure.axes[0], "xdata": 1.0, "ydata": 0.0})())
     assert view._focus_pair == ("M1", "STR")
     assert len(view.spectrum_figure.axes[0].lines) == 1
-    pair_checkbox = view.pair_group._checks[0][0]
-    pair_checkbox.setChecked(False)
+    pair_action = view.pair_selection_menu.actions()[0]
+    pair_action.setChecked(False)
     app.processEvents()
     assert view._selected_pairs() == []
+    assert view.pair_selection_button.text() == "脑区对 0/1"
     assert "请选择至少一个脑区对" in view.status_label.text()
-    pair_checkbox.setChecked(True)
+    pair_action.setChecked(True)
     app.processEvents()
     assert view._selected_pairs() == [("M1", "STR")]
+    assert view.pair_selection_button.text() == "脑区对 1/1"
+
+    tde_spectrum = pd.DataFrame([{
+        "region_a": "M1", "region_b": "STR", "method": "phase_periodicity_phase_only",
+        "antisymmetrized": True, "frequency_band": "alpha", "band_low_hz": 5.0,
+        "band_high_hz": 6.0, "delay_ms": -5.0, "estimate_strength": 0.2,
+    }])
+    tde_summary = pd.DataFrame([{
+        "region_a": "M1", "region_b": "STR", "frequency_band": "alpha",
+        "band_low_hz": 5.0, "band_high_hz": 6.0, "region_peak_delay_ms": -5.0,
+        "region_peak_strength": 0.2, "channel_pair_median_delay_ms": -5.0,
+        "channel_pair_mad_delay_ms": 0.0, "n_channel_pairs": 1,
+    }])
+    view.set_payload({"metric": "Time Delay", "file_id": "synthetic", "tables": {"region_spectrum": tde_spectrum, "band_summary": tde_summary}})
+    assert view.more_settings_button.isHidden()
+    assert view.scale_label.isHidden()
+    view.set_payload({"metric": "Connectivity", "file_id": "synthetic", "tables": {"region_summary": spectrum, "band_summary": bands}})
+    assert not view.more_settings_button.isHidden()
+    assert view.more_settings_panel.isHidden()
 
     original_refresh_impl = view._refresh_impl
 
@@ -349,7 +531,7 @@ def test_connectivity_view_links_matrix_selection_to_spectrum(monkeypatch) -> No
     app.quit()
 
 
-@pytest.mark.skipif(os.environ.get("CI") == "true", reason="Qt window test is local/offscreen")
+@pytest.mark.skipif(_SKIP_QT_WINDOW_TESTS, reason="Set LUNA_RUN_QT_TESTS=1 to opt into offscreen Qt window tests in CI")
 def test_connectivity_view_multiband_and_dpli_display(monkeypatch) -> None:
     pytest.importorskip("PySide6")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -380,7 +562,7 @@ def test_connectivity_view_multiband_and_dpli_display(monkeypatch) -> None:
     app.quit()
 
 
-@pytest.mark.skipif(os.environ.get("CI") == "true", reason="Qt window test is local/offscreen")
+@pytest.mark.skipif(_SKIP_QT_WINDOW_TESTS, reason="Set LUNA_RUN_QT_TESTS=1 to opt into offscreen Qt window tests in CI")
 def test_connectivity_view_separates_line_noise_marker_from_plot_exclusion(monkeypatch) -> None:
     pytest.importorskip("PySide6")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")

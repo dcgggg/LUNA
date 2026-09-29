@@ -1,17 +1,62 @@
 # LUNA 当前项目状态
 
-最后核查：2026-09-24。以下状态只依据当前工作区代码、当前虚拟环境和本次实际运行结果；未把旧需求、历史截图或未执行的人工操作记为通过。
+最后核查：2026-09-29。以下状态只依据当前工作区代码、当前虚拟环境和本次实际运行结果；未把旧需求、历史截图或未执行的人工操作记为通过。
 
 ## 总体状态
 
 | 项目 | 当前状态 | 证据/限制 |
 |---|---|---|
-| 软件版本 | `0.3.0.dev1` | 本次待发布开发版本；版本来源为 `src/lfp_analysis/__init__.py`，`pyproject.toml` 使用动态版本 |
+| 软件版本 | `0.3.0.dev2` | 本次待发布开发版本；版本来源为 `src/lfp_analysis/__init__.py`，`pyproject.toml` 使用动态版本 |
 | GUI 框架 | PySide6 + Matplotlib | `scripts/run_gui.py` → `lfp_analysis.gui.launch()` → `MainWindow` |
-| CLI | 可用 | `lfp-analysis.exe` 和 `python -m lfp_analysis.cli --help` 已核实；当前环境没有 `luna.exe` 别名 |
-| 测试 | 103 项通过 | 本轮 `pytest -q`、Ruff、compileall、pip check 和差异检查通过；FOOOF 兼容后端仍有第三方弃用警告 |
-| 真实样例 | 文件级全流程完成 | 身份未解析，不能做动物层推断 |
+| CLI | 可用 | `lfp-analysis.exe`、`luna-diagnose.exe` 和模块入口均已核实；当前环境没有 `luna.exe` 别名 |
+| 测试 | 136 项通过 | 2026-09-29 Windows x64/Python 3.11 源码环境与 Python 3.12.14 最新 wheel 隔离环境，均在 `CI=true`、Qt offscreen 窗口测试显式启用时完成全量测试；Ruff、compileall、依赖检查通过。另以无可选分析后端的 `.[gui]` 安装完成真实 FIF 的 GUI PSD 计算、保存、重载和正常关窗。FOOOF/Qt 上游弃用警告保留 |
+| 真实样例 | 文件级全流程及读图文档核对完成 | 固定 FIF 21×16×5000，1000 Hz、有效片段累计105 s；animal/session 身份未解析，不能做动物层推断 |
+| 分析说明 | 已加入 GUI 读图帮助和 3 份生成式中文文档 | 文档与 GUI 使用同一说明源；本轮核对 CLI 实际 41 个 CSV 的全部字段均进入目录，GUI 原生桌面/DPI未手动验收 |
 | Git 状态 | 有既有未提交修改 | 本轮未提交、未推送、未清理或重置 |
+
+## 功能连接跨机诊断与兼容性（2026-09-28 至 2026-09-29）
+
+- 已确认项目依赖边界：`mne`（MNE-Python，用于 FIF I/O 等）与 `mne-connectivity`（MIC/MIM、wPLI、dPLI 等估计器）是两个独立发行包。`pyproject.toml` 的 `connectivity`、`desktop`、`all` extras 均明确包含 `mne-connectivity>=0.9,<1`；TDE 使用独立的 `pybispectra` extra。依赖分组、安装命令和传递依赖说明见 `docs/DEPENDENCIES.md`。
+- 已确认一项兼容风险，但不能将其冒充为其他电脑故障的已知根因：在隔离 Python 3.11/MNE 1.13.2 环境中用 `--no-deps` 探查 MNE-Connectivity 0.8.0/0.8.1 时，包导入因 `mne.fixes.jit` 缺失而失败，`pip check` 仍未发现包元数据冲突。因此项目对连接 extra 的下限调整至 0.9。常规 wheel 安装的 0.9.0 在本机成功导入和计算。
+- 诊断入口 `python -m lfp_analysis.diagnostics --output <报告.json> [--input <epochs.fif>]` 无需启动 Qt；报告包含 OS/Python/架构、LUNA 与关键模块位置、依赖版本/API、线程后端、路径可写性及可选 FIF 头信息，不含信号样本、通道名或完整环境变量。GUI 后台检查/分析失败会写入脱敏 JSON 技术报告，并在状态/日志中给出错误与报告位置。当前开发虚拟环境发现 `lfp_analysis` namespace 同时被 `luna-analysis` 与旧 `mouse-lfp-analysis` editable 元数据登记；本轮没有擅自卸载或更改该既有虚拟环境。隔离 wheel 环境仅有 `luna-analysis` 一个 owner。
+- 核心版 wheel 的额外边界验证：全新 Windows x64/Python 3.11 venv 只安装核心包时，诊断模块仍能生成报告；缺少 PySide6/MNE-Connectivity 被准确标记为未安装，连接自检明确报告 `dependency_unavailable`、提示 `.[connectivity]` 并以退出码2结束，未错误报为成功。该轮未加载真实信号。
+- 新增 `src/lfp_analysis/app_paths.py`、`ui_fonts.py` 与 `optional_dependencies.py`：用户数据/配置/日志/结果采用平台用户目录；安装包资源通过 `importlib.resources` 定位；UI 字体依平台选择；可选后端导入/API 损坏时只禁用相关方法，不隐式替换算法。GUI 启动、FIF 检查和连接计算仍由既有入口/计算核心执行。
+- 固定只读 FIF 的 Windows x64 真实连接运行在隔离环境完成：Python 3.11.9、MNE 1.13.2、MNE-Connectivity 0.9.0、NumPy 2.4.6、SciPy 1.17.1、PySide6 6.11.2。21 epochs、1000 Hz；使用 8 个通道组成两个显式 `QC_Test_A/B` 通道集合，仅作质量验证、不代表生物脑区映射。MIC、MIM、wPLI、dPLI、wPLI²-debiased 五种方法均成功；共 12 次主/降秩/片段稳定性估计调用。数值表、完整频谱和图已保存到隔离临时结果包，manifest 状态 `completed`，`load_saved_run()` 可从包重载参数及索引；输入源哈希复核未变。
+- Python 3.12.14 的全新 Windows x64 环境再次按 `.[desktop,dev]` 安装，并通过全量 120 项测试、依赖检查、Ruff 0.16.9 与 compileall。用隔离环境实际运行固定 FIF 的 MIC、MIM、wPLI、dPLI、wPLI²-debiased 五种连接方法，manifest 与连接状态均为成功；21 epochs、1000 Hz、显式 `QC_A/QC_B` 测试分组（不是生物脑区映射），保存的频谱 CSV 含五种方法且 `load_saved_run()`/CSV 可重载。输入 SHA-256 前后相同，结果位于 `%TEMP%`。读取连接 CSV 时 pandas 对混合类型元数据列发出 `DtypeWarning`，读取成功；不影响数值或运行状态。
+- 干净安装验证：从本次源码构建非 editable wheel，在独立 Python 3.11 环境按 `.[desktop,dev]` 安装，没有手工补装依赖；`pip check`、120 测试、Ruff、compileall 均通过。从仓库外目录运行诊断、命令帮助和 Qt offscreen 主窗口成功，Logo/YAML 使用 wheel 内资源；用户目录经环境隔离重定向到临时目录。GUI 的真实鼠标/屏幕操作没有在本轮执行。
+- 后续以该全新 wheel venv 中的安装版 `site-packages` 再运行完整测试套件：129 passed，81 warnings，28.82 s；警告为 Matplotlib Qt 高 DPI 枚举及 FOOOF 上游弃用。该项补充确认测试针对安装包而非仓库源码导入；不代表 macOS 运行验证。
+- 平台边界：本机 Windows x64 的 Python 3.11.9 与临时隔离 Python 3.12.14 环境均已验证；没有 macOS 主机。2026-09-28 使用 `uv pip compile --only-binary :all:` 为 macOS arm64/x86_64 × Python 3.11/3.12 各解析 `.[desktop,dev]` 依赖成功（每组52个发行包），这仅证明 wheel 解析可行，不是 macOS 安装或运行证据。GitHub Actions smoke matrix 配置 Windows x64、macOS Apple Silicon (`macos-15`) 和 macOS Intel (`macos-15-intel`)；workflow 已加入 standalone `--self-test-connectivity`、合成连接保存/重载和 GUI offscreen 测试，并在每个 job 结束时上传脱敏诊断 JSON 七天。本机模拟 CI 条件运行的129项全量测试通过，但远端矩阵尚未运行，真实桌面鼠标/DPI 未验收。GitHub 官方 runner 文档当前将 `macos-15` 标为 arm64、`macos-15-intel` 标为 x64，并计划 Intel 标签支持至2027年8月。macOS CI 仍待远端触发。
+- 在隔离 Python 3.12.14 Windows 环境仅安装 `.[gui]`、不安装连接/TDE/谱参数化 extra 时，实际启动 offscreen MainWindow 并加载固定 FIF 成功（21 epochs、16通道、1000 Hz）；MIC、TDE、FOOOF 被禁用且带安装提示，PSD 保持可用。进一步完成 GUI PSD-only 计算，写出67,200行逐epoch/通道频谱表，manifest=`completed`，表和运行索引重载成功。该流程暴露并修复已删除 QThread 包装器仍被 closeEvent 查询导致关窗 RuntimeError 的问题；正常关窗回归通过。FIF SHA-256 前后相同。验证不是原生桌面交互，也不代表 Mac 运行证据。
+- 2026-09-29 补充：当前 Windows 开发环境的 `luna-diagnose.exe` 首次未生成，虽安装元数据已有入口。以 `.venv` 当前解释器执行 `python -m pip install --no-deps -e .` 后生成并可从仓库外运行；未改动依赖。实际报告发现诊断器错误地把 PySide6 标为 API 缺失，因为 QtCore/QtWidgets 是子模块，不是包顶层属性；现已检查真实的 `QtCore.QObject` 与 `QtWidgets.QApplication`，并有存在/缺失两种测试。完整126项测试通过。当前 `lfp_analysis` 分发元数据仍登记 `luna-analysis` 与旧 `mouse-lfp-analysis` 两个 owner，但模块实际加载自当前仓库 `src/lfp_analysis`；保留警告、未擅自卸载旧环境记录。
+
+- 2026-09-29 最新诊断隐私复核：曾确认用户目录替换为波浪号后绕过自定义路径清理，可能露出其下的项目/数据文件夹名称；已修复 Windows/UNC/POSIX 完整路径脱敏，并将 invoked_as 限为启动器名称，添加 URL 与含空格路径回归。当前源码 Python 3.11 全量136项通过；最新 wheel 在隔离 Windows Python 3.11 与3.12环境通过诊断专项及 Python 3.12 全量136项。安装版诊断只读固定 FIF 文件头并运行七种合成连接方法，报告不含输入路径、文件名、通道名或信号样本；源哈希不变。没有 macOS 或故障电脑报告，远端连接故障根因仍未确认。
+- 最新 Python 3.12.14 wheel 另以固定只读 FIF（21 epochs、16通道、1000 Hz）完成五种 GUI 连接方法的计算、结果保存和重载，状态 completed/ok、谱表32,340行；仅选8通道并临时映射到QC_A/QC_B供软件测试，非生物学脑区映射。原文件未修改。
+
+## Windows 项目迁移到 POSIX 的相对路径回归（2026-09-29）
+
+- 确认一项真实跨系统兼容缺陷：旧 Windows 项目把项目内 FIF、层级目录、分析 bundle、结果表/数组及批次运行目录写成反斜杠相对路径。POSIX 系统把反斜杠当普通字符，复制项目后相关原始数据、目录或结果无法通过这些旧索引定位。该问题由代码路径和新增复现测试确认，但没有证据表明它就是用户另一台电脑上连接模块故障的根因。
+- 新增 `portable_paths.py` 作为统一解析层：读入旧 Windows 或 POSIX 分隔符，拒绝盘符/绝对路径、`..` 和解析后逃出项目/运行目录的 symlink；新写入的 result manifest、SQLite result path、batch run `file_dir` 与表/图相对路径统一为 `/`。Project Manager 层级路径、项目内 FIF 与已保存结果可在搬迁后解析，旧清单保持可读；诊断/科学数值未改。
+- 固定只读 FIF 项目搬迁烟测：导入后将数据库路径模拟为旧反斜杠，复制整个含空格项目目录，再从新位置打开 FIF；读到21×16×5000、1000 Hz，源文件 SHA-256 前后相同。合成 bundle 回归覆盖旧 Windows SQLite `result_path` 与 manifest 的 table/array 路径，搬迁后 `ProjectResults` 可读取表格和数组；模板可在旧反斜杠层级节点下增量创建 session。
+- 全量测试在 `CI=true`、Qt offscreen 与 `LUNA_RUN_QT_TESTS=1` 下为132 passed、1项 FOOOF 上游弃用警告；`ruff check src tests scripts`、`compileall`、`pip check`、`git diff --check` 均通过。项目内路径不变量、绝对路径和目录逃逸有对应回归覆盖。
+- 限制：本机为 Windows x64，不能据此宣称 macOS 原生运行已验证；GitHub macOS matrix 尚未运行，另一台故障电脑没有诊断报告。连接故障具体根因仍未知；诊断命令和诊断附件流程已准备好，需在实际故障环境执行才能定位环境/API/后端差异。
+
+## 功能连接诊断合成自检（2026-09-29）
+
+- 无 GUI 命令 `luna-diagnose --self-test-connectivity --output <报告>` 现会通过 LUNA 实际连接计算核心运行所有 MNE-Connectivity 方法，使用仅作软件执行检查的合成数据（6 epochs × 4 通道 × 3000 样本，500 Hz、5–80 Hz、multitaper 6 Hz、单 worker），并按方法写入状态。
+- 本机 Windows x64/Python 3.11.9 从 `%TEMP%` 调用安装入口实测全部 7 种方法 MIC、MIM、wPLI、dPLI、wPLI²-debiased、imcoh、coh 成功；频率网格 451 点，5–80 Hz；3 次估计调用，约 3 s。与命令同时提供的固定真实 FIF 只读加载文件头，21×16×5000、1000 Hz，未读样本且哈希不变。
+- 当前工作区另构建了 `0.3.0.dev1` wheel 并在两个临时安装位置检查：prefix 安装确认模块/资源/console script；随后新建 Windows x64/Python 3.11 venv，仅从 wheel 安装 `.[desktop]`，未手工补装包。`pip check` 通过；安装版 `luna-diagnose` 七方法合成自检全为 `ok`，`luna-gui --help` 正常，PySide6 offscreen 下主窗口可显示并正常关闭。wheel 来自本机 Windows 构建，不是 macOS wheel/runtime 证据。验证中 prefix 测试曾使开发 venv 的 LUNA console launchers 被移除，随后通过 `python -m pip install --no-deps -e .` 恢复；最终入口存在且 `pip check` 通过。
+- 在上述全新 wheel venv 中另使用 AGENTS 指定只读 FIF 实际运行项目 GUI 分析核心并保存/重载连接结果：21 epochs、16通道、1000 Hz、有效累计105 s；明确选8个文件通道并临时标成两组 `QC_A/QC_B`（各4通道，仅软件兼容性检查，不是生物脑区映射），选择全部21个epoch。五个 GUI 连接方法 MIC/MIM/wPLI/dPLI/wPLI²-debiased 均写入结果，Connectivity 状态 `ok`、run manifest `completed`；重载连接CSV和run bundle成功，谱表32,406行，报告中的有效epoch数21。输入SHA-256与基线相同。加载CSV时 pandas 对稀疏文本元数据列 `estimated_rank_metadata` 发出 `DtypeWarning`；进一步核对为 JSON 文本与空值混合，结果表成功读取且数值核验通过，不是连接估计失败或静默吞错。
+- 该命令验证软件/后端执行和 API 连通，不验证科学准确性、目标故障电脑真实数据或 macOS；缺少后端和方法失败会记录在报告中，并以非零退出码提示。完整测试129项通过；无 Mac 或远端故障报告，相关结论仍待原生/外部证据。
+
+## 分析流程解释文档（2026-09-27）
+
+- `docs/ANALYSIS_GUIDE.md`、`docs/RESULT_DATA_DICTIONARY.md`、`docs/FIGURE_RESULT_INDEX.md` 由 `src/lfp_analysis/analysis_help_content.py` 单一内容源生成；README 和 GUI“如何读图”入口链接/使用该内容。
+- 对固定只读 FIF 在 `%TEMP%/luna_explainer_final_83455015be5846f39980f924b2f2a252` 完成一次单文件代表流程。核对该次生成的 41 个 CSV 文件名和所有实际列；额外确认 16/16 谱参数化拟合成功、连接区域汇总表 8838×22 与连接 metadata 中 shape 一致、TDE 区域延迟表存在。该次启用模块为 PSD、Band Power、specparam、MIC/MIM/wpli2_debiased、TDE 方法1（标准及反对称）；未运行 dPLI、普通 wPLI 或其他可选连接方法。
+- 文件哈希与输入源一致；manifest 的 `identity_status=file_only_identity_unresolved`、`animal_level_statistics_run=false`。没有推断动物、LDN 配对、AIMs 或组间效应。
+- 发现并修正文档/显示标签：PSD y 轴单位改为“source unit²/Hz”，频带功率 y 轴优先读取结果中记录的绝对功率单位；连接 metadata `region_summary_shape` 修复为实际 region summary DataFrame shape（只修元数据维度，不改连接数值）。
+- 已确认的保存追溯限制：单文件 CLI 的 `config_used.yaml` 是输入配置副本，若使用 `extends` 不会展开父配置；`run_manifest.json` 仅有配置审计、部分参数范围和状态，非完整解析参数快照。部分参数保存在结果表和模块 metadata；项目 result bundle 有独立 effective_parameters。CLI 参数快照不足已写入数据字典/指南，尚未改变保存格式。
+- 本次真实 CLI 图共 17 个图类（PNG+SVG），逐一映射到绘图函数与数据字段。目视检查发现文件级 `band_power.png/.svg` 多面板标签拥挤/相邻标题和标签易挤压；数值表不受影响，GUI 总览/比较视图另有交互布局。该绘图布局本轮未重构。
+- `.venv` 当前确认 Python 3.11.9、SciPy 1.17.1、MNE 1.12.1、MNE-Connectivity 0.9.0、specparam 2.0.0rc7、PyBispectra 1.3.2、PySide6 6.11.2。项目全量 108 测试通过；仅报告 FOOOF 兼容依赖弃用警告。
 
 ## 当前产品范围调整（2026-09-23）
 

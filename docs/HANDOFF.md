@@ -1,6 +1,6 @@
 # LUNA 开发交接
 
-核查日期：2026-09-23（北京时间）。本文件给下一次会话或下一模型优先阅读，内容依据当前工作区代码和本次命令结果，不依据聊天历史推断。
+核查日期：2026-09-29（北京时间）。本文件给下一次会话或下一模型优先阅读，内容依据当前工作区代码和本次命令结果，不依据聊天历史推断。
 
 ## 1. 产品目标与明确边界
 
@@ -10,15 +10,15 @@ LUNA（Local field potential Unified Network Analysis platform）当前目标是
 
 ## 2. 当前真实状态
 
-当前版本为 `0.3.0.dev1`，分支 `master`，remote 为 `https://github.com/dcgggg/LUNA.git`。本次发布前工作区存在未提交修改，涉及 AGENTS/README/CHANGELOG、docs、`src/lfp_analysis/gui.py`、`project_gui.py`、`project_store.py`、`tests/test_project_store.py`，并有未跟踪 `docs/ARCHITECTURE.md`、`tests/test_project_draft.py`、`tests/test_project_manager_scope.py` 和 `docs/screenshots/`；最终提交 SHA 以发布后的 Git 记录为准。不得 reset、checkout、清理或覆盖这些修改。
+当前版本为 `0.3.0.dev2`，分支 `master`，remote 为 `https://github.com/dcgggg/LUNA.git`。本轮发布前工作区包含 README、GUI/绘图/连接代码、分析帮助、可选依赖诊断、跨平台路径、CI 和测试改动；最终提交 SHA 以发布后的 Git 记录为准。以 `git status --short` 查看精确范围；不得 reset、checkout、清理或覆盖这些修改。
 
 当前项目数据库 schema 为 6。稳定 ID 和父子关系在 SQLite；目录树使用可读名称。导入默认复制到项目 `data/raw/`，以大小和 SHA-256 校验，外部源文件不移动。结果使用 `luna-result-bundle/1.0`，数值文件和 manifest 成功写入后才登记；检查、映射或科学参数变化会把当前结果标为 `needs_recompute`，历史结果仍可读取。
 
-主要状态：项目管理、模板、导入、检查配置、结果 bundle、批处理、Review、Filter/export 已有代码和测试/离屏证据；单条和批处理共用 `gui_engine.run_gui_analysis()`。固定真实样例的文件级运行已验证，但其 animal/session/给药/行为身份未解析，不能做动物层推断。当前 GUI 的原生 Windows 鼠标、实体 DPI、多显示器和视频同步仍未验证。
+主要状态：项目管理、模板、导入、检查配置、结果 bundle、批处理、Review、Filter/export 已有代码和测试/离屏证据；单条和批处理共用 `gui_engine.run_gui_analysis()`。2026-09-27 固定真实样例文件级完整流程再次运行，21×16×5000、1000 Hz、有效累计时长105秒；animal/session 身份未解析，未运行动物层推断。分析流程指南、字段词典和图表索引现已落地；单文件 CLI 的 `config_used.yaml` 在 `extends` 场景下不是完整展开参数快照，此追溯限制已记录。当前 GUI 的原生 Windows 鼠标、实体 DPI、多显示器和视频同步仍未验证。
 
 ## 3. 环境、入口与验证
 
-解释器：`.venv\Scripts\python.exe`；Python 3.11.9。关键版本：NumPy 2.4.6、SciPy 1.17.1、pandas 2.3.3、Matplotlib 3.11.1、MNE 1.12.1、MNE-Connectivity 0.9.0、specparam 2.0.0rc7、FOOOF 1.1.1、PyBispectra 1.3.2、PySide6 6.11.2、pytest 8.4.2、Ruff 0.16.6。
+解释器：`.venv\Scripts\python.exe`；Python 3.11.9。关键版本：NumPy 2.4.6、SciPy 1.17.1、pandas 2.3.3、Matplotlib 3.11.1、MNE 1.12.1、MNE-Connectivity 0.9.0、specparam 2.0.0rc7、FOOOF 1.1.1、PyBispectra 1.3.2、PySide6 6.11.2、pytest 8.4.2、Ruff 0.16.6。独立 wheel 环境解析到 MNE 1.13.2/MNE-Connectivity 0.9.0，相关测试也通过。完整记录和安装指引见 `docs/DEPENDENCIES.md`。
 
 GUI 入口：`scripts/run_gui.py`；CLI：`python -m lfp_analysis.cli`；PyCharm 辅助入口：`scripts/run_single_file.py`；结果读取：`scripts/read_project_results.py` 或 `src/lfp_analysis/results_api.py`。标准验证为：
 
@@ -30,7 +30,23 @@ GUI 入口：`scripts/run_gui.py`；CLI：`python -m lfp_analysis.cli`；PyCharm
 git diff --check
 ```
 
-本次结果为 103 项测试通过，Ruff、compileall、pip check、diff check 通过；仅有 FOOOF 第三方弃用警告。固定只读测试文件 `C:\Users\PC\Documents\ChatGPT\testdata\LID-T80_all_channels-epo.fif` 读取为 21×16×5000、1000 Hz、4 个非空 `drop_log` 条目、有效时长 105 s；本轮读取前后 SHA-256 一致，文件身份仍未解析。项目管理范围联动在 Qt offscreen 中有交互测试和真实样例只读登记/打开信号验证；当前 Computer Use 没有暴露原生 Windows 应用窗口，因此实体鼠标和 DPI 仍未验证。
+2026-09-28 Windows x64/Python 3.11 在 `CI=true` 并显式启用 offscreen Qt 测试后，全量124项测试、Ruff、compileall、依赖检查通过；新增 GUI 合成 FIF 导入→PSD→保存→新窗口载入历史结果集成测试通过。Python 3.12.14 的声明 extras 环境曾通过全量120项测试，并对固定 FIF 完成 MIC/MIM/wPLI/dPLI/wPLI²-debiased 计算、保存和重载；使用显式 QC 通道分组，身份未解析。本轮 Python 3.12.14 仅 `.[gui]` 环境完成固定 FIF 加载、PSD-only GUI 计算、结果保存/重载和正常关窗；可选分析方法正确禁用。macOS arm64/x86_64 × Python 3.11/3.12 的 wheel-only 依赖解析已通过，但 macOS 原生安装/运行、远端 CI、真实桌面交互/DPI仍未验证；无其他电脑诊断报告，远端故障根因未确认。细节见 `docs/PROJECT_STATUS.md` 与 `docs/DEV_LOG.md`。
+
+2026-09-29 追加本机复核：当前 Windows x64/Python 3.11 全量129项通过。当前源码 wheel 在全新 Python 3.11 venv 中仅安装 `.[desktop]` 后，`pip check`、安装版七方法诊断、GUI CLI 帮助和 PySide6 offscreen 主窗口创建/关闭均通过；Logo/YAML 资源来自 wheel。另在该干净 wheel venv 用指定只读 FIF 经 GUI 分析核心完成 MIC/MIM/wPLI/dPLI/wPLI²-debiased 计算、结果保存与重载，manifest completed、连接状态 ok；通道仅临时分成非生物学 QC_A/QC_B，身份仍未解析。GitHub workflow 现显式调用独立七方法合成诊断，并保留 macOS arm64/Intel matrix，但当前未提交代码尚未在远端运行。诊断仍报告当前开发环境中 `luna-analysis` 与旧 `mouse-lfp-analysis` 两个 `lfp_analysis` 元数据 owner；代码实际从当前工作区导入，未卸载旧发行包。完整细节见最新 `docs/DEV_LOG.md`。这不是其他电脑或 macOS 验证；用户没有可提供的远端诊断报告。
+
+补充验证：同一全新 wheel 环境安装 `.[desktop,dev]` 后，完整129项测试由该环境 `site-packages` 版本运行并通过（81条 Matplotlib/FOOOF 弃用警告，28.82秒）。这加强 Windows 安装包回归证据，不改变 macOS/外部设备尚未验证的状态。
+
+平台工作流现在会在各 OS/Python job 结束时保留常规诊断和合成连接诊断两个 JSON artifact 7天；工作流尚未推送或运行，不能据此声称已有 macOS 结果。
+
+核心版 wheel 另在临时 venv 验证：无 GUI/连接 extra 时独立诊断仍可运行；连接自检正确报告后端不可用、安装 extra 与非零退出码，未伪报成功。详见 `docs/DEV_LOG.md` 最新条目。
+
+2026-09-29 路径迁移回归补充：发现并修复 Windows 写入的 `\` 相对路径在 POSIX 上无法解析的问题，覆盖项目内 FIF、层级目录、分析索引、manifest 表/数组以及批次目录。旧 Windows 路径读取兼容，新写入统一 `/`；路径仍经过目录边界检查。Windows 本机全量 Qt-offscreen 测试现为132 passed，固定只读 FIF 项目复制后重开成功，旧格式合成结果包移动后表格/数组读取通过。macOS runner/原生 GUI仍未运行；没有其他电脑诊断报告，所以此项是已确认的迁移缺陷修复，不是用户连接故障根因结论。
+
+后续仅 GUI 安装复现验证：Windows x64/Python 3.12.14 隔离环境安装 `.[gui]`（未装 mne-connectivity、pybispectra、specparam、fooof），主窗口从安装 wheel 启动并加载固定 FIF 成功；MIC、TDE、FOOOF 禁用，PSD 可用。PSD-only GUI 分析生成67,200行频谱长表，run manifest 成功，重读保存表和 run 均成功。复现并修正缺少谱参数化包时 FOOOF 仍可勾选，以及 inspect QThread 删除后 MainWindow.closeEvent 对失效包装器调用 `isRunning()` 的问题；两者均有回归证据。见 `docs/DEPENDENCIES.md` 和最新 DEV_LOG。macOS 和目标故障机仍需原生/实际诊断证据。
+
+2026-09-29 最新诊断隐私与安装验证：修复诊断报告可能泄露用户主目录下自定义文件夹名的问题，增加 Windows/POSIX 路径、URL 与启动器名称回归。当前源码 Python 3.11 全量136项通过；最新 wheel 在隔离 Windows Python 3.11/3.12 环境均可安装，Python 3.12 全量136项通过。安装版诊断对固定 FIF 仅读文件头（21×16×5000、1000 Hz）并在合成数据上运行七种连接方法，报告不含输入路径、文件名、通道名或信号样本；源文件哈希不变。无 macOS 或故障电脑报告，远端根因未确认。
+
+补充：最新 Python 3.12.14 wheel 隔离环境亦用固定只读 FIF 完成五种 GUI 连接方法的计算、保存和重载；21 epochs、16输入通道、1000 Hz，分析选8通道临时分为 QC_A/QC_B（仅软件测试标签），连接状态 ok、结果可重载。此为 Windows x64 验证，不是 macOS 验收。
 
 ## 2.1 Project Manager 范围联动（2026-09-23）
 
@@ -71,4 +87,4 @@ git diff --check
 
 ## 7. 可直接复制给下一模型的接手提示词
 
-“请先阅读当前项目的 `AGENTS.md`、`docs/HANDOFF.md`、`docs/PROJECT_STATUS.md`、`docs/ARCHITECTURE.md` 和 `docs/DEVELOPMENT.md`，再检查 `git status --short`。Project Manager 的可恢复草稿回归已覆盖崩溃、重开、第二读取者、目录保护和 schema 5→6 迁移。先由产品明确草稿期间第二读取者可见元数据是否可接受；若要求 Save 前隔离，再设计单独 draft DB/提交流程，写明数据文件、结果写入、异常恢复的边界并增补测试。不要改分析算法、默认参数或真实 FIF，不要未经授权 commit/push。”
+“请先阅读当前项目的 `AGENTS.md`、`docs/HANDOFF.md`、`docs/PROJECT_STATUS.md`、`docs/ARCHITECTURE.md`、`docs/DEVELOPMENT.md` 和 `docs/DEPENDENCIES.md`，再检查 `git status --short`。连接性本地证据：MNE-Connectivity 是与 MNE-Python 分开的依赖，连接 extra 已明确声明；Windows x64 Python 3.11 和 3.12 的最新 wheel 在隔离环境安装验证，全量 Qt-offscreen 测试136项通过，固定 FIF 的五种连接方法此前已完成保存/重载。安装版 `luna-diagnose --self-test-connectivity` 逐项执行七种 MNE-Connectivity 方法，诊断报告已修复完整路径脱敏。用户没有其他电脑或 Mac 诊断报告，因此远端故障根因未确认。macOS Apple Silicon/Intel、远端 CI 和真实桌面 GUI/DPI仍未验证；不要把它们写成通过。本任务不提交、不推送。”

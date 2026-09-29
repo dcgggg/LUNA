@@ -102,7 +102,7 @@ def select_results(
     included = candidates.loc[~duplicated].copy()
     signatures: list[dict[str, Any]] = []
     for row in included.itertuples():
-        manifest = load_result_manifest(store.paths.root / row.result_path)
+        manifest = load_result_manifest(store.resolve_project_relative_path(row.result_path))
         signatures.append({"analysis_id": row.analysis_id, "compatibility_signature": _compatibility_signature(manifest)})
     compatibility = pd.DataFrame(signatures)
     if not compatibility.empty:
@@ -124,7 +124,7 @@ def subject_summary(
         raise ValueError("aggregation must be mean or median")
     frames: list[pd.DataFrame] = []
     for row in selection.included.itertuples():
-        manifest = load_result_manifest(store.paths.root / row.result_path)
+        manifest = load_result_manifest(store.resolve_project_relative_path(row.result_path))
         frame = load_table(manifest, table_name)
         if "region_pair" not in frame:
             if {"region_a", "region_b"}.issubset(frame.columns):

@@ -11,6 +11,7 @@ import copy
 import json
 import platform
 import threading
+import traceback
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -40,6 +41,7 @@ from .connectivity_plots import (
     plot_spectrum,
     prepare_connectivity,
 )
+from .diagnostics import write_failure_report
 from .fooof_plots import ordered_channels as ordered_fooof_channels
 from .fooof_plots import (
     plot_aperiodic_details,
@@ -57,6 +59,7 @@ from .io import channel_info_table, read_fif, sha256_file
 from .mapping import apply_mapping
 from .metadata import load_metadata_tables
 from .parameterization import fit_channel_psd_table
+from .portable_paths import resolve_portable_relative_path
 from .quality import assess_quality
 from .resources import packaged_resource_path
 from .spectral import compute_band_power, compute_psd, summarize_psd
@@ -537,7 +540,7 @@ def _save_metric_figures(metric: str, tables: dict[str, pd.DataFrame], file_dir:
         combined_fig.savefig(combined_base.with_suffix(".svg"))
         plt.close(combined_fig)
         return [
-            str(path.relative_to(file_dir))
+            path.relative_to(file_dir).as_posix()
             for path in (
                 overview_base.with_suffix(".png"),
                 overview_base.with_suffix(".svg"),
@@ -611,7 +614,7 @@ def _save_metric_figures(metric: str, tables: dict[str, pd.DataFrame], file_dir:
         detail_fig.savefig(detail_base.with_suffix(".svg"))
         plt.close(detail_fig)
         return [
-            str(path.relative_to(file_dir))
+            path.relative_to(file_dir).as_posix()
             for base in (overview_base, aperiodic_base, periodic_base, heatmap_base, peaks_base, distribution_base, detail_base)
             for path in (base.with_suffix(".png"), base.with_suffix(".svg"))
         ]
@@ -637,7 +640,7 @@ def _save_metric_figures(metric: str, tables: dict[str, pd.DataFrame], file_dir:
                 plot_spectrum(axis, prepared, band, "linear", f"{file_id} | ", 9)
                 fig.savefig(spectrum_base.with_suffix(".png"), dpi=150)
                 fig.savefig(spectrum_base.with_suffix(".svg"))
-                saved.extend(str(path.relative_to(file_dir)) for path in (spectrum_base.with_suffix(".png"), spectrum_base.with_suffix(".svg")))
+                saved.extend(path.relative_to(file_dir).as_posix() for path in (spectrum_base.with_suffix(".png"), spectrum_base.with_suffix(".svg")))
                 plt.close(fig)
                 fig, axis = plt.subplots(figsize=(9, 5))
 
@@ -646,7 +649,7 @@ def _save_metric_figures(metric: str, tables: dict[str, pd.DataFrame], file_dir:
                 matrix_base = figures_dir / f"connectivity_{method}_matrix"
                 matrix_fig.savefig(matrix_base.with_suffix(".png"), dpi=150)
                 matrix_fig.savefig(matrix_base.with_suffix(".svg"))
-                saved.extend(str(path.relative_to(file_dir)) for path in (matrix_base.with_suffix(".png"), matrix_base.with_suffix(".svg")))
+                saved.extend(path.relative_to(file_dir).as_posix() for path in (matrix_base.with_suffix(".png"), matrix_base.with_suffix(".svg")))
                 plt.close(matrix_fig)
 
                 combined_fig, combined_axes = plt.subplots(2, 1, figsize=(10, 9), constrained_layout=True)
@@ -655,7 +658,7 @@ def _save_metric_figures(metric: str, tables: dict[str, pd.DataFrame], file_dir:
                 combined_base = figures_dir / f"connectivity_{method}_combined"
                 combined_fig.savefig(combined_base.with_suffix(".png"), dpi=150)
                 combined_fig.savefig(combined_base.with_suffix(".svg"))
-                saved.extend(str(path.relative_to(file_dir)) for path in (combined_base.with_suffix(".png"), combined_base.with_suffix(".svg")))
+                saved.extend(path.relative_to(file_dir).as_posix() for path in (combined_base.with_suffix(".png"), combined_base.with_suffix(".svg")))
                 plt.close(combined_fig)
             plt.close(fig)
             return saved
@@ -679,7 +682,7 @@ def _save_metric_figures(metric: str, tables: dict[str, pd.DataFrame], file_dir:
     fig.savefig(base.with_suffix(".png"), dpi=150)
     fig.savefig(base.with_suffix(".svg"))
     plt.close(fig)
-    return [str(base.with_suffix(".png").relative_to(file_dir)), str(base.with_suffix(".svg").relative_to(file_dir))]
+    return [base.with_suffix(".png").relative_to(file_dir).as_posix(), base.with_suffix(".svg").relative_to(file_dir).as_posix()]
 
 
 def run_gui_analysis(
@@ -717,6 +720,7 @@ def run_gui_analysis(
         "files": [],
         "errors": [],
         "warnings": [],
+        "diagnostic_reports": [],
     }
     _atomic_json(manifest, run_dir / "run_manifest.json")
     input_files = list(snapshot.get("input_files", []))
@@ -732,6 +736,10 @@ def run_gui_analysis(
                 raise AnalysisCancelled("用户取消运行")
             input_path = Path(input_file).expanduser().resolve()
             update(f"读取 {input_path.name} ({file_position + 1}/{len(input_files)})")
+            current_metric = "file inspection"
+            selected_data: np.ndarray | None = None
+            runtime_config: dict[str, Any] | None = None
+            loaded = None
             try:
                 loaded_info = inspect_file(input_path, metadata_dir, config_path)
                 loaded = loaded_info["loaded"]
@@ -856,7 +864,8 @@ def run_gui_analysis(
                 selected = set(snapshot.get("indicators", []))
 
                 def begin_metric(metric: str, file_name: str = input_path.name) -> None:
-                    nonlocal completed_steps
+                    nonlocal completed_steps, current_metric
+                    current_metric = metric
                     if cancel_event.is_set():
                         raise AnalysisCancelled("用户取消运行")
                     update(f"{file_name}: 运行 {metric}")
@@ -964,11 +973,59 @@ def run_gui_analysis(
                     # Keep the exact mapping used by this run in the live
                     # payload so custom region names also drive the viewer.
                     connectivity["channel_table"] = selected_table
+                    connectivity_failures = connectivity.get("failures", pd.DataFrame())
+                    connectivity_diagnostic: str | None = None
+                    if isinstance(connectivity_failures, pd.DataFrame) and not connectivity_failures.empty:
+                        failed_calls = connectivity.get("estimation_calls", pd.DataFrame())
+                        if isinstance(failed_calls, pd.DataFrame) and not failed_calls.empty and "status" in failed_calls:
+                            failed_calls = failed_calls.loc[failed_calls["status"].astype(str).eq("failed")]
+                        diagnostic_file = file_dir / "diagnostics" / "connectivity_failure.json"
+                        report = write_failure_report(
+                            diagnostic_file,
+                            {
+                                "stage": "connectivity_estimation",
+                                "analysis_task_id": connectivity.get("metadata", {}).get("analysis_task_id", ""),
+                                "failure_count": len(connectivity_failures),
+                                "effective_parameters": runtime_config.get("connectivity", {}),
+                                "input": {
+                                    "shape_epochs_channels_times": list(selected_data.shape),
+                                    "dtype": str(selected_data.dtype),
+                                    "sampling_rate_hz": float(loaded.sfreq),
+                                    "epoch_duration_s": float(selected_data.shape[-1] / loaded.sfreq),
+                                    "valid_epoch_count": connectivity.get("metadata", {}).get("n_valid_epochs"),
+                                    "selected_channel_count": int(selected_data.shape[1]),
+                                    "selected_region_pairs": connectivity.get("metadata", {}).get("selected_region_pairs", []),
+                                },
+                                "rank_diagnostics": connectivity.get("rank_summary", pd.DataFrame()).to_dict("records"),
+                                "estimator_failures": failed_calls.to_dict("records") if isinstance(failed_calls, pd.DataFrame) else [],
+                                "failures": connectivity_failures.to_dict("records"),
+                            },
+                        )
+                        connectivity_diagnostic = report.relative_to(file_dir).as_posix()
+                        relative_report = report.relative_to(run_dir).as_posix()
+                        manifest["diagnostic_reports"].append(relative_report)
+                        if str(connectivity.get("status", "")).startswith("not_run") or str(connectivity.get("status", "")).startswith("failed"):
+                            manifest["errors"].append(
+                                {
+                                    "file": input_path.name,
+                                    "metric": "Connectivity",
+                                    "status": connectivity.get("status"),
+                                    "message": f"{len(connectivity_failures)} connection estimate(s) failed; see diagnostic report.",
+                                    "diagnostic_report": relative_report,
+                                }
+                            )
+                        else:
+                            manifest["warnings"].append(
+                                f"{input_path.name}: {len(connectivity_failures)} connection estimate(s) failed; see {relative_report}."
+                            )
                     paths = _save_table_group(file_dir / "connectivity", {key: connectivity[key] for key in ("spectrum", "region_summary", "band_summary", "channel_pair_band_summary", "patterns", "redundancy_correlation", "redundancy_singular_values", "rank_summary", "rank_sensitivity", "stability", "epoch_profile", "input_checks", "failures", "frequency_diagnostics", "roughness", "band_cv", "binned_spectrum", "display_spectrum", "display_roughness", "estimation_calls")}, provenance)
                     _save_connectivity_npz(file_dir / "connectivity", connectivity.get("spectrum", pd.DataFrame()))
                     _atomic_json(connectivity.get("metadata", {}), file_dir / "connectivity" / "connectivity_metadata.json")
                     figure_paths = _save_metric_figures("Connectivity", connectivity, file_dir, file_id)
-                    record = {"metric": "Connectivity", "status": str(connectivity.get("status", "unknown")), "paths": {"tables": paths, "figures": figure_paths, "arrays": "connectivity/connectivity_arrays.npz", "metadata": "connectivity/connectivity_metadata.json"}, "parameters": {**runtime_config.get("connectivity", {}), "estimation_call_count": len(connectivity.get("estimation_calls", pd.DataFrame()))}}
+                    record_paths = {"tables": paths, "figures": figure_paths, "arrays": "connectivity/connectivity_arrays.npz", "metadata": "connectivity/connectivity_metadata.json"}
+                    if connectivity_diagnostic:
+                        record_paths["diagnostic"] = connectivity_diagnostic
+                    record = {"metric": "Connectivity", "status": str(connectivity.get("status", "unknown")), "paths": record_paths, "parameters": {**runtime_config.get("connectivity", {}), "estimation_call_count": len(connectivity.get("estimation_calls", pd.DataFrame()))}}
                     metric_records.append(record)
                     result_callback({**_metric_plot_data("Connectivity", connectivity), "file_id": file_id, "file_uid": loaded_info["file_uid"], "display_name": loaded_info.get("display_name", input_path.name), "file_dir": str(file_dir), "record": record})
                     completed_steps += 3
@@ -985,7 +1042,7 @@ def run_gui_analysis(
                     completed_steps += 1
 
                 for metric_record in metric_records:
-                    metric_record["file_dir"] = str(file_dir.relative_to(run_dir))
+                    metric_record["file_dir"] = file_dir.relative_to(run_dir).as_posix()
                 _atomic_json(metric_records, file_dir / "results_index.json")
                 file_record = {
                     "file_id": file_id,
@@ -1002,7 +1059,7 @@ def run_gui_analysis(
                     "selected_nominal_duration_s": float(len(epoch_indices) * (end_index - start_index) / loaded.sfreq),
                     "analysis_effective_valid_duration_s": float(analysis_quality["file"].iloc[0]["effective_valid_duration_s"]),
                     "effective_valid_duration_s": float(analysis_quality["file"].iloc[0]["effective_valid_duration_s"]),
-                    "file_dir": str(file_dir.relative_to(run_dir)),
+                    "file_dir": file_dir.relative_to(run_dir).as_posix(),
                     "metrics": metric_records,
                     "project_context": project_context if isinstance(project_context, dict) else {},
                     "inspection_snapshot": snapshot.get("inspection_snapshot", {}),
@@ -1013,6 +1070,30 @@ def run_gui_analysis(
                 raise
             except Exception as exc:  # noqa: BLE001 - GUI retains per-file failures
                 error = {"file": str(input_path), "error": f"{type(exc).__name__}: {exc}"}
+                diagnostic_path = run_dir / "diagnostics" / f"file_{file_position + 1:02d}_failure.json"
+                try:
+                    report = write_failure_report(
+                        diagnostic_path,
+                        {
+                            "stage": current_metric,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                            "requested_indicators": snapshot.get("indicators", []),
+                            "effective_parameters": runtime_config if isinstance(runtime_config, dict) else {},
+                            "input": {
+                                "shape_epochs_channels_times": list(selected_data.shape) if selected_data is not None else None,
+                                "dtype": str(selected_data.dtype) if selected_data is not None else None,
+                                "sampling_rate_hz": float(loaded.sfreq) if loaded is not None else None,
+                                "epoch_duration_s": float(selected_data.shape[-1] / loaded.sfreq) if selected_data is not None and loaded is not None else None,
+                            },
+                        },
+                    )
+                    relative_report = report.relative_to(run_dir).as_posix()
+                    manifest["diagnostic_reports"].append(relative_report)
+                    error["diagnostic_report"] = relative_report
+                except Exception as report_error:  # noqa: BLE001 - preserve both analysis and report-write failures
+                    error["diagnostic_report_error"] = f"{type(report_error).__name__}: {report_error}"
                 manifest["errors"].append(error)
                 _atomic_json(manifest, run_dir / "run_manifest.json")
                 result_callback({"metric": "File", "status": "failed", "file_id": input_path.stem, "file_uid": stable_file_uid(input_path, "unreadable"), "display_name": input_path.name, "error": error["error"], "file_dir": str(run_dir)})
@@ -1050,16 +1131,7 @@ def load_saved_run(run_dir: str | Path) -> dict[str, Any]:
 
 def resolve_manifest_path(root: str | Path, relative_path: str | Path, label: str = "manifest path") -> Path:
     """Resolve a manifest path without allowing absolute paths or traversal."""
-    root_path = Path(root).expanduser().resolve()
-    raw = Path(relative_path) if relative_path not in (None, "") else Path(".")
-    if raw.is_absolute():
-        raise ValueError(f"{label} must be relative to the saved run: {relative_path}")
-    resolved = (root_path / raw).resolve()
-    try:
-        resolved.relative_to(root_path)
-    except ValueError as exc:
-        raise ValueError(f"{label} escapes the saved run directory: {relative_path}") from exc
-    return resolved
+    return resolve_portable_relative_path(root, relative_path, label=label, allow_empty=True)
 
 
 def load_saved_table(path: str | Path) -> pd.DataFrame:

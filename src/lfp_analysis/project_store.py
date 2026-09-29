@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .portable_paths import parse_portable_relative_path, resolve_portable_relative_path
+
 PROJECT_SCHEMA_VERSION = 6
 PROJECT_DATABASE = "project.sqlite3"
 WINDOWS_RESERVED_NAMES = {
@@ -521,11 +523,12 @@ class ProjectStore:
         used_paths: set[str],
     ) -> str:
         base = normalize_structure_folder_name(display_name, fallback)
+        portable_parent = parse_portable_relative_path(parent_relative, allow_empty=True).as_posix()
         index = 1
         while True:
             folder = base if index == 1 else f"{base} ({index})"
-            candidate = (Path(parent_relative) / folder).as_posix()
-            target = self.paths.root / Path(candidate)
+            candidate = (Path(portable_parent) / folder).as_posix()
+            target = self.resolve_project_relative_path(candidate)
             existing_can_be_reused = target.is_dir() and not any(target.iterdir())
             if candidate.casefold() not in used_paths and (not target.exists() or existing_can_be_reused):
                 used_paths.add(candidate.casefold())
@@ -535,13 +538,17 @@ class ProjectStore:
 
     def _used_structure_paths(self, connection: sqlite3.Connection) -> set[str]:
         """Return metadata and on-disk hierarchy paths reserved in this project."""
-        used = {
-            str(row[0]).casefold()
-            for table in ("subjects", "sessions", "state_records")
+        used: set[str] = set()
+        for table in ("subjects", "sessions", "state_records"):
             for row in connection.execute(
                 f"SELECT relative_path FROM {table} WHERE relative_path IS NOT NULL AND relative_path<>''"
-            )
-        }
+            ):
+                value = str(row[0])
+                try:
+                    value = parse_portable_relative_path(value).as_posix()
+                except ValueError:
+                    value = value.replace("\\", "/")
+                used.add(value.casefold())
         return used
 
     def _create_structure_directories(self, relative_paths: Iterable[str]) -> list[Path]:
@@ -549,8 +556,8 @@ class ProjectStore:
         root = self.paths.root.resolve()
         created: list[Path] = []
         try:
-            for relative in sorted(set(relative_paths), key=lambda value: len(Path(value).parts)):
-                target = (root / Path(relative)).resolve()
+            for relative in sorted(set(relative_paths), key=lambda value: len(parse_portable_relative_path(value).parts)):
+                target = self.resolve_project_relative_path(relative)
                 if os.path.commonpath((str(root), str(target))) != str(root):
                     raise ValueError(f"Hierarchy path escapes the project root: {relative}")
                 if target.exists():
@@ -828,7 +835,12 @@ class ProjectStore:
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     attachment_id, state_record_id, data_unit_id, resource_type.strip() or "behavior",
-                    file_format.strip() or None, str(Path(source_path).expanduser().resolve()) if source_path_kind == "external" else str(Path(source_path)),
+                    file_format.strip() or None,
+                    str(Path(source_path).expanduser().resolve())
+                    if source_path_kind == "external"
+                    else parse_portable_relative_path(source_path).as_posix()
+                    if source_path_kind == "project_relative"
+                    else str(Path(source_path)),
                     source_path_kind, str(Path(original_source_path).expanduser().resolve()) if original_source_path else None,
                     time_unit.strip() or None, notes.strip() or None, _json(sync_metadata), utc_now(),
                 ),
@@ -955,6 +967,11 @@ class ProjectStore:
         if not self.query("SELECT 1 FROM state_records WHERE state_record_id=?", (state_record_id,)):
             raise KeyError(f"Unknown target state_record_id: {state_record_id}")
         source = self.resolve_source_path_value(source_path, source_path_kind)
+        stored_source_path = (
+            parse_portable_relative_path(source_path).as_posix()
+            if source_path_kind == "project_relative"
+            else str(source)
+        )
         fingerprint = file_fingerprint(source)
         data_unit_id = new_id("data")
         structure = dict(source_structure or {})
@@ -971,7 +988,7 @@ class ProjectStore:
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data_unit_id, state_record_id,
-                    str(Path(source_path)) if source_path_kind == "project_relative" else str(source),
+                    stored_source_path,
                     source_path_kind, fingerprint["sha256"], fingerprint["size_bytes"],
                     source.suffix.lower().lstrip("."), _json(channel_mapping), _json(epoch_selection),
                     _json(time_selection), sampling_rate_hz, signal_unit.strip() or None, validity_status,
@@ -984,12 +1001,13 @@ class ProjectStore:
         return data_unit_id
 
     def resolve_source_path_value(self, source_path: str | Path, source_path_kind: str = "external") -> Path:
-        path = Path(source_path).expanduser()
         if source_path_kind == "project_relative":
-            resolved = (self.paths.root / path).resolve()
-            resolved.relative_to(self.paths.root)
-            return resolved
-        return path.resolve()
+            return self.resolve_project_relative_path(source_path)
+        return Path(source_path).expanduser().resolve()
+
+    def resolve_project_relative_path(self, path: str | Path) -> Path:
+        """Resolve project metadata/bundle paths across Windows and POSIX."""
+        return resolve_portable_relative_path(self.paths.root, path, label="Project-relative path")
 
     def resolve_source_path(self, data_unit: str | dict[str, Any]) -> Path:
         if isinstance(data_unit, str):
@@ -1231,7 +1249,7 @@ class ProjectStore:
             relative = str(row.get("relative_path") or "")
             if not relative:
                 continue
-            target = (self.paths.root / relative).resolve()
+            target = self.resolve_project_relative_path(relative)
             try:
                 target.relative_to(self.paths.root)
                 target.rmdir()
@@ -1679,6 +1697,8 @@ class ProjectStore:
         return rows
 
     def register_analysis(self, record: dict[str, Any]) -> None:
+        record = dict(record)
+        record["result_path"] = parse_portable_relative_path(record["result_path"], label="Analysis result path").as_posix()
         fields = (
             "analysis_id", "data_unit_id", "module_name", "method_name", "result_path", "schema_version",
             "parameter_fingerprint", "data_fingerprint", "parameters_json", "calculation_status", "save_status",
@@ -1905,7 +1925,7 @@ class ProjectStore:
         with self.transaction() as connection:
             connection.execute(
                 "INSERT INTO comparison_snapshots VALUES(?,?,?,?,?,?,?,?)",
-                (comparison_id, name, _json(filters), _json(included), _json(excluded), _json(settings), payload["created_at_utc"], str(target.relative_to(self.paths.root))),
+                (comparison_id, name, _json(filters), _json(included), _json(excluded), _json(settings), payload["created_at_utc"], target.relative_to(self.paths.root).as_posix()),
             )
         return comparison_id
 
@@ -1913,8 +1933,7 @@ class ProjectStore:
         rows = self.query("SELECT snapshot_path FROM comparison_snapshots WHERE comparison_id=?", (comparison_id,))
         if not rows:
             raise KeyError(comparison_id)
-        path = (self.paths.root / rows[0]["snapshot_path"]).resolve()
-        path.relative_to(self.paths.root)
+        path = self.resolve_project_relative_path(rows[0]["snapshot_path"])
         return json.loads(path.read_text(encoding="utf-8"))
 
     def comparison_snapshots(self) -> list[dict[str, Any]]:

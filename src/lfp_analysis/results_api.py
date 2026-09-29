@@ -23,7 +23,7 @@ class ProjectResults:
         rows = self.store.query("SELECT result_path FROM analysis_runs WHERE analysis_id=?", (analysis_id,))
         if not rows:
             raise KeyError(analysis_id)
-        return load_result_manifest(self.store.paths.root / rows[0]["result_path"])
+        return load_result_manifest(self.store.resolve_project_relative_path(rows[0]["result_path"]))
 
     def table(self, analysis_id: str, table_name: str | None = None) -> pd.DataFrame:
         manifest = self.manifest(analysis_id)

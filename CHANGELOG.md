@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0.dev2] — 2026-09-29 (prerelease)
+
+- Added platform-aware user paths, packaged-resource loading, optional-backend diagnostics, and explicit `desktop`/connectivity dependency groups.
+- Added redacted environment and synthetic connectivity self-tests for MIC, MIM, wPLI, debiased squared wPLI, dPLI, imcoh, and coherence without using experimental signal samples.
+- Added cross-platform project/result path handling, installation-package smoke checks, and Windows/macOS-target dependency workflow definitions; macOS execution remains unverified.
+- Improved GUI layout, optional-method availability checks, diagnostic error reporting, saved-result lifecycle handling, and connectivity failure traceability without changing the scientific algorithm definitions or default estimator parameters.
+- Expanded the README, dependency guide, analysis-help documentation, and regression tests.
+
+### Validation
+
+- 136 automated tests passed in the Windows x64/Python 3.11 development environment with Qt offscreen tests enabled.
+- Ruff, Python compilation, `pip check`, package version import, diagnostic self-test, fixed-FIF header inspection, and wheel build passed.
+- Native desktop mouse/DPI/multi-monitor behavior and macOS runtime execution remain unverified.
+
 ## [0.3.0.dev1] — 2026-09-24 (prerelease)
 
 - Removed the in-app cross-record A/B comparison entry point. The project manager now provides hierarchy, import, metadata, filter and CSV/JSON list export; cross-subject statistics and scientific comparison figures use the saved result contract externally.

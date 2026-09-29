@@ -7,20 +7,26 @@ touches Qt widgets directly.
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
+import platform
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import shiboken6
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
+from .analysis_help import AnalysisHelpDialog
+from .analysis_help_content import HELP_TOPICS
 from .app_info import (
     APP_DESCRIPTION,
     APP_FULL_NAME,
@@ -30,6 +36,12 @@ from .app_info import (
     DEFAULT_MAPPING_FILENAME,
     DEFAULT_OUTPUT_DIRNAME,
     window_title,
+)
+from .app_paths import (
+    default_config_directory,
+    default_log_directory,
+    default_metadata_directory,
+    default_output_directory,
 )
 from .band_power_plots import (
     band_label,
@@ -49,6 +61,7 @@ from .colors import (
 )
 from .config import load_config
 from .connectivity_gui import ConnectivityView
+from .diagnostics import write_failure_report
 from .fooof_plots import (
     normalize_bands,
     plot_aperiodic_details,
@@ -85,16 +98,24 @@ from .mapping import (
     save_mapping,
     validate_mapping,
 )
+from .optional_dependencies import optional_method_availability
+from .portable_paths import portable_path_name
 from .project_batch import ProjectBatchRunner
 from .project_gui import ProjectCreationDialog, ProjectWorkspace
 from .project_store import PROJECT_DATABASE, ProjectStore
 from .resources import packaged_resource_path
 from .result_contract import load_result_manifest
+from .ui_fonts import choose_ui_font_family
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-HEADER_CONTENT_WIDTH = 1120
-HEADER_PANEL_HEIGHT = 122
 GLOBAL_ACTION_HEIGHT = 32
+HEADER_LOGO_WIDTH = 160
+HEADER_LOGO_HEIGHT = 54
+ANALYSIS_PANEL_MIN_WIDTH = 280
+ANALYSIS_PANEL_DEFAULT_WIDTH = 320
+ANALYSIS_PANEL_MAX_WIDTH = 480
+RESULT_PANEL_MIN_WIDTH = 480
+HEADER_WORKSPACE_MENU_THRESHOLD = 900
 RESULT_PAGE_MIN_HEIGHT = 340
 # Kept as a compatibility constant for external callers; a collapsed table now
 # occupies no height and is not populated until the user expands it.
@@ -254,6 +275,38 @@ class CollapsiblePanel(QtWidgets.QWidget):
         self.toggle.setText(title)
 
 
+class ElidingLabel(QtWidgets.QLabel):
+    """Keep full text available while fitting long labels into adaptive rows."""
+
+    def __init__(self, text: str = "", parent: QtWidgets.QWidget | None = None) -> None:
+        self._full_text = str(text)
+        super().__init__("", parent)
+        self.setWordWrap(False)
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full_text = str(text)
+        self.setToolTip(self._full_text)
+        self._render_elided_text()
+
+    def fullText(self) -> str:
+        return self._full_text
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._render_elided_text()
+
+    def _render_elided_text(self) -> None:
+        available_width = max(0, self.contentsRect().width())
+        rendered = self.fontMetrics().elidedText(
+            self._full_text,
+            QtCore.Qt.TextElideMode.ElideMiddle,
+            available_width,
+        )
+        QtWidgets.QLabel.setText(self, rendered)
+
+
 def _gui_stylesheet() -> str:
     """Return the compact, high-DPI-friendly Qt style for the application."""
     return f"""
@@ -397,22 +450,6 @@ def _gui_stylesheet() -> str:
     """
 
 
-def _load_windows_cjk_font() -> str | None:
-    """Load a bundled system CJK font when Qt does not expose Windows fonts."""
-    for candidate in (
-        Path(r"C:\Windows\Fonts\Noto Sans SC (TrueType).otf"),
-        Path(r"C:\Windows\Fonts\simhei.ttf"),
-        Path(r"C:\Windows\Fonts\Deng.ttf"),
-    ):
-        if not candidate.is_file():
-            continue
-        font_id = QtGui.QFontDatabase.addApplicationFont(str(candidate))
-        families = QtGui.QFontDatabase.applicationFontFamilies(font_id)
-        if families:
-            return str(families[0])
-    return None
-
-
 class AnalysisWorker(QtCore.QObject):
     progress = QtCore.Signal(str, int)
     result = QtCore.Signal(object)
@@ -438,7 +475,37 @@ class AnalysisWorker(QtCore.QObject):
                 cancel_event=self.cancel_event,
             )
         except Exception as exc:  # noqa: BLE001 - worker forwards all failures
-            outcome = {"run_dir": "", "manifest": {"status": "failed", "errors": [f"{type(exc).__name__}: {exc}"]}}
+            snapshot_values = self.snapshot.get("values", {})
+            if not isinstance(snapshot_values, dict):
+                snapshot_values = {}
+            diagnostic_report = ""
+            diagnostic_report_error = ""
+            try:
+                report = write_failure_report(
+                    default_log_directory(PROJECT_ROOT) / "failures" / f"{self.task_id}.json",
+                    {
+                        "stage": "gui_worker_unhandled_exception",
+                        "analysis_task_id": self.task_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                        "requested_indicators": self.snapshot.get("indicators", []),
+                        "input_count": len(self.snapshot.get("input_files", [])),
+                        "selected_epoch_count": len(self.snapshot.get("selected_epoch_indices", [])),
+                        "selected_channel_count": len(self.snapshot.get("selected_channel_names", [])),
+                        "selected_region_pairs": self.snapshot.get("selected_region_pairs", []),
+                        "effective_parameters": snapshot_values,
+                    },
+                )
+                diagnostic_report = str(report)
+            except Exception as report_exc:  # noqa: BLE001 - report failure must not strand the GUI task
+                diagnostic_report_error = f"{type(report_exc).__name__}: {report_exc}"
+            outcome = {
+                "run_dir": "",
+                "diagnostic_report": diagnostic_report,
+                "diagnostic_report_error": diagnostic_report_error,
+                "manifest": {"run_id": self.task_id, "status": "failed", "errors": [f"{type(exc).__name__}: {exc}"]},
+            }
         self.finished.emit(outcome)
 
 
@@ -461,7 +528,31 @@ class InspectWorker(QtCore.QObject):
                 "infos": [inspect_file(path, self.metadata_dir, self.config_path) for path in self.paths],
             })
         except Exception as exc:  # noqa: BLE001 - display the readable error
-            self.failed.emit({"task_id": self.task_id, "message": f"{type(exc).__name__}: {exc}"})
+            diagnostic_report = ""
+            diagnostic_report_error = ""
+            try:
+                report = write_failure_report(
+                    default_log_directory(PROJECT_ROOT) / "failures" / f"{self.task_id}.json",
+                    {
+                        "stage": "fif_inspection",
+                        "task_id": self.task_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                        "input_count": len(self.paths),
+                    },
+                )
+                diagnostic_report = str(report)
+            except Exception as report_exc:  # noqa: BLE001 - preserve the inspection failure if logging is unavailable
+                diagnostic_report_error = f"{type(report_exc).__name__}: {report_exc}"
+            self.failed.emit(
+                {
+                    "task_id": self.task_id,
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "diagnostic_report": diagnostic_report,
+                    "diagnostic_report_error": diagnostic_report_error,
+                }
+            )
 
 
 class ResultCanvas(FigureCanvasQTAgg):
@@ -1512,9 +1603,13 @@ def _to_float(value: Any) -> float:
         return np.nan
 
 
-def _load_logo_pixmap(path: Path, width: int = 190, height: int = 58) -> QtGui.QPixmap:
-    """Render the supplied SVG without changing its aspect ratio."""
-    pixmap = QtGui.QPixmap(width, height)
+def _load_logo_pixmap(path: Path, width: int = HEADER_LOGO_WIDTH, height: int = HEADER_LOGO_HEIGHT) -> QtGui.QPixmap:
+    """Render the supplied SVG sharply at the current screen scale."""
+    app = QtWidgets.QApplication.instance()
+    screen = app.primaryScreen() if app is not None else None
+    device_ratio = max(1.0, float(screen.devicePixelRatio()) if screen is not None else 1.0)
+    pixmap = QtGui.QPixmap(round(width * device_ratio), round(height * device_ratio))
+    pixmap.setDevicePixelRatio(device_ratio)
     pixmap.fill(QtCore.Qt.GlobalColor.transparent)
     renderer = QtSvg.QSvgRenderer(str(path))
     if renderer.isValid():
@@ -1539,7 +1634,7 @@ def _load_logo_pixmap(path: Path, width: int = 190, height: int = 58) -> QtGui.Q
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, input_files: list[str] | None = None, output_dir: str | None = None, project_root: str | None = None) -> None:
         super().__init__()
-        font_family = _load_windows_cjk_font() or "Noto Sans SC"
+        font_family = choose_ui_font_family(QtGui.QFontDatabase.families(), platform.system())
         # Set the font on the application as well as the main window.  Several
         # result widgets are created without a parent first; using the
         # application font prevents those widgets from falling back to a
@@ -1552,11 +1647,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(_gui_stylesheet())
         self.setWindowTitle(window_title())
         self.resize(1500, 980)
-        self.setMinimumSize(980, 620)
+        self.setMinimumSize(860, 600)
         self.config_path = PROJECT_ROOT / "configs" / DEFAULT_CONFIG_FILENAME
         if not self.config_path.is_file():
             self.config_path = packaged_resource_path(f"configs/{DEFAULT_CONFIG_FILENAME}")
-        self.metadata_dir = PROJECT_ROOT / "metadata"
+        self.metadata_dir = default_metadata_directory(PROJECT_ROOT)
+        for writable_directory in (
+            self.metadata_dir,
+            default_config_directory(PROJECT_ROOT),
+            default_output_directory(PROJECT_ROOT),
+        ):
+            writable_directory.mkdir(parents=True, exist_ok=True)
         self.current_mapping_path: Path | None = None
         self.base_config = load_config(self.config_path)
         self.file_infos: list[dict[str, Any]] = []
@@ -1588,13 +1689,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._project_bad_channels: set[str] = set()
         self._pending_project_result_restore: dict[str, Any] | None = None
         self._project_result_restore_generation = 0
+        self._plot_focus_mode = False
+        self._pre_focus_analysis_width = ANALYSIS_PANEL_DEFAULT_WIDTH
         self._inspection_save_timer = QtCore.QTimer(self)
         self._inspection_save_timer.setSingleShot(True)
         self._inspection_save_timer.setInterval(700)
         self._inspection_save_timer.timeout.connect(self._autosave_project_inspection)
         self._build_ui()
+        self._header_layout_timer = QtCore.QTimer(self)
+        self._header_layout_timer.setSingleShot(True)
+        self._header_layout_timer.setInterval(50)
+        self._header_layout_timer.timeout.connect(self._update_header_responsiveness)
+        self._splitter_settings_timer = QtCore.QTimer(self)
+        self._splitter_settings_timer.setSingleShot(True)
+        self._splitter_settings_timer.setInterval(350)
+        self._splitter_settings_timer.timeout.connect(self._save_analysis_splitter_width)
+        self.analysis_splitter.splitterMoved.connect(lambda *_args: self._schedule_splitter_save())
+        QtCore.QTimer.singleShot(0, self._restore_analysis_splitter_width)
         self._wheel_focus_guard = install_wheel_focus_guard(self)
         help_menu = self.menuBar().addMenu("Help")
+        reading_action = help_menu.addAction("分析流程与读图说明")
+        reading_action.triggered.connect(lambda: self._show_analysis_help("workflow"))
+        results_action = help_menu.addAction("保存结果与字段词典")
+        results_action.triggered.connect(lambda: self._show_analysis_help("saved_results"))
+        help_menu.addSeparator()
         about_action = QtGui.QAction("About LUNA", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -1621,39 +1739,41 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(5)
         root.addWidget(self._build_top_toolbar(), stretch=0)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.setObjectName("analysisResultSplitter")
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(6)
+        self.analysis_splitter = splitter
         root.addWidget(splitter, stretch=1)
 
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setObjectName("analysisConfigScroll")
         self.analysis_config_scroll = left_scroll
-        left_scroll.setMinimumWidth(350)
+        left_scroll.setMinimumWidth(ANALYSIS_PANEL_MIN_WIDTH)
         left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         left_panel = QtWidgets.QWidget()
-        left_panel.setMinimumWidth(338)
+        left_panel.setMinimumWidth(ANALYSIS_PANEL_MIN_WIDTH - 10)
         left_scroll.setWidget(left_panel)
         left_layout = QtWidgets.QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(2, 2, 8, 2)
-        left_layout.setSpacing(10)
+        left_layout.setContentsMargins(2, 2, 6, 2)
+        left_layout.setSpacing(8)
         left_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         splitter.addWidget(left_scroll)
 
         right = QtWidgets.QWidget()
-        right.setMinimumWidth(560)
+        right.setMinimumWidth(RESULT_PANEL_MIN_WIDTH)
         right_layout = QtWidgets.QVBoxLayout(right)
-        right_layout.setContentsMargins(2, 2, 2, 2)
-        right_layout.setSpacing(7)
+        right_layout.setContentsMargins(1, 1, 1, 1)
+        right_layout.setSpacing(4)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([430, 1070])
+        splitter.setSizes([ANALYSIS_PANEL_DEFAULT_WIDTH, max(1, self.width() - ANALYSIS_PANEL_DEFAULT_WIDTH)])
 
         left_layout.addWidget(self._build_data_group())
         left_layout.addWidget(self._build_mapping_group())
@@ -1673,6 +1793,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.result_combo.setFixedHeight(30)
         self.result_combo.currentTextChanged.connect(self._show_selected_result)
         result_selector_row.addWidget(self.result_combo, stretch=1)
+        self.analysis_help_button = QtWidgets.QPushButton("如何读图")
+        self.analysis_help_button.setToolTip("查看当前结果模块的图表含义、坐标和解释边界；不会触发重新计算。")
+        self.analysis_help_button.clicked.connect(self._show_analysis_help)
+        result_selector_row.addWidget(self.analysis_help_button)
         self.result_info_button = QtWidgets.QPushButton("结果参数")
         self.result_info_button.setToolTip("查看所选历史结果的只读参数、通道/epoch选择、版本和质量信息。")
         self.result_info_button.setEnabled(False)
@@ -1811,40 +1935,25 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(self.status_panel, stretch=0)
 
     def _build_top_toolbar(self) -> QtWidgets.QWidget:
-        """Global project and execution controls, independent of parameters."""
+        """Compact adaptive header with stable two-row controls."""
         panel = QtWidgets.QWidget()
         panel.setObjectName("topToolbarPanel")
+        # Fixed vertically to its content-derived size hint: the header never
+        # grows with spare window height or shrinks under plot pressure.
         panel.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
-        panel.setFixedHeight(HEADER_PANEL_HEIGHT)
+        self.top_toolbar_panel = panel
+        # Kept as a compatibility reference; this is now the full-width header,
+        # not a fixed-width child inside a horizontal scroll area.
+        self.header_content_widget = panel
         outer = QtWidgets.QVBoxLayout(panel)
-        outer.setContentsMargins(8, 5, 8, 5)
+        outer.setContentsMargins(6, 3, 6, 3)
         outer.setSpacing(3)
-        # Only the header content is fixed-width.  The main window and result
-        # area remain resizable; a narrow window gets a local header scrollbar.
-        header_scroll = QtWidgets.QScrollArea()
-        header_scroll.setObjectName("headerScroll")
-        header_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        header_scroll.setWidgetResizable(False)
-        header_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        header_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        header_content = QtWidgets.QWidget()
-        header_content.setFixedWidth(HEADER_CONTENT_WIDTH)
-        self.header_scroll = header_scroll
-        self.header_content_widget = header_content
-        content_layout = QtWidgets.QVBoxLayout(header_content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(4)
+
+        # Row 1: compact brand, eliding data summary, and primary run/result actions.
         info_row = QtWidgets.QHBoxLayout()
-        info_row.setSpacing(14)
-        brand_panel = QtWidgets.QWidget()
-        brand_panel.setFixedWidth(240)
-        brand_layout = QtWidgets.QVBoxLayout(brand_panel)
-        brand_layout.setContentsMargins(0, 0, 0, 0)
-        brand_layout.setSpacing(0)
+        info_row.setContentsMargins(0, 0, 0, 0)
+        info_row.setSpacing(8)
         logo = QtWidgets.QLabel()
-        # The README/web light-theme header uses luna-logo.svg.  Reuse that
-        # exact branding asset in the desktop header so both surfaces stay in
-        # sync; the packaged copy is the installation fallback.
         logo_path = PROJECT_ROOT / "assets" / "branding" / "luna-logo.svg"
         if not logo_path.is_file():
             try:
@@ -1853,67 +1962,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 logo_path = packaged_resource_path("branding/luna-logo-on-white.svg")
         self.header_logo_path = logo_path
         self.header_logo = logo
-        logo.setPixmap(_load_logo_pixmap(logo_path, width=218, height=72))
-        logo.setFixedSize(218, 72)
+        logo.setPixmap(_load_logo_pixmap(logo_path))
+        logo.setFixedSize(HEADER_LOGO_WIDTH, HEADER_LOGO_HEIGHT)
         logo.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         logo.setToolTip(APP_DESCRIPTION)
-        # The formal Logo already contains the wordmark and full name.  Keep
-        # this brand area image-only so the name is not rendered twice.
-        brand_layout.addWidget(logo, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
-        info_row.addWidget(brand_panel)
+        info_row.addWidget(logo, stretch=0)
+
         summary_panel = QtWidgets.QWidget()
+        summary_panel.setMinimumWidth(205)
+        summary_panel.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
         summary_layout = QtWidgets.QVBoxLayout(summary_panel)
         summary_layout.setContentsMargins(0, 0, 0, 0)
         summary_layout.setSpacing(1)
-        self.header_dataset_label = QtWidgets.QLabel("未载入数据集")
+        self.header_dataset_label = ElidingLabel("未载入数据集")
         self.header_dataset_label.setStyleSheet(f"color: {GUI_COLORS['text']}; font-weight: 600;")
-        self.header_dataset_label.setWordWrap(False)
-        self.header_dataset_label.setToolTip("当前数据文件")
         summary_layout.addWidget(self.header_dataset_label)
-        self.header_data_summary_label = QtWidgets.QLabel("Epoch — / —；片段 —；通道 — / —")
+        self.header_data_summary_label = ElidingLabel("Epoch — / — · — s · 通道 — / —")
         self.header_data_summary_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
-        self.header_data_summary_label.setWordWrap(False)
         summary_layout.addWidget(self.header_data_summary_label)
         info_row.addWidget(summary_panel, stretch=1)
-        self.header_task_label = QtWidgets.QLabel("就绪")
-        self.header_task_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
-        self.header_task_label.setMinimumWidth(180)
-        self.header_task_label.setWordWrap(False)
-        self.header_task_label.setFixedHeight(24)
-        self.header_task_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
-        info_row.addWidget(self.header_task_label)
-        content_layout.addLayout(info_row)
-        # Keep the existing worker/status code independent of the layout.
-        self.task_label = self.header_task_label
-        action_row = QtWidgets.QHBoxLayout()
-        action_row.setSpacing(8)
-        action_row.addWidget(QtWidgets.QLabel("颜色模板"))
-        self.color_template_combo = QtWidgets.QComboBox()
-        self.color_template_combo.setMinimumWidth(150)
-        for template in available_color_templates():
-            self.color_template_combo.addItem(color_template_label(template), template)
-        self.color_template_combo.setCurrentIndex(max(0, self.color_template_combo.findData(DEFAULT_COLOR_TEMPLATE)))
-        self.color_template_combo.setToolTip("分类颜色模板；改变后只刷新显示，不重新计算分析结果。")
-        self.color_template_combo.currentIndexChanged.connect(self._display_color_changed)
-        action_row.addWidget(self.color_template_combo)
-        self.project_button = QtWidgets.QPushButton("Project")
-        self.project_button.setObjectName("globalSecondaryAction")
-        self.project_button.setToolTip("Create, open, and manage multi-subject LUNA projects.")
-        self.project_button.clicked.connect(self._show_project_workspace)
-        self.project_button.setFixedHeight(GLOBAL_ACTION_HEIGHT)
-        action_row.addWidget(self.project_button)
-        self.project_batch_button = QtWidgets.QPushButton("Batch")
-        self.project_batch_button.setObjectName("globalSecondaryAction")
-        self.project_batch_button.setToolTip("Choose project data, modules, and complete calculation parameters for a recoverable batch.")
-        self.project_batch_button.clicked.connect(self._show_project_batch)
-        self.project_review_button = QtWidgets.QPushButton("Review")
-        self.project_review_button.setObjectName("globalSecondaryAction")
-        self.project_review_button.setToolTip("Review saved result versions and set independent approval status.")
-        self.project_review_button.clicked.connect(self._show_project_review)
-        for button in (self.project_batch_button, self.project_review_button):
-            button.setFixedHeight(GLOBAL_ACTION_HEIGHT)
-            action_row.addWidget(button)
-        action_row.addStretch(1)
+
+        action_group = QtWidgets.QWidget(panel)
+        action_row = QtWidgets.QHBoxLayout(action_group)
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(5)
         self.run_button = QtWidgets.QPushButton("Run Analysis")
         self.run_button.setObjectName("primaryAction")
         self.run_button.setToolTip("按当前文件、通道、epoch、脑区对和计算参数运行已勾选指标。")
@@ -1940,21 +2012,172 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.export_figure_button.clicked.connect(self._export_figure)
         for button in (self.run_button, self.cancel_button, self.save_result_button, self.export_figure_button):
-            button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 28)
+            button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 20)
             button.setFixedHeight(GLOBAL_ACTION_HEIGHT)
             button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Fixed)
             action_row.addWidget(button)
+        info_row.addWidget(action_group, stretch=0)
+        outer.addLayout(info_row)
+
+        # Row 2: workspace actions and display-only controls; lower-priority
+        # workspace buttons collapse into one menu on narrow logical screens.
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(6)
+        self.project_button = QtWidgets.QPushButton("Project")
+        self.project_button.setObjectName("globalSecondaryAction")
+        self.project_button.setToolTip("Create, open, and manage multi-subject LUNA projects.")
+        self.project_button.clicked.connect(self._show_project_workspace)
+        self.project_batch_button = QtWidgets.QPushButton("Batch")
+        self.project_batch_button.setObjectName("globalSecondaryAction")
+        self.project_batch_button.setToolTip("Choose project data, modules, and complete calculation parameters for a recoverable batch.")
+        self.project_batch_button.clicked.connect(self._show_project_batch)
+        self.project_review_button = QtWidgets.QPushButton("Review")
+        self.project_review_button.setObjectName("globalSecondaryAction")
+        self.project_review_button.setToolTip("Review saved result versions and set independent approval status.")
+        self.project_review_button.clicked.connect(self._show_project_review)
+        self.workspace_more_button = QtWidgets.QToolButton()
+        self.workspace_more_button.setText("Workspace ▾")
+        self.workspace_more_button.setToolTip("Project, Batch, and Review workspaces")
+        self.workspace_more_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.workspace_more_menu = QtWidgets.QMenu(self.workspace_more_button)
+        for text, callback in (
+            ("Project", self._show_project_workspace),
+            ("Batch", self._show_project_batch),
+            ("Review", self._show_project_review),
+        ):
+            self.workspace_more_menu.addAction(text, callback)
+        self.workspace_more_button.setMenu(self.workspace_more_menu)
+        for button in (self.project_button, self.project_batch_button, self.project_review_button, self.workspace_more_button):
+            button.setFixedHeight(30)
+            button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 18)
+            button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Fixed)
+            action_row.addWidget(button)
+
+        self.color_template_combo = QtWidgets.QComboBox(panel)
+        for template in available_color_templates():
+            self.color_template_combo.addItem(color_template_label(template), template)
+        self.color_template_combo.setCurrentIndex(max(0, self.color_template_combo.findData(DEFAULT_COLOR_TEMPLATE)))
+        self.color_template_combo.setToolTip("分类颜色模板；改变后只刷新显示，不重新计算分析结果。")
+        self.color_template_combo.currentIndexChanged.connect(self._display_color_changed)
+        self.color_template_combo.hide()
+        self.display_settings_button = QtWidgets.QToolButton()
+        self.display_settings_button.setText("显示设置 ▾")
+        self.display_settings_button.setToolTip("更改分类配色；只刷新显示，不会重新计算。")
+        self.display_settings_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.display_settings_menu = QtWidgets.QMenu(self.display_settings_button)
+        self._color_template_actions: dict[str, QtGui.QAction] = {}
+        for template in available_color_templates():
+            action = self.display_settings_menu.addAction(color_template_label(template))
+            action.setCheckable(True)
+            action.setChecked(template == DEFAULT_COLOR_TEMPLATE)
+            action.triggered.connect(lambda _checked=False, value=template: self._select_color_template(value))
+            self._color_template_actions[template] = action
+        self.display_settings_button.setMenu(self.display_settings_menu)
+        self.display_settings_button.setFixedHeight(30)
+        self.display_settings_button.setMinimumWidth(self.display_settings_button.fontMetrics().horizontalAdvance(self.display_settings_button.text()) + 18)
+        action_row.addWidget(self.display_settings_button)
+
+        self.focus_plot_button = QtWidgets.QPushButton("专注绘图")
+        self.focus_plot_button.setCheckable(True)
+        self.focus_plot_button.setToolTip("临时收起左侧参数区；再次点击可恢复。")
+        self.focus_plot_button.setFixedHeight(30)
+        self.focus_plot_button.setMinimumWidth(self.focus_plot_button.fontMetrics().horizontalAdvance("退出专注绘图") + 18)
+        self.focus_plot_button.toggled.connect(self._toggle_plot_focus)
+        action_row.addWidget(self.focus_plot_button)
+
+        action_row.addStretch(1)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setTextVisible(False)
-        self.progress.setFixedWidth(86)
-        self.progress.setToolTip("后台任务进度；无法估计时会使用不确定进度。")
+        self.progress.setFixedSize(76, 16)
+        self.progress.setToolTip("后台任务进度；无法估计时会显示忙碌指示。")
+        self.progress.setVisible(False)
         action_row.addWidget(self.progress)
-        content_layout.addLayout(action_row)
-        header_scroll.setWidget(header_content)
-        header_scroll.setFixedHeight(112)
-        outer.addWidget(header_scroll)
+        self.header_task_label = ElidingLabel("就绪")
+        self.header_task_label.setStyleSheet(f"color: {GUI_COLORS['muted']};")
+        self.header_task_label.setMinimumWidth(90)
+        self.header_task_label.setFixedHeight(24)
+        self.header_task_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
+        action_row.addWidget(self.header_task_label, stretch=1)
+        self.task_label = self.header_task_label
+        outer.addLayout(action_row)
+
+        self._update_header_responsiveness()
         return panel
+
+    def _select_color_template(self, template: str) -> None:
+        index = self.color_template_combo.findData(template)
+        if index >= 0:
+            self.color_template_combo.setCurrentIndex(index)
+
+    def _update_header_responsiveness(self) -> None:
+        if not hasattr(self, "workspace_more_button") or not hasattr(self, "top_toolbar_panel"):
+            return
+        use_workspace_menu = self.top_toolbar_panel.width() < HEADER_WORKSPACE_MENU_THRESHOLD
+        for button in (self.project_button, self.project_batch_button, self.project_review_button):
+            button.setVisible(not use_workspace_menu)
+        self.workspace_more_button.setVisible(use_workspace_menu)
+
+    def _schedule_splitter_save(self) -> None:
+        if not self._plot_focus_mode and hasattr(self, "_splitter_settings_timer"):
+            self._splitter_settings_timer.start()
+
+    def _save_analysis_splitter_width(self) -> None:
+        if self._plot_focus_mode or not hasattr(self, "analysis_splitter"):
+            return
+        sizes = self.analysis_splitter.sizes()
+        if len(sizes) == 2 and sizes[0] >= ANALYSIS_PANEL_MIN_WIDTH:
+            QtCore.QSettings("LUNA", "LUNA").setValue("main_analysis_panel_width", int(sizes[0]))
+
+    def _restore_analysis_splitter_width(self) -> None:
+        if not hasattr(self, "analysis_splitter"):
+            return
+        settings = QtCore.QSettings("LUNA", "LUNA")
+        if not settings.contains("main_analysis_panel_width"):
+            return
+        try:
+            saved_width = int(settings.value("main_analysis_panel_width"))
+        except (TypeError, ValueError):
+            saved_width = ANALYSIS_PANEL_DEFAULT_WIDTH
+        total_width = self.analysis_splitter.width()
+        right_min = self.analysis_splitter.widget(1).minimumWidth()
+        max_left = min(ANALYSIS_PANEL_MAX_WIDTH, total_width - right_min - self.analysis_splitter.handleWidth())
+        if max_left < ANALYSIS_PANEL_MIN_WIDTH:
+            return
+        left_width = min(max(saved_width, ANALYSIS_PANEL_MIN_WIDTH), max_left)
+        self.analysis_splitter.setSizes([left_width, max(1, total_width - left_width)])
+
+    def _toggle_plot_focus(self, focused: bool) -> None:
+        if focused:
+            sizes = self.analysis_splitter.sizes()
+            if sizes and sizes[0] >= ANALYSIS_PANEL_MIN_WIDTH:
+                self._pre_focus_analysis_width = sizes[0]
+            self._plot_focus_mode = True
+            self.analysis_splitter.setCollapsible(0, True)
+            self.analysis_config_scroll.hide()
+            self.analysis_splitter.setSizes([0, max(1, self.analysis_splitter.width())])
+            self.focus_plot_button.setText("退出专注绘图")
+        else:
+            self.analysis_config_scroll.show()
+            self.analysis_splitter.setCollapsible(0, False)
+            self._plot_focus_mode = False
+            self._restore_focus_analysis_panel()
+            self.focus_plot_button.setText("专注绘图")
+
+    def _restore_focus_analysis_panel(self) -> None:
+        total_width = self.analysis_splitter.width()
+        right_min = self.analysis_splitter.widget(1).minimumWidth()
+        max_left = min(ANALYSIS_PANEL_MAX_WIDTH, total_width - right_min - self.analysis_splitter.handleWidth())
+        if max_left < ANALYSIS_PANEL_MIN_WIDTH:
+            return
+        left_width = min(max(self._pre_focus_analysis_width, ANALYSIS_PANEL_MIN_WIDTH), max_left)
+        self.analysis_splitter.setSizes([left_width, max(1, total_width - left_width)])
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_header_layout_timer"):
+            self._header_layout_timer.start()
 
     def _group(self, title: str) -> tuple[CollapsiblePanel, QtWidgets.QVBoxLayout]:
         box = CollapsiblePanel(title)
@@ -1976,8 +2199,12 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addStretch(1)
         layout.addLayout(row)
 
-        inspection_row = QtWidgets.QHBoxLayout()
-        inspection_row.setSpacing(6)
+        inspection_rows = QtWidgets.QGridLayout()
+        inspection_rows.setObjectName("inspectionControlsGrid")
+        self.inspection_controls_grid = inspection_rows
+        inspection_rows.setContentsMargins(0, 0, 0, 0)
+        inspection_rows.setHorizontalSpacing(5)
+        inspection_rows.setVerticalSpacing(4)
         self.save_inspection_button = QtWidgets.QPushButton("保存检查")
         self.save_inspection_button.setToolTip("Save this data unit's channel mapping, included channels, epoch/time selection, review status, and notes to the project.")
         self.save_inspection_button.clicked.connect(self._save_project_inspection)
@@ -1990,7 +2217,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.inspection_status_combo.currentIndexChanged.connect(lambda _index: self._schedule_project_inspection_save("inspection_status_edit"))
         self.inspection_notes_edit = QtWidgets.QLineEdit()
         self.inspection_notes_edit.setPlaceholderText("检查备注（保存在本地项目）")
-        self.inspection_notes_edit.setMinimumWidth(160)
+        self.inspection_notes_edit.setMinimumWidth(48)
         self.inspection_notes_edit.editingFinished.connect(lambda: self._schedule_project_inspection_save("inspection_notes_edit"))
         self.previous_project_data_button = QtWidgets.QPushButton("上一份")
         self.previous_project_data_button.clicked.connect(lambda: self._open_project_adjacent(-1, unchecked_only=False))
@@ -1998,19 +2225,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.next_project_data_button.clicked.connect(lambda: self._open_project_adjacent(1, unchecked_only=False))
         self.next_unchecked_button = QtWidgets.QPushButton("下一份待检查")
         self.next_unchecked_button.clicked.connect(lambda: self._open_project_adjacent(1, unchecked_only=True))
-        for button in (self.save_inspection_button, self.previous_project_data_button, self.next_project_data_button, self.next_unchecked_button):
-            inspection_row.addWidget(button)
-        inspection_row.addWidget(self.inspection_status_combo)
-        inspection_row.addWidget(self.inspection_notes_edit, 1)
-        inspection_row.addStretch(1)
-        layout.addLayout(inspection_row)
+        # Keep the project-review controls usable in the compact analysis
+        # sidebar.  A single horizontal row clipped these labels at narrow
+        # widths; the second row can shrink the optional notes field instead.
+        inspection_rows.addWidget(self.save_inspection_button, 0, 0)
+        inspection_rows.addWidget(self.previous_project_data_button, 0, 1)
+        inspection_rows.addWidget(self.next_project_data_button, 0, 2)
+        inspection_rows.addWidget(self.next_unchecked_button, 1, 0)
+        inspection_rows.addWidget(self.inspection_status_combo, 1, 1)
+        inspection_rows.addWidget(self.inspection_notes_edit, 1, 2)
+        inspection_rows.setColumnStretch(2, 1)
+        layout.addLayout(inspection_rows)
         self.file_combo = QtWidgets.QComboBox()
         self.file_combo.setMinimumWidth(180)
         self.file_combo.setToolTip("当前文件；悬停可查看完整路径。")
         self.file_combo.currentIndexChanged.connect(self._file_changed)
         layout.addWidget(self.file_combo)
         output_row = QtWidgets.QHBoxLayout()
-        self.output_edit = QtWidgets.QLineEdit(str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME))
+        self.output_edit = QtWidgets.QLineEdit(str(default_output_directory(PROJECT_ROOT)))
         self.output_edit.setToolTip("分析结果保存目录；完整路径可直接编辑、复制。")
         choose_output = QtWidgets.QPushButton("输出目录")
         choose_output.setToolTip("选择分析结果保存目录。")
@@ -2170,7 +2402,7 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "保存通道映射",
-            str(PROJECT_ROOT / DEFAULT_MAPPING_FILENAME),
+            str(default_config_directory(PROJECT_ROOT) / DEFAULT_MAPPING_FILENAME),
             "JSON (*.json)",
         )
         if not path:
@@ -2187,7 +2419,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.current_info is None:
             self._show_message(QtWidgets.QMessageBox.Icon.Information, "尚未载入文件", "请先导入 FIF 文件。")
             return
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "载入通道映射", str(PROJECT_ROOT), "JSON (*.json)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "载入通道映射", str(default_config_directory(PROJECT_ROOT)), "JSON (*.json)")
         if not path:
             return
         try:
@@ -2342,7 +2574,9 @@ class MainWindow(QtWidgets.QMainWindow):
         method_display_names = {"wpli": "wPLI", "dpli": "dPLI", "wpli2_debiased": "wPLI²_debiased", "Time Delay": "TDE"}
         for index, name in enumerate(method_names):
             checkbox = QtWidgets.QCheckBox(method_display_names.get(name, name))
-            checkbox.setToolTip(descriptions[name])
+            available, dependency_hint = optional_method_availability(name)
+            checkbox.setEnabled(available)
+            checkbox.setToolTip(descriptions[name] if available else f"{descriptions[name]}\n{dependency_hint}")
             checkbox.stateChanged.connect(self._indicator_changed)
             self.indicator_checks[name] = checkbox
             method_grid.addWidget(checkbox, index // 3, index % 3)
@@ -2350,12 +2584,18 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(connectivity_box)
         for name in ("Quality", "PSD", "Band Power", "FOOOF"):
             checkbox = QtWidgets.QCheckBox(name)
-            checkbox.setToolTip(descriptions[name])
+            available, dependency_hint = self._optional_method_availability(name)
+            checkbox.setEnabled(available)
+            checkbox.setToolTip(descriptions[name] if available else f"{descriptions[name]}\n{dependency_hint}")
             checkbox.stateChanged.connect(self._indicator_changed)
             self.indicator_checks[name] = checkbox
             layout.addWidget(checkbox)
         self._rebuild_pair_controls()
         return box
+
+    def _optional_method_availability(self, name: str) -> tuple[bool, str]:
+        backend = str(self.base_config.get("parameterization", {}).get("backend", "specparam"))
+        return optional_method_availability(name, parameterization_backend=backend)
 
     def _build_parameter_group(self) -> QtWidgets.QGroupBox:
         box, layout = self._group("计算参数（实际传入后端）")
@@ -2898,6 +3138,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_text.clear()
         self._log(f"开始读取 {len(paths)} 个 FIF；将自动计算质量和实际有效时长…")
         self.task_label.setText("状态：正在读取 FIF 和通道映射…")
+        self.progress.setVisible(False)
         self.run_button.setEnabled(False)
         self.inspect_thread = QtCore.QThread(self)
         worker = InspectWorker(paths, self.metadata_dir, self.config_path)
@@ -3128,6 +3369,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if str(payload.get("task_id", "")) != self._active_inspect_task_id:
                 return
             message = str(payload.get("message", "读取失败"))
+            if payload.get("diagnostic_report"):
+                self._log(f"读取失败诊断报告：{payload['diagnostic_report']}")
+            if payload.get("diagnostic_report_error"):
+                self._log(f"读取失败诊断报告写入失败：{payload['diagnostic_report_error']}")
         else:
             message = str(payload)
         self.run_button.setEnabled(True)
@@ -3158,8 +3403,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pair_checks.clear()
         self.mapping_status_label.setText("尚未载入文件。")
         self.header_dataset_label.setText("未载入数据集")
-        self.header_data_summary_label.setText("Epoch — / —；片段 —；通道 — / —")
+        self.header_data_summary_label.setText("Epoch —/— · — s · 通道 —/—")
         self.run_button.setText("Run Analysis")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setVisible(False)
         self.data_info_label.setText("尚未载入文件。")
         self.project_context_label.setText("Not attached to a project data unit.")
         self.selection_label.setText("选择数据量：尚未载入")
@@ -3291,9 +3539,7 @@ class MainWindow(QtWidgets.QMainWindow):
         quality_file = info.get("quality_file", {})
         quality_status = "fail" if int(quality_file.get("n_fail_epoch_channel_rows", 0)) else ("warn" if int(quality_file.get("n_warn_epoch_channel_rows", 0)) else "ok")
         self.data_info_label.setText(
-            f"文件：{Path(info['path']).name}\n"
-            f"采样率：{info['sfreq']:g} Hz；形状：{info['n_epochs']} × {info['n_channels']} × {info['n_times']}\n"
-            f"epoch 时间：{info['tmin']:g}–{info['tmax']:g} s；保留数据名义时长：{float(info.get('nominal_duration_s', 0.0)):g} s\n"
+            f"采样率：{info['sfreq']:g} Hz；epoch 时间：{info['tmin']:g}–{info['tmax']:g} s\n"
             f"实际有效时长：{float(info.get('effective_duration_s', 0.0)):g} s；"
             f"候选 epoch：{info.get('n_candidate_epochs', info['n_epochs'])}，上游删除：{info.get('n_dropped_candidates', 0)}\n"
             f"自动质量：{quality_status}；fail={int(quality_file.get('n_fail_epoch_channel_rows', 0))}，"
@@ -3378,7 +3624,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.current_info is None:
             self.preview_epoch_label.setText("Epoch — / —")
             if hasattr(self, "header_data_summary_label"):
-                self.header_data_summary_label.setText("Epoch — / —；片段 —；通道 — / —")
+                self.header_data_summary_label.setText("Epoch —/— · — s · 通道 —/—")
             return
         total = int(self.current_info.get("n_epochs", 0))
         current = min(max(0, self.preview_epoch.value()), max(0, total - 1))
@@ -3390,7 +3636,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "header_data_summary_label"):
             return
         if self.current_info is None:
-            self.header_data_summary_label.setText("Epoch — / —；片段 —；通道 — / —")
+            self.header_data_summary_label.setText("Epoch —/— · — s · 通道 —/—")
             return
         info = self.current_info
         total_epochs = int(info.get("n_epochs", 0))
@@ -3399,8 +3645,8 @@ class MainWindow(QtWidgets.QMainWindow):
         selected_count = len(self._selected_channel_names()) if hasattr(self, "channel_list") else 0
         duration_text = f"{duration:g} s" if np.isfinite(duration) else "—"
         self.header_data_summary_label.setText(
-            f"Epoch {current_epoch} / {total_epochs}；片段 {duration_text}；"
-            f"通道 {int(info.get('n_channels', 0))} / {selected_count}"
+            f"Epoch {current_epoch}/{total_epochs} · {duration_text} · "
+            f"通道 {int(info.get('n_channels', 0))}/{selected_count}"
         )
 
     def _update_selection_label(self) -> None:
@@ -3782,7 +4028,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_button.setText("Running...")
         self.cancel_button.setEnabled(True)
         self.task_label.setText("状态：后台运行中…")
+        self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setVisible(True)
         self.analysis_thread = QtCore.QThread(self)
         self.analysis_worker = AnalysisWorker(snapshot, self.config_path, self.metadata_dir)
         self.analysis_worker.moveToThread(self.analysis_thread)
@@ -3812,7 +4060,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._active_analysis_task_id and self.analysis_worker is not None and self.analysis_worker.task_id != self._active_analysis_task_id:
             return
         self.task_label.setText(f"状态：{message}")
-        self.progress.setValue(percent)
+        if percent < 0:
+            self.progress.setRange(0, 0)
+        else:
+            if self.progress.maximum() == 0:
+                self.progress.setRange(0, 100)
+            self.progress.setValue(max(0, min(int(percent), 100)))
+        self.progress.setVisible(True)
         if message != self._last_progress_message:
             self._log(f"进度 {percent}%：{message}")
             self._last_progress_message = message
@@ -3834,7 +4088,35 @@ class MainWindow(QtWidgets.QMainWindow):
             index = self.result_combo.findData(key)
             if index >= 0:
                 self.result_combo.setCurrentIndex(index)
-        self._show_payload(payload, force_new_result=True)
+        try:
+            self._show_payload(payload, force_new_result=True)
+        except Exception as exc:  # noqa: BLE001 - report GUI rendering failures without losing saved tables
+            report_path = None
+            file_dir = Path(str(payload.get("file_dir", "")))
+            if file_dir.is_dir():
+                try:
+                    report_path = write_failure_report(
+                        file_dir / "diagnostics" / "gui_result_render_failure.json",
+                        {
+                            "stage": "gui_result_render",
+                            "metric": payload.get("metric", "unknown"),
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                            "input_shape": payload.get("input_shape"),
+                            "saved_metric_status": record.get("status", "unknown") if isinstance(record, dict) else "unknown",
+                            "scientific_tables_saved": bool((record.get("paths") or {}).get("tables")) if isinstance(record, dict) else False,
+                        },
+                    )
+                except Exception as report_error:  # noqa: BLE001 - retain the original render failure in the visible log
+                    self._log(f"绘图失败诊断报告写入失败：{type(report_error).__name__}: {report_error}")
+            brief = f"结果绘图失败：{type(exc).__name__}: {exc}"
+            self.result_status_label.setText("绘图失败；数值结果仍保留")
+            self.task_label.setText(brief)
+            self._log(brief)
+            if report_path is not None:
+                self._log(f"详细诊断报告：{report_path}")
+            return
         parameters = record.get("parameters", {}) if isinstance(record, dict) else {}
         call_count = parameters.get("estimation_call_count") if isinstance(parameters, dict) else None
         suffix = f"；谱估计调用={call_count}" if call_count is not None else ""
@@ -3851,6 +4133,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_button.setEnabled(True)
         self.run_button.setText("Completed" if manifest.get("status") in {"completed", "completed_with_errors"} else "Failed")
         self.cancel_button.setEnabled(False)
+        self.progress.setRange(0, 100)
+        self.progress.setVisible(True)
         self.progress.setValue(100 if manifest.get("status") in {"completed", "completed_with_errors"} else self.progress.value())
         self.task_label.setText(f"状态：{manifest.get('status', 'unknown')}；结果目录：{outcome.get('run_dir', '')}")
         self._log(
@@ -3859,6 +4143,15 @@ class MainWindow(QtWidgets.QMainWindow):
             f"错误={len(manifest.get('errors', []))}；"
             f"警告={len(manifest.get('warnings', []))}。"
         )
+        for report_path in manifest.get("diagnostic_reports", []):
+            self._log(f"诊断报告：{Path(outcome.get('run_dir', '')) / report_path}")
+        if outcome.get("diagnostic_report"):
+            self._log(f"后台异常诊断报告：{outcome['diagnostic_report']}")
+        if outcome.get("diagnostic_report_error"):
+            self._log(f"后台异常诊断报告写入失败：{outcome['diagnostic_report_error']}")
+        for error in manifest.get("errors", []):
+            summary = (error.get("error") or error.get("message") or str(error)) if isinstance(error, dict) else str(error)
+            self._log(f"任务错误：{summary}")
         self.loaded_run = outcome
         if (
             self.project_store is not None
@@ -3870,7 +4163,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 run_dir = Path(outcome["run_dir"])
                 parameters = json.loads((run_dir / "parameters.json").read_text(encoding="utf-8")).get("values", {})
                 file_records = list(manifest.get("files", []))
-                file_manifest = json.loads((run_dir / file_records[0]["file_dir"] / "file_manifest.json").read_text(encoding="utf-8")) if len(file_records) == 1 else {}
+                file_manifest = json.loads(resolve_manifest_path(run_dir, file_records[0]["file_dir"], "file_dir").joinpath("file_manifest.json").read_text(encoding="utf-8")) if len(file_records) == 1 else {}
                 frozen_data_unit_id = str((file_manifest.get("project_context") or {}).get("data_unit_id") or "")
                 if frozen_data_unit_id:
                     runner.index_completed_run(frozen_data_unit_id, parameters, run_dir, manifest)
@@ -4012,7 +4305,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._displayed_result_key = ""
             self._pending_project_result_restore = None
             self._restore_project_saved_results(dict(context), generation=self._project_result_restore_generation)
-            self.header_dataset_label.setText(f"结果浏览：{Path(source_path).name}")
+            self.header_dataset_label.setText(f"结果浏览：{portable_path_name(source_path)}")
             self.header_data_summary_label.setText("原始 FIF 不可用；仅浏览已保存结果")
             self.project_context_label.setText(self._project_context_text())
             self.task_label.setText("状态：原始文件不可用，已尝试恢复已保存结果。")
@@ -4034,11 +4327,13 @@ class MainWindow(QtWidgets.QMainWindow):
         their manifest validation, path handling, or payload construction.
         """
         data_unit_id = str(context.get("data_unit_id") or "")
-        bundle = Path(str(row["result_path"]))
-        if not bundle.is_absolute():
+        bundle_value = Path(str(row["result_path"]))
+        if bundle_value.is_absolute():
+            bundle = bundle_value
+        else:
             if self.project_store is None:
                 raise ValueError("project store is not attached")
-            bundle = self.project_store.paths.root / bundle
+            bundle = self.project_store.resolve_project_relative_path(bundle_value)
         manifest = load_result_manifest(bundle)
         if str(manifest.get("data_unit_id")) != data_unit_id:
             raise ValueError("result data_unit_id does not match the selected project data unit")
@@ -4054,7 +4349,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "warnings": manifest.get("warnings", row.get("warnings", [])),
             "analysis_id": analysis_identifier,
         }
-        file_id = Path(str(context.get("source_path") or manifest.get("source", {}).get("path") or data_unit_id)).stem
+        source_label = str(context.get("source_path") or manifest.get("source", {}).get("path") or data_unit_id)
+        file_id = Path(portable_path_name(source_label)).stem
         # Keep versions distinct in the result selector.  The older code used
         # only data_unit_id here, which made manual history selection replace
         # the automatically restored version invisibly.
@@ -4223,6 +4519,21 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(buttons)
         dialog.exec()
 
+    def _show_analysis_help(self, topic_id: str | bool | None = None) -> None:
+        if not isinstance(topic_id, str) or topic_id not in HELP_TOPICS:
+            metric = str((self._current_result_payload() or {}).get("metric", ""))
+            topic_id = {
+                "Raw Waveform": "raw_quality",
+                "Quality": "raw_quality",
+                "PSD": "psd",
+                "Band Power": "band_power",
+                "FOOOF": "parameterization",
+                "Connectivity": "connectivity",
+                "Time Delay": "time_delay",
+            }.get(metric, "workflow")
+        dialog = AnalysisHelpDialog(topic_id, self)
+        dialog.exec()
+
     def _apply_result_parameters(self) -> None:
         payload = self._current_result_payload()
         if not payload or not payload.get("historical_parameters"):
@@ -4253,6 +4564,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _display_color_changed(self, *_args: Any) -> None:
         """Update classification colours without invalidating numeric results."""
         template = str(self.color_template_combo.currentData() or DEFAULT_COLOR_TEMPLATE)
+        for name, action in self._color_template_actions.items():
+            action.setChecked(name == template)
         self.canvas.color_template = template
         self.band_power_view.set_color_template(template)
         self.fooof_view.set_color_template(template)
@@ -4454,7 +4767,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # user's last Welch and Multitaper values.  Runtime snapshots above
         # still contain only the currently effective PSD branch.
         snapshot["values"] = self._read_parameter_values(active_psd_only=False)
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存分析预设", str(PROJECT_ROOT / "configs" / "gui_preset.json"), "JSON (*.json)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存分析预设", str(default_config_directory(PROJECT_ROOT) / "gui_preset.json"), "JSON (*.json)")
         if path:
             preset = {
                 "schema_version": 2,
@@ -4485,13 +4798,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"已保存预设：{path}")
 
     def _load_preset(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "载入分析预设", str(PROJECT_ROOT / "configs"), "JSON (*.json)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "载入分析预设", str(default_config_directory(PROJECT_ROOT)), "JSON (*.json)")
         if not path:
             return
         try:
             preset = json.loads(Path(path).read_text(encoding="utf-8"))
+            requested_indicators = set(preset.get("indicators", []))
+            unavailable = [
+                name
+                for name in requested_indicators
+                if name in self.indicator_checks and not self._optional_method_availability(name)[0]
+            ]
             for name, checkbox in self.indicator_checks.items():
-                checkbox.setChecked(name in preset.get("indicators", []))
+                checkbox.setChecked(name in requested_indicators and name not in unavailable)
             values = preset.get("values", {})
             display_settings = preset.get("display_settings", {})
             template = str(display_settings.get("color_template", DEFAULT_COLOR_TEMPLATE)) if isinstance(display_settings, dict) else DEFAULT_COLOR_TEMPLATE
@@ -4531,6 +4850,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_parameter_tabs()
             self._set_dirty(True)
             self._log(f"已载入预设：{path}")
+            if unavailable:
+                details = "；".join(self._optional_method_availability(name)[1] for name in unavailable)
+                self._show_message(
+                    QtWidgets.QMessageBox.Icon.Warning,
+                    "预设中的可选方法不可用",
+                    f"当前环境未启用：{', '.join(sorted(unavailable))}。这些方法没有改用其他算法。\n{details}",
+                )
         except Exception as exc:  # noqa: BLE001
             self._show_message(QtWidgets.QMessageBox.Icon.Warning, "载入预设失败", str(exc))
 
@@ -4644,7 +4970,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.result_combo.currentText().endswith("| Connectivity") or self.result_combo.currentText().endswith("| Time Delay"):
             self._export_connectivity("spectrum")
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出当前图", str(PROJECT_ROOT / "results" / "luna_figure.svg"), "SVG (*.svg);;PNG (*.png);;PDF (*.pdf)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出当前图", str(default_output_directory(PROJECT_ROOT) / "luna_figure.svg"), "SVG (*.svg);;PNG (*.png);;PDF (*.pdf)")
         if path:
             self.canvas.figure.savefig(path, dpi=200)
             self._log(f"已导出图：{path}")
@@ -4658,7 +4984,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _export_band_figure(self, kind: str) -> None:
         names = {"overview": "band_power_overview", "comparison": "band_power_compare", "combined": "band_power_combined"}
-        default = PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / f"luna_{names.get(kind, 'band_power')}.svg"
+        default = default_output_directory(PROJECT_ROOT) / f"luna_{names.get(kind, 'band_power')}.svg"
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "导出频带功率图",
@@ -4675,14 +5001,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.fooof_view.payload is None:
             return
         if kind == "all":
-            directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择 FOOOF 全部结果输出目录", str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME))
+            directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择 FOOOF 全部结果输出目录", str(default_output_directory(PROJECT_ROOT)))
             if directory:
                 figures = self.fooof_view.save_all(directory)
                 tables = self.fooof_view.save_tables(Path(directory) / "fooof")
                 self._log(f"已导出 FOOOF 全部图表 {len(figures)} 个和数据表 {len(tables)} 个。")
             return
         if kind == "tables":
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出 FOOOF 数值表前缀", str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / "luna_fooof.csv"), "CSV (*.csv)")
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出 FOOOF 数值表前缀", str(default_output_directory(PROJECT_ROOT) / "luna_fooof.csv"), "CSV (*.csv)")
             if path:
                 tables = self.fooof_view.save_tables(path)
                 self._log(f"已导出 FOOOF 数据表 {len(tables)} 个。")
@@ -4690,7 +5016,7 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "导出当前 FOOOF 图",
-            str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / "luna_fooof_current.svg"),
+            str(default_output_directory(PROJECT_ROOT) / "luna_fooof_current.svg"),
             "PNG (*.png);;TIFF (*.tif *.tiff);;SVG (*.svg);;PDF (*.pdf)",
         )
         if path:
@@ -4705,7 +5031,7 @@ class MainWindow(QtWidgets.QMainWindow):
             path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self,
                 "导出连接指标数值表前缀",
-                str(PROJECT_ROOT / "results" / DEFAULT_OUTPUT_DIRNAME / "luna_connectivity.csv"),
+                str(default_output_directory(PROJECT_ROOT) / "luna_connectivity.csv"),
                 "CSV (*.csv)",
             )
             if path:
@@ -4745,15 +5071,15 @@ class MainWindow(QtWidgets.QMainWindow):
             ):
                 event.ignore()
                 return
-        if self.analysis_worker is not None:
+        if self.analysis_worker is not None and shiboken6.isValid(self.analysis_worker):
             self.analysis_worker.cancel_event.set()
-        if self.analysis_thread is not None and self.analysis_thread.isRunning():
+        if self.analysis_thread is not None and shiboken6.isValid(self.analysis_thread) and self.analysis_thread.isRunning():
             self.analysis_thread.requestInterruption()
             if not self.analysis_thread.wait(3000):
                 self.task_label.setText("状态：后台任务仍在收尾，请稍后再关闭窗口。")
                 event.ignore()
                 return
-        if self.inspect_thread is not None and self.inspect_thread.isRunning():
+        if self.inspect_thread is not None and shiboken6.isValid(self.inspect_thread) and self.inspect_thread.isRunning():
             self.inspect_thread.requestInterruption()
             if not self.inspect_thread.wait(3000):
                 self.task_label.setText("状态：文件读取仍在收尾，请稍后再关闭窗口。")
@@ -4771,3 +5097,13 @@ def launch(input_files: list[str] | None = None, output_dir: str | None = None, 
     window = MainWindow(input_files=input_files, output_dir=output_dir, project_root=project_root)
     window.show()
     return app.exec()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Installed command-line entry point for the desktop application."""
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} — {APP_FULL_NAME}")
+    parser.add_argument("--input", action="append", default=[], help="预先载入的 FIF 文件；可重复指定")
+    parser.add_argument("--output", default=None, help="分析结果根目录；默认使用当前用户可写目录")
+    parser.add_argument("--project", default=None, help="启动时打开的 LUNA 项目目录")
+    args = parser.parse_args(argv)
+    return launch(input_files=args.input or None, output_dir=args.output, project_root=args.project)

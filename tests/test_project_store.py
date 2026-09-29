@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pandas as pd
 import pytest
 
 from lfp_analysis.comparison import paired_subject_summary, select_results
+from lfp_analysis.portable_paths import portable_path_name
 from lfp_analysis.project_store import ProjectStore, normalize_project_folder_name
 from lfp_analysis.result_contract import (
     load_array,
@@ -134,6 +136,82 @@ def test_result_contract_is_named_versioned_and_readable_without_source(tmp_path
     (bundle / "values.csv").unlink()
     with pytest.raises(ValueError, match="missing_file"):
         load_result_manifest(bundle)
+
+
+def test_windows_result_paths_normalize_and_legacy_bundle_reopens_after_move(tmp_path: Path):
+    project_root = tmp_path / "project"
+    store = ProjectStore.create(project_root, "Portable results")
+    source = tmp_path / "source.fif"
+    source.write_bytes(b"source")
+    data_unit_id = _hierarchy(store, source)
+    unit = store.data_units(data_unit_ids=[data_unit_id])[0]
+    bundle = project_root / "results" / data_unit_id / "psd"
+    (bundle / "tables").mkdir(parents=True)
+    (bundle / "arrays").mkdir()
+    pd.DataFrame({"value": [2.5]}).to_csv(bundle / "tables" / "values.csv", index=False)
+    np.savez_compressed(bundle / "arrays" / "spectrum.npz", spectrum=np.asarray([3.0, 4.0]))
+    manifest = write_result_manifest(
+        bundle,
+        identities={key: str(unit[key]) for key in ("project_id", "subject_id", "session_id", "state_record_id", "data_unit_id")},
+        module_name="PSD",
+        method_name="welch",
+        parameters={"nperseg": 1000},
+        data_fingerprint="portable-data",
+        source={"path": str(source), "sha256": "source"},
+        selections={},
+        channel_mapping=[],
+        sampling_rate_hz=1000.0,
+        signal_unit="V",
+        tables={"values": r"tables\values.csv"},
+        arrays={"primary": r"arrays\spectrum.npz"},
+        analysis_identifier="analysis_portable_bundle",
+    )
+    assert manifest["tables"] == {"values": "tables/values.csv"}
+    assert manifest["arrays"][0]["file"] == "arrays/spectrum.npz"
+
+    analysis_id = "analysis_portable_bundle"
+    store.register_analysis(
+        {
+            "analysis_id": analysis_id,
+            "data_unit_id": data_unit_id,
+            "module_name": "PSD",
+            "method_name": "welch",
+            "result_path": rf"results\{data_unit_id}\psd",
+            "schema_version": manifest["schema_version"],
+            "parameter_fingerprint": manifest["parameter_fingerprint"],
+            "data_fingerprint": manifest["data_fingerprint"],
+            "parameters_json": json.dumps(manifest["effective_parameters"]),
+            "calculation_status": "completed",
+            "save_status": "saved",
+            "review_status": "pending",
+            "review_notes": None,
+            "created_at_utc": manifest["created_at_utc"],
+            "completed_at_utc": manifest["created_at_utc"],
+            "active": 1,
+            "warnings_json": "[]",
+            "error_message": None,
+        }
+    )
+    stored_path = store.analysis_results({"analysis_id": analysis_id})[0]["result_path"]
+    assert stored_path == f"results/{data_unit_id}/psd"
+
+    # Simulate a result bundle and SQLite index written by an older Windows build.
+    legacy_manifest = dict(manifest)
+    legacy_manifest["tables"] = {"values": r"tables\values.csv"}
+    legacy_manifest["arrays"] = [{**manifest["arrays"][0], "file": r"arrays\spectrum.npz"}]
+    (bundle / "manifest.json").write_text(json.dumps(legacy_manifest), encoding="utf-8")
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE analysis_runs SET result_path=? WHERE analysis_id=?",
+            (rf"results\{data_unit_id}\psd", analysis_id),
+        )
+
+    moved_project = tmp_path / "moved project with spaces"
+    shutil.copytree(project_root, moved_project)
+    reader = ProjectResults(moved_project)
+    assert reader.manifest(analysis_id)["analysis_id"] == analysis_id
+    assert reader.table(analysis_id, "values")["value"].tolist() == [2.5]
+    np.testing.assert_array_equal(reader.array(analysis_id, "spectrum"), [3.0, 4.0])
 
 
 def test_result_manifest_write_failure_does_not_create_completion_marker(tmp_path: Path):
@@ -303,6 +381,67 @@ def test_named_project_portable_import_template_and_inspection(tmp_path: Path):
     reopened = ProjectStore(moved)
     reopened_unit = reopened.data_units(data_unit_ids=[data_id])[0]
     assert reopened.resolve_source_path(reopened_unit).read_bytes() == b"portable-source"
+
+
+def test_project_relative_source_paths_are_portable_and_accept_legacy_windows_separators(tmp_path: Path):
+    source = tmp_path / "recording.fif"
+    source.write_bytes(b"portable-source")
+    store = ProjectStore.create(tmp_path / "project", "Portable paths")
+    subject = store.add_subject("M01")
+    session = store.add_session(subject, "Day1")
+    state = store.add_state_record(session, "T20")
+
+    data_unit_id, copied = store.import_data_unit(state, source)
+    assert copied
+    unit = store.data_units(data_unit_ids=[data_unit_id])[0]
+    portable_path = str(unit["source_path"])
+    assert "/" in portable_path
+    assert "\\" not in portable_path
+    assert store.resolve_source_path(unit).read_bytes() == b"portable-source"
+
+    legacy_windows_path = portable_path.replace("/", "\\")
+    resolved_legacy = store.resolve_source_path(
+        {"source_path": legacy_windows_path, "source_path_kind": "project_relative"}
+    )
+    assert resolved_legacy.read_bytes() == b"portable-source"
+
+    with pytest.raises(ValueError, match="relative"):
+        store.resolve_source_path_value(r"C:\\outside\\recording.fif", "project_relative")
+    with pytest.raises(ValueError, match="relative"):
+        store.resolve_source_path_value("../outside/recording.fif", "project_relative")
+
+
+def test_legacy_windows_hierarchy_paths_resolve_and_extend_after_move(tmp_path: Path):
+    store = ProjectStore.create(tmp_path / "project", "Legacy hierarchy")
+    store.apply_structure_template(
+        {
+            "subjects": [{"subject_code": "Mouse01"}],
+            "sessions": [{"session_key": "Day1"}],
+            "states": [{"display_name": "T20"}],
+        }
+    )
+    with store.transaction() as connection:
+        connection.execute("UPDATE subjects SET relative_path=?", (r"subjects\Mouse01",))
+        connection.execute("UPDATE sessions SET relative_path=?", (r"subjects\Mouse01\Day1",))
+        connection.execute("UPDATE state_records SET relative_path=?", (r"subjects\Mouse01\Day1\T20",))
+
+    moved = tmp_path / "moved project"
+    shutil.copytree(store.paths.root, moved)
+    reopened = ProjectStore(moved)
+    assert reopened.resolve_project_relative_path(reopened.subjects()[0]["relative_path"]).is_dir()
+    plan = reopened.apply_structure_template(
+        {
+            "subjects": [{"subject_code": "Mouse01"}],
+            "sessions": [{"session_key": "Day1"}, {"session_key": "Day7"}],
+            "states": [{"display_name": "T20"}],
+        }
+    )
+    assert plan["subjects_reused"] == 1
+    assert len(reopened.sessions(reopened.subjects()[0]["subject_id"])) == 2
+    day7 = next(row for row in reopened.sessions(reopened.subjects()[0]["subject_id"]) if row["session_key"] == "Day7")
+    assert day7["relative_path"] == "subjects/Mouse01/Day7"
+    assert reopened.resolve_project_relative_path(day7["relative_path"]).is_dir()
+    assert portable_path_name(r"data\raw\recording.fif") == "recording.fif"
 
 
 def test_import_targets_existing_state_id_and_never_creates_same_label_state(tmp_path: Path):

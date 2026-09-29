@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from . import __version__
+from .portable_paths import parse_portable_relative_path, resolve_portable_relative_path
 
 RESULT_SCHEMA_VERSION = "1.0"
 REQUIRED_IDENTITIES = ("project_id", "subject_id", "session_id", "state_record_id", "data_unit_id")
@@ -86,10 +87,14 @@ def write_result_manifest(
     aid = analysis_identifier or analysis_id()
     array_records: list[dict[str, Any]] = []
     for label, relative in (arrays or {}).items():
-        path = (root / relative).resolve()
-        path.relative_to(root)
+        portable_relative = parse_portable_relative_path(relative, label=f"Array path for {label}").as_posix()
+        path = resolve_portable_relative_path(root, portable_relative, label=f"Array path for {label}")
         for item in describe_npz(path):
-            array_records.append({"file": relative, "label": label, **item, "axes": (axes or {}).get(item["name"], []), "unit": (units or {}).get(item["name"], ""), "numeric_space": (numeric_spaces or {}).get(item["name"], "linear")})
+            array_records.append({"file": portable_relative, "label": label, **item, "axes": (axes or {}).get(item["name"], []), "unit": (units or {}).get(item["name"], ""), "numeric_space": (numeric_spaces or {}).get(item["name"], "linear")})
+    portable_tables = {
+        name: parse_portable_relative_path(relative, label=f"Table path for {name}").as_posix()
+        for name, relative in tables.items()
+    }
     manifest = {
         "schema_name": "luna-result-bundle",
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -114,7 +119,7 @@ def write_result_manifest(
         "channel_mapping": channel_mapping,
         "sampling_rate_hz": sampling_rate_hz,
         "signal_unit": signal_unit,
-        "tables": tables,
+        "tables": portable_tables,
         "arrays": array_records,
         "quality_summary": quality or {},
         "warnings": warnings or [],
@@ -156,8 +161,7 @@ def validate_manifest(manifest: dict[str, Any], root: str | Path | None = None, 
         paths = list((manifest.get("tables") or {}).values()) + [item.get("file", "") for item in manifest.get("arrays", [])]
         for relative in paths:
             try:
-                target = (base / str(relative)).resolve()
-                target.relative_to(base)
+                target = resolve_portable_relative_path(base, str(relative), label="Result bundle path")
             except ValueError:
                 errors.append(f"unsafe_path:{relative}")
                 continue
@@ -182,8 +186,7 @@ def load_table(manifest: dict[str, Any], table_name: str) -> pd.DataFrame:
     if table_name not in manifest.get("tables", {}):
         raise KeyError(f"Result table not found: {table_name}")
     root = Path(manifest["bundle_dir"]).resolve()
-    path = (root / manifest["tables"][table_name]).resolve()
-    path.relative_to(root)
+    path = resolve_portable_relative_path(root, manifest["tables"][table_name], label=f"Result table {table_name}")
     return pd.read_csv(path, low_memory=False)
 
 
@@ -192,7 +195,6 @@ def load_array(manifest: dict[str, Any], array_name: str) -> np.ndarray:
     if len(matches) != 1:
         raise KeyError(f"Expected one array named {array_name!r}; found {len(matches)}")
     root = Path(manifest["bundle_dir"]).resolve()
-    path = (root / matches[0]["file"]).resolve()
-    path.relative_to(root)
+    path = resolve_portable_relative_path(root, matches[0]["file"], label=f"Result array {array_name}")
     with np.load(path, allow_pickle=False) as arrays:
         return np.asarray(arrays[array_name]).copy()

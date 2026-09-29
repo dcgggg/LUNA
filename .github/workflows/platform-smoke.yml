@@ -1,0 +1,57 @@
+name: Platform smoke checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }} · Python ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # GitHub maps macos-15 to Apple Silicon and macos-15-intel to x86_64.
+        # Keep both architectures explicit: an arm64 pass is not Intel coverage.
+        os: [windows-latest, macos-15, macos-15-intel]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+      # CI defaults to skipping the interactive-widget regression tests. Opt in
+      # here because this job deliberately runs them against Qt's offscreen backend.
+      LUNA_RUN_QT_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install declared desktop and development dependencies
+        run: python -m pip install ".[desktop,dev]"
+      - name: Verify installed environment and optional backend API
+        run: |
+          python -m pip check
+          python -c "import inspect, mne, mne_connectivity, PySide6; from mne_connectivity import spectral_connectivity_epochs; params=inspect.signature(spectral_connectivity_epochs).parameters; assert {'fdecim', 'n_components'} <= params.keys(); print('MNE', mne.__version__, 'MNE-Connectivity', mne_connectivity.__version__, 'PySide6', PySide6.__version__)"
+          luna-gui --help
+          python -m lfp_analysis.diagnostics --output luna-diagnostic.json
+          python -m lfp_analysis.diagnostics --self-test-connectivity --output connectivity-diagnostic.json
+      - name: Run tests and static checks
+        run: |
+          python -m pytest -q
+          python -m ruff check src tests scripts
+          python -m compileall -q src scripts tests
+      - name: Preserve sanitized diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luna-diagnostics-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            luna-diagnostic.json
+            connectivity-diagnostic.json
+          if-no-files-found: warn
+          retention-days: 7

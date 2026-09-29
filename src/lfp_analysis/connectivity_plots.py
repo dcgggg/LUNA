@@ -6,6 +6,7 @@ connectivity estimate, so display changes cannot alter the underlying run.
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Any
 
 import matplotlib
@@ -224,6 +225,37 @@ def _bands_text(selected_band: Any) -> str:
     return f"；显示频段：{labels}"
 
 
+def _wrap_plot_title(text: str, max_width: int = 84) -> str:
+    """Wrap long plot titles by approximate display width without dropping text."""
+    def display_width(value: str) -> int:
+        return sum(2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1 for char in value)
+
+    remaining = str(text).strip()
+    lines: list[str] = []
+    while remaining and display_width(remaining) > max_width:
+        width = 0
+        last_preferred_break = -1
+        last_space_break = -1
+        overflow_at = len(remaining)
+        for index, character in enumerate(remaining):
+            width += display_width(character)
+            if character in "；|，,":
+                last_preferred_break = index + 1
+            elif character.isspace():
+                last_space_break = index + 1
+            if width > max_width:
+                overflow_at = index
+                break
+        cut = last_preferred_break if last_preferred_break > 0 else last_space_break
+        if cut <= 0 or cut >= overflow_at + 1:
+            cut = max(1, overflow_at)
+        lines.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        lines.append(remaining)
+    return "\n".join(lines)
+
+
 def method_label(method: str) -> str:
     return METHOD_LABELS.get(str(method).lower(), str(method).upper())
 
@@ -327,7 +359,8 @@ def plot_spectrum(
         view_title = "全频谱（标记选定频段）"
     axis.set_xlabel("频率（Hz）")
     smoothing_note = "；仅显示平滑曲线（原始值另存）" if use_smoothing else ""
-    axis.set_title(f"{title_prefix}{method_label(method)} 频谱｜{view_title}{_bands_text(selected_band)}{smoothing_note}", fontsize=font_size + 1)
+    title = f"{title_prefix}{method_label(method)} 频谱｜{view_title}{_bands_text(selected_band)}{smoothing_note}"
+    axis.set_title(_wrap_plot_title(title), fontsize=font_size + 1, linespacing=1.15)
     axis.grid(True, color="#dddddd", linewidth=0.45, alpha=0.8)
     axis.legend(fontsize=max(7, font_size - 1), frameon=False, ncol=2)
     axis.tick_params(labelsize=font_size)

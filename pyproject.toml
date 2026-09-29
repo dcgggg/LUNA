@@ -19,14 +19,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-connectivity = ["mne-connectivity>=0.7,<1"]
+connectivity = ["mne-connectivity>=0.9,<1"]
 tde = ["pybispectra>=1.3,<2"]
 parameterization = ["specparam==2.0.0rc7", "fooof>=1.1,<2"]
 notebook = ["jupyterlab>=4,<5", "nbformat>=5.9,<6", "ipykernel>=6.29,<7"]
 gui = ["PySide6>=6.7,<7"]
 dev = ["pytest>=8,<9", "ruff>=0.6,<1"]
+desktop = [
+    "PySide6>=6.7,<7",
+    "mne-connectivity>=0.9,<1",
+    "pybispectra>=1.3,<2",
+    "specparam==2.0.0rc7",
+    "fooof>=1.1,<2",
+]
 all = [
-    "mne-connectivity>=0.7,<1",
+    "mne-connectivity>=0.9,<1",
     "pybispectra>=1.3,<2",
     "specparam==2.0.0rc7",
     "fooof>=1.1,<2",
@@ -41,6 +48,8 @@ all = [
 [project.scripts]
 lfp-analysis = "lfp_analysis.cli:main"
 luna = "lfp_analysis.cli:main"
+luna-gui = "lfp_analysis.gui:main"
+luna-diagnose = "lfp_analysis.diagnostics:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

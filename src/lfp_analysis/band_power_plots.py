@@ -98,6 +98,30 @@ def _with_metadata(table: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def _attach_channel_metadata(frame: pd.DataFrame, tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Fill display-only channel labels from the mapping saved with this run."""
+    metadata = tables.get("channel_table")
+    if frame.empty or not isinstance(metadata, pd.DataFrame) or metadata.empty:
+        return frame
+    if "channel_name" not in frame or "channel_name" not in metadata:
+        return frame
+    mapping = metadata.dropna(subset=["channel_name"]).drop_duplicates("channel_name", keep="last").copy()
+    mapping["channel_name"] = mapping["channel_name"].astype(str)
+    lookup_key = frame["channel_name"].astype(str)
+    result = frame.copy()
+    for column in ("physical_channel_number", "region"):
+        if column not in mapping:
+            continue
+        values = lookup_key.map(mapping.set_index("channel_name")[column])
+        if column not in result:
+            result[column] = values
+        else:
+            current = result[column]
+            missing = current.isna() | current.astype(str).str.strip().isin({"", "nan", "None"})
+            result.loc[missing, column] = values.loc[missing]
+    return result
+
+
 def _filtered_epoch_table(
     tables: dict[str, pd.DataFrame],
     selected_channels: Iterable[str] | None = None,
@@ -107,6 +131,7 @@ def _filtered_epoch_table(
     frame = _first_table(tables, ("band_power", "band_power_epoch_channel"))
     if frame.empty:
         frame = _first_table(tables, ("band_power_summary",))
+    frame = _attach_channel_metadata(frame, tables)
     frame = _with_metadata(frame)
     if frame.empty:
         return frame
